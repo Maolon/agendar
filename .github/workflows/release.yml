@@ -38,7 +38,7 @@ jobs:
       GH_REPO: ${{ github.repository }}
       TAG: ${{ inputs.tag }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: bundle-*
           merge-multiple: true
