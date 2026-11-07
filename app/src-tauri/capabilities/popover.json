@@ -1,0 +1,21 @@
+{
+  "identifier": "popover",
+  "description": "Local quick triage only",
+  "local": true,
+  "webviews": [
+    "popover"
+  ],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "allow-get-snapshot",
+    "allow-prepare-answer",
+    "allow-answer-decision",
+    "allow-snooze-need",
+    "allow-dismiss-need",
+    "allow-show-main",
+    "allow-hide-popover",
+    "allow-window-chrome",
+    "allow-set-glass-regions"
+  ]
+}

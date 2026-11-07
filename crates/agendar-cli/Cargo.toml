@@ -1,0 +1,28 @@
+[package]
+name = "agendar-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "agendar"
+path = "src/main.rs"
+
+[lib]
+name = "agendar_cli"
+path = "src/lib.rs"
+
+[dependencies]
+agendar-core = { path = "../agendar-core" }
+clap.workspace = true
+ctrlc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
+fs2.workspace = true
+tempfile.workspace = true

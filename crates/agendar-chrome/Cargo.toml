@@ -1,0 +1,23 @@
+[package]
+name = "agendar-chrome"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Window chrome: macOS Liquid Glass regions behind the transparent webview (safe API)"
+publish = false
+
+[dependencies]
+serde.workspace = true
+tauri.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+# macOS 26+ glass. The only unsafe here turns Tauri's live WKWebView pointer
+# into an NSView reference inside `with_webview`.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "=0.6.5"
+objc2-foundation = { version = "=0.3.2", features = ["NSGeometry"] }
+objc2-app-kit = { version = "=0.3.2", features = ["NSGlassEffectView", "NSView", "NSResponder", "NSWorkspace", "NSAccessibility", "NSGraphics", "NSColor", "NSColorSpace"] }

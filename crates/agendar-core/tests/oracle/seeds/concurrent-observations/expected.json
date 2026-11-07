@@ -1,0 +1,1 @@
+{"assertions":{"conflict":true,"delivery":"00000000000000000000000007","failure_rescue":false,"failure_streak":1,"observation":"00000000000000000000000009","observation_frontier":["00000000000000000000000008","00000000000000000000000009"],"seen_result":"failed"},"oracle_version":1}

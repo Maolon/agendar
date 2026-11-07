@@ -1,0 +1,13 @@
+# Workflow actions stay current; Rust and npm dependencies are pinned on
+# purpose and only get Dependabot security updates (enabled in repo settings).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns: ["*"]

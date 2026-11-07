@@ -1,0 +1,1 @@
+{"assertions":{"basis":{"x":"tainted","y":"tainted","z":"firm"},"built_on":["x","y"],"progress":{"x":"done","y":"doing","z":"doing"},"redo":["x","y"],"taints":{"x":["00000000000000000000000007"],"y":["00000000000000000000000007"],"z":[]}},"oracle_version":1}

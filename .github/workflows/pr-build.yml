@@ -1,0 +1,25 @@
+name: pr build
+
+# Every pull request into main builds installable apps for all platforms; the
+# bundles are attached to the run so a reviewer can try the change.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+
+concurrency:
+  group: pr-build-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: ${{ !github.event.pull_request.draft }}
+    uses: ./.github/workflows/build.yml

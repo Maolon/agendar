@@ -1,0 +1,55 @@
+name: release
+
+# Build a tag and upload installers, CLI archives and checksums to its GitHub
+# release. release-please.yml calls this after a release PR merges; run it by
+# hand for a tag pushed some other way (the release is created if missing).
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and publish, for example v0.1.0
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    secrets: inherit
+    with:
+      ref: ${{ inputs.tag }}
+
+  publish:
+    name: publish ${{ inputs.tag }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bundle-*
+          merge-multiple: true
+          path: dist
+
+      - name: Create the release if it does not exist yet
+        run: |
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --title "Agendar ${TAG#v}" \
+              --notes "Installers for macOS, Windows and Linux, plus the agendar CLI on its own. See the README for install steps."
+          fi
+
+      - name: Upload the files
+        run: gh release upload "$TAG" dist/* --clobber

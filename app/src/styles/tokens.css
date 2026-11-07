@@ -1,0 +1,111 @@
+/*
+ * Token set. Amber backgrounds are unchanged; the approved
+ * label colour is #1D1D1F in both themes (5.7288:1 light, 6.4232:1 dark).
+ * Colors are semantic only: no per-project palette.
+ */
+
+:root {
+  --page: #eeeeeb;
+  --win: #ffffff;
+  --side: #f6f6f4;
+  --fg: #1d1d1f;
+  --fg2: #6b6b70;
+  --fg3: #a3a3a8;
+  --line: #e6e5e1;
+  --fill: #f3f3f1;
+  --sel: rgba(20, 20, 20, 0.06);
+  --tile: #ededea;
+  --amber: #d9820b;
+  --amber-ink: #9e5905;
+  --red: #c93a2c;
+  --green: #2e8f55;
+  --blue: #2f6fca;
+  /* Progress states: finished, working; not started stays a dim outline. */
+  --st-done: var(--green);
+  --st-doing: var(--fg);
+  --on-accent: #1d1d1f;
+  --term: #1e1e1d;
+  --term-fg: #dadad6;
+  --term-dim: #8c8c87;
+  --thumb-a: #dadad6;
+  --thumb-b: #b9b9b4;
+  --thumb-c: #97978f;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.05), 0 18px 50px rgba(0, 0, 0, 0.1);
+
+  --ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", "PingFang SC",
+    "Hiragino Sans GB", system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  --radius-card: 12px;
+  --radius-strip: 10px;
+  --radius-button: 9px;
+  --radius-row: 8px;
+  --titlebar: 46px;
+  --pane: 330px;
+  --view-pad: 28px 30px 34px;
+  /* The content grows with the window (more Now cards per row, a wider plan)
+     and only centres beyond this. */
+  --view-max: 1180px;
+  --view-gap: 18px;
+  --body: 13px;
+  --leading: 1.4;
+  --heading: 27px;
+  --para: 12.5px;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --page: #0f0f0e;
+    --win: #1c1c1b;
+    --side: #212120;
+    --fg: #ecece8;
+    --fg2: #a1a19c;
+    --fg3: #6a6a66;
+    --line: #31312e;
+    --fill: #262624;
+    --sel: rgba(255, 255, 255, 0.07);
+    --tile: #2c2c2a;
+    --amber: #e8890c;
+    --amber-ink: #f2a445;
+    --red: #ef6253;
+    --green: #4cbb78;
+    --blue: #5b9cf0;
+    --on-accent: #1d1d1f;
+    --term: #121211;
+    --term-fg: #d8d8d4;
+    --term-dim: #7a7a75;
+    --thumb-a: #4a4a47;
+    --thumb-b: #3a3a38;
+    --thumb-c: #2c2c2a;
+    --shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+  --page: #0f0f0e;
+  --win: #1c1c1b;
+  --side: #212120;
+  --fg: #ecece8;
+  --fg2: #a1a19c;
+  --fg3: #6a6a66;
+  --line: #31312e;
+  --fill: #262624;
+  --sel: rgba(255, 255, 255, 0.07);
+  --tile: #2c2c2a;
+  --amber: #e8890c;
+  --amber-ink: #f2a445;
+  --red: #ef6253;
+  --green: #4cbb78;
+  --blue: #5b9cf0;
+  --on-accent: #1d1d1f;
+  --term: #121211;
+  --term-fg: #d8d8d4;
+  --term-dim: #7a7a75;
+  --thumb-a: #4a4a47;
+  --thumb-b: #3a3a38;
+  --thumb-c: #2c2c2a;
+  --shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+  color-scheme: dark;
+}

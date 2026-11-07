@@ -1,0 +1,133 @@
+name: build
+
+# Installable apps for every platform, kept as workflow artifacts. Pull
+# requests call this to prove main still builds; release.yml calls it for a tag
+# and uploads the result.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to build; empty builds the triggering commit.
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS (Apple silicon)
+            os: macos-latest
+            target: aarch64-apple-darwin
+            bundles: app,dmg
+          - name: macOS (Intel)
+            os: macos-latest
+            target: x86_64-apple-darwin
+            bundles: app,dmg
+          - name: Windows (x64)
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+          - name: Linux (x64)
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,appimage
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: rustup toolchain install 1.94.1 --profile minimal --target ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26.12.1
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+          run_install: false
+
+      - name: Install frontend packages
+        run: pnpm -C app install --frozen-lockfile
+
+      - name: Install Tauri Linux system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev patchelf libssl-dev libfuse2
+
+      # Without these secrets the app stays ad-hoc signed (signingIdentity "-"
+      # in tauri.conf.json). Add them to sign with a Developer ID and notarize.
+      - name: Use the Developer ID when configured
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ]; then
+            echo "No Developer ID secrets: the app is ad-hoc signed."
+            exit 0
+          fi
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            printf '%s=%s\n' "$name" "${!name}" >> "$GITHUB_ENV"
+          done
+          echo "Signing with the Developer ID and notarizing."
+
+      - name: Stage the bundled CLI
+        run: node app/scripts/bundle-cli.mjs --target ${{ matrix.target }}
+
+      - name: Build the app
+        run: pnpm -C app exec tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+      - name: Collect installers, the CLI and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(node -p 'require("./app/package.json").version')
+          target=${{ matrix.target }}
+          bundle=target/$target/release/bundle
+          out=dist
+          mkdir -p "$out"
+          case "$RUNNER_OS" in
+            macOS)   cp "$bundle"/dmg/*.dmg "$out"/ ;;
+            Windows) cp "$bundle"/nsis/*-setup.exe "$out"/ ;;
+            Linux)   cp "$bundle"/deb/*.deb "$bundle"/appimage/*.AppImage "$out"/ ;;
+          esac
+          cli=agendar-cli-$version-$target
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a -tzip "$out/$cli.zip" "./target/$target/release/agendar.exe" > /dev/null
+          else
+            tar -czf "$out/$cli.tar.gz" -C "target/$target/release" agendar
+          fi
+          cd "$out"
+          for file in *; do
+            if command -v sha256sum > /dev/null; then sha256sum "$file"; else shasum -a 256 "$file"; fi > "$file.sha256"
+          done
+          ls -l
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14

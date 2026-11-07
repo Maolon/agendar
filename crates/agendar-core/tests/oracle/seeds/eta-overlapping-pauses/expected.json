@@ -1,0 +1,1 @@
+{"assertions":{"actual_active_s":600,"calibration":[],"eligible":false,"pause_intervals_minutes":[[2,6],[4,8]],"pause_union_minutes":[[2,8]],"paused_s":360,"sample_ratio_milli":1000},"oracle_version":1}

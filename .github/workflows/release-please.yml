@@ -1,0 +1,79 @@
+name: release-please
+
+# Merged PR titles (feat:, fix:, ...) drive the version. release-please keeps
+# one release PR open that bumps the version in Cargo.toml, app/package.json
+# and tauri.conf.json and updates CHANGELOG.md; this workflow then syncs
+# Cargo.lock on that PR. Merging the release PR tags the release, and the
+# release workflow builds and uploads it.
+#
+# Set the RELEASE_PLEASE_TOKEN secret (a fine-grained token with contents and
+# pull request write access) so the checks run on the release PR; pushes made
+# with the default token do not start other workflows.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      pr: ${{ steps.release.outputs.pr }}
+    steps:
+      - id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  lockfile:
+    name: sync Cargo.lock on the release PR
+    needs: release-please
+    if: ${{ needs.release-please.outputs.pr != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ fromJSON(needs.release-please.outputs.pr).headBranchName }}
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal
+
+      - name: Update only the workspace entries
+        run: cargo update --workspace
+
+      - name: Check every version agrees
+        run: node scripts/check-version.mjs
+
+      - name: Commit when Cargo.lock changed
+        run: |
+          if git diff --quiet -- Cargo.lock; then
+            echo "Cargo.lock already matches."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: sync Cargo.lock with the release version" -- Cargo.lock
+          git push
+
+  release:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    secrets: inherit
+    with:
+      tag: ${{ needs.release-please.outputs.tag_name }}

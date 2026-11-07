@@ -1,0 +1,69 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Agendar",
+  "version": "0.1.0",
+  "identifier": "dev.agendar.app",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Agendar",
+        "width": 1120,
+        "height": 740,
+        "minWidth": 860,
+        "minHeight": 600,
+        "resizable": true,
+        "visible": true,
+        "center": true,
+        "url": "index.html"
+      },
+      {
+        "label": "popover",
+        "title": "Agendar",
+        "width": 380,
+        "height": 560,
+        "resizable": false,
+        "decorations": false,
+        "visible": false,
+        "skipTaskbar": true,
+        "url": "index.html?surface=popover"
+      }
+    ],
+    "security": {
+      "capabilities": [
+        "main",
+        "popover"
+      ],
+      "csp": "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' agendar-media: http://agendar-media.localhost; media-src agendar-media: http://agendar-media.localhost; font-src 'self'; connect-src ipc: http://ipc.localhost; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'",
+      "devCsp": "default-src 'none'; script-src 'self' http://localhost:1420; style-src 'self' 'unsafe-inline'; img-src 'self' agendar-media: http://agendar-media.localhost; media-src agendar-media: http://agendar-media.localhost; font-src 'self'; connect-src ipc: http://ipc.localhost http://localhost:1420 ws://localhost:1420; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"
+    },
+    "macOSPrivateApi": true
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "app"
+    ],
+    "category": "Productivity",
+    "shortDescription": "Project radar and decision loop for coding agents",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "externalBin": [
+      "binaries/agendar"
+    ],
+    "macOS": {
+      "signingIdentity": "-"
+    }
+  }
+}

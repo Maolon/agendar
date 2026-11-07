@@ -1,0 +1,38 @@
+[package]
+name = "agendar-notify"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Safe owned-data API for native desktop notification actions (UserNotifications, WinRT, notify-rust)"
+publish = false
+
+[features]
+# Enables the in-memory fake transport used by `tests/contract.rs`. It is a
+# default feature so `cargo test -p agendar-notify --locked` runs the contract
+# suite; it must never be used as a real backend.
+default = ["fake"]
+fake = []
+
+# Linux backend. `z-with-tokio` is the pinned feature selection; zbus runs its
+# own reactor, so every call
+# happens on this crate's dedicated worker thread, never on a GUI thread.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+notify-rust = { version = "=4.18.2", default-features = false, features = ["z-with-tokio"] }
+
+# macOS backend. Apple's UserNotifications framework through objc2.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "=0.6.5"
+objc2-foundation = "=0.3.2"
+objc2-user-notifications = "=0.3.2"
+block2 = "=0.6.2"
+
+# Windows backend. WinRT toasts with in-process `Activated` handlers.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.62.2", features = [
+    "Foundation",
+    "Data_Xml_Dom",
+    "UI_Notifications",
+    "Win32_System_WinRT",
+] }

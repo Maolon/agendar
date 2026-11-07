@@ -1,0 +1,41 @@
+[package]
+name = "agendar-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chrono.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+ulid.workspace = true
+url.workspace = true
+directories.workspace = true
+fs2.workspace = true
+tempfile.workspace = true
+rusqlite.workspace = true
+notify.workspace = true
+sysinfo.workspace = true
+
+# `O_NOFOLLOW` for the no-follow lock leaf open; the constant is platform ABI,
+# so it comes from the platform binding crate rather than a local table.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+# The Windows lock leaf needs the volume serial number and file index of an
+# open handle. std exposes the metadata but not a safe comparison, and the
+# crate forbids `unsafe`, so the reviewed, maintained `same_file` handle
+# identity supplies it.
+[target.'cfg(windows)'.dependencies]
+same-file.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true

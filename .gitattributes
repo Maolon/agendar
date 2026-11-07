@@ -1,0 +1,3 @@
+# Text files use LF on every platform, so files embedded at build time (the
+# Agent Skill) and the byte-exact seed oracles match on Windows too.
+* text=auto eol=lf

@@ -1,0 +1,877 @@
+/* Frame: a floating sidebar and one toolbar row; popover. On macOS the traffic
+   lights sit over the page (overlay title bar) inside the sidebar. */
+
+.app {
+  height: 100%;
+  position: relative;
+  overflow: hidden;
+}
+
+.win {
+  height: 100%;
+  min-height: 0;
+  background: var(--win);
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  overflow: hidden;
+  font-size: var(--body);
+  line-height: var(--leading);
+  position: relative;
+}
+
+.maincol {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  background: var(--win);
+}
+
+/* One toolbar row: sidebar toggle, search. Empty space drags the window. */
+.toolbar {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) 34px;
+  align-items: center;
+  gap: 10px;
+  min-height: var(--titlebar);
+  padding: 8px 12px 4px;
+  min-width: 0;
+}
+
+/* The traffic lights sit over the toolbar while the sidebar is hidden: the
+   toolbar starts clear of them, and the page lines up with the sidebar button
+   instead of sliding under the lights (the page's own inset is 30px). */
+.win[data-overlay="true"].pane-collapsed {
+  --lights-inset: 84px;
+}
+.win[data-overlay="true"].pane-collapsed .toolbar {
+  padding-left: var(--lights-inset);
+}
+.win[data-overlay="true"].pane-collapsed .main {
+  padding-left: calc(var(--lights-inset) - 30px);
+}
+
+/* Capsules: round toolbar controls (native glass shows through on macOS 26). */
+.icon-btn.cap {
+  width: 34px;
+  height: 30px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--fill);
+}
+
+.search {
+  justify-self: center;
+  width: 420px;
+  max-width: 52vw;
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--fill);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 12px;
+  color: var(--fg2);
+}
+
+.search input {
+  border: 0;
+  outline: 0;
+  background: none;
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  color: var(--fg);
+}
+
+.search input::placeholder {
+  color: var(--fg3);
+}
+
+.search kbd {
+  flex: none;
+}
+
+kbd {
+  font-family: var(--mono);
+  font-size: 11px;
+  border: 1px solid var(--line);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  padding: 0 5px;
+  background: var(--win);
+  color: var(--fg);
+}
+
+.wbody {
+  display: grid;
+  grid-template-columns: var(--pane) minmax(0, 1fr);
+  min-height: 0;
+  position: relative;
+  overflow: hidden;
+}
+/* The left pane hides entirely; the toolbar keeps the toggle. */
+.pane-collapsed .wbody > .side {
+  display: none;
+}
+.pane-collapsed .wbody {
+  grid-template-columns: minmax(0, 1fr);
+}
+/* Drag handle on the pane's right edge. */
+.pane-grip {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(var(--pane) - 1px);
+  width: 6px;
+  cursor: col-resize;
+  z-index: 2;
+  touch-action: none;
+}
+.pane-grip:hover,
+.pane-grip:focus-visible {
+  background: color-mix(in srgb, var(--fg3) 35%, transparent);
+  outline: none;
+}
+.icon-btn {
+  display: inline-grid;
+  place-items: center;
+  width: 26px;
+  height: 22px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--fg2);
+  cursor: pointer;
+}
+.icon-btn:hover {
+  background: color-mix(in srgb, var(--fg3) 20%, transparent);
+  color: var(--fg);
+}
+
+/* The sidebar floats inside the window, its corners concentric with it, and
+   its rows adapt to its width (never a sideways scroll). */
+.side {
+  container-type: inline-size;
+  container-name: side;
+  background: var(--side);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  margin: 8px 0 8px 8px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* Overlay title bar: the traffic lights take the top of the sidebar. */
+.win[data-overlay="true"] .side-scroll {
+  padding-top: 40px;
+}
+
+/* Native glass: the page leaves the sidebar and capsules clear and paints
+   everything around them, so the glass behind the webview shows through. */
+:root:has(.win[data-material="glass"]),
+:root:has(.win[data-material="glass"]) body,
+:root:has(.win[data-material="glass"]) #root,
+:root:has(.win[data-material="glass"]) .app,
+.win[data-material="glass"],
+.win[data-material="glass"] .wbody {
+  background: transparent;
+}
+.win[data-material="glass"] .side {
+  background: transparent;
+  border-color: transparent;
+  /* Paint the gutter around the panel; .wbody clips the rest. */
+  box-shadow: 0 0 0 48px var(--win);
+}
+.win[data-material="glass"] .side-foot {
+  border-top-color: color-mix(in srgb, var(--fg) 14%, transparent);
+}
+/* Text on glass: a layer of the sidebar colour keeps text legible whatever
+   the glass shows (an inactive window's glass turns pale and ignores the
+   tint), and the faintest text tiers step up one. */
+.win[data-material="glass"] .side {
+  background: color-mix(in srgb, var(--side) 60%, transparent);
+  --fg3: color-mix(in srgb, var(--fg) 70%, var(--side));
+  --fg2: color-mix(in srgb, var(--fg) 84%, var(--side));
+}
+/* An inactive window's glass turns pale and drops the tint: lean harder on
+   the sidebar colour then. */
+.win[data-material="glass"][data-inactive] .side {
+  background: color-mix(in srgb, var(--side) 88%, transparent);
+}
+.pop[data-material="glass"][data-inactive] {
+  background: color-mix(in srgb, var(--win) 92%, transparent);
+}
+
+/* Glass windows: the page scrolls under a fading toolbar, and its capsules are
+   CSS glass over that content (native glass cannot sit above the page). */
+.win[data-material="glass"] .maincol {
+  position: relative;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+.win[data-material="glass"] .toolbar {
+  position: absolute;
+  inset: 0 0 auto 0;
+  z-index: 3;
+  padding-bottom: 14px;
+}
+/* Scroll edge: content under the toolbar blurs and fades out. */
+.win[data-material="glass"] .toolbar::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: linear-gradient(
+    to bottom,
+    var(--win) 55%,
+    color-mix(in srgb, var(--win) 0%, transparent)
+  );
+  -webkit-backdrop-filter: blur(14px);
+  backdrop-filter: blur(14px);
+  -webkit-mask-image: linear-gradient(to bottom, #000 70%, transparent);
+  mask-image: linear-gradient(to bottom, #000 70%, transparent);
+}
+.win[data-material="glass"] .main {
+  grid-row: 2;
+  padding-top: calc(var(--titlebar) + 6px);
+}
+.win[data-material="glass"] .icon-btn.cap,
+.win[data-material="glass"] .search {
+  background: color-mix(in srgb, var(--fill) 55%, transparent);
+  -webkit-backdrop-filter: blur(18px) saturate(1.6);
+  backdrop-filter: blur(18px) saturate(1.6);
+  border-color: color-mix(in srgb, var(--fg) 14%, transparent);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, #fff 20%, transparent),
+    0 6px 18px rgba(0, 0, 0, 0.22);
+}
+
+.side-scroll {
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding: 8px 8px 12px;
+  flex: 1;
+}
+
+.gh {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-weight: 650;
+  font-size: 13.5px;
+  padding: 12px 10px 6px;
+}
+
+.gh .n {
+  color: var(--fg2);
+  font-weight: 500;
+}
+
+.gh .n.on {
+  color: var(--amber-ink);
+  font-weight: 650;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  width: 100%;
+  text-align: left;
+  border: 0;
+  background: none;
+  padding: 8px 10px;
+  border-radius: var(--radius-row);
+  cursor: pointer;
+}
+
+.row:hover {
+  background: color-mix(in srgb, var(--sel) 60%, transparent);
+}
+
+.row[aria-current="true"] {
+  background: var(--sel);
+}
+
+.row .t {
+  font-weight: 600;
+  line-height: 1.3;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow-wrap: anywhere;
+}
+
+.row .s {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--fg2);
+  font-size: 12px;
+  margin-top: 3px;
+  min-width: 0;
+}
+.row .why {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.row .tr .pe {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.row .tr .pe .ic {
+  width: 12px;
+  height: 12px;
+}
+
+.row .tr {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--fg2);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.row .tr .ic {
+  width: 14px;
+  height: 14px;
+}
+
+.prow {
+  grid-template-columns: 22px minmax(40px, 1fr) minmax(0, max-content);
+  padding: 7px 10px;
+}
+
+.prow .tr {
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* The finish time never shrinks; the track gives way first. */
+.prow .tr .pe {
+  flex: none;
+}
+
+.pe-short {
+  display: none;
+}
+
+.prow .track {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.prow .track.dense {
+  flex: 0 1 88px;
+  width: auto;
+  min-width: 28px;
+}
+
+/* Narrow: the finish time matters more than the track; the footer keeps the
+   agents line and shows the received time on hover. */
+@container side (max-width: 300px) {
+  .prow .tr .track {
+    display: none;
+  }
+  .prow .pe[data-short] .pe-full,
+  .prow .pe .ic {
+    display: none;
+  }
+  .prow .pe-short {
+    display: inline;
+  }
+  .foot-item.foot-received {
+    display: none;
+  }
+}
+
+/* Rail: icons only (avatars, need types, counts); names stay for screen
+   readers and show on hover. */
+@container side (max-width: 150px) {
+  .side-scroll {
+    padding-left: 6px;
+    padding-right: 6px;
+  }
+  /* Group headers become one amber count (needs) and a divider. */
+  .gh {
+    justify-content: center;
+    font-size: 0;
+    min-height: 0;
+  }
+  .gh .n {
+    display: none;
+  }
+  .gh .n.on {
+    display: inline;
+    font-size: 12px;
+    margin: 0;
+  }
+  .gh ~ .gh {
+    margin: 8px 10px 4px !important;
+    padding: 0;
+    border-top: 1px solid var(--line);
+  }
+  .row {
+    grid-template-columns: minmax(0, 1fr);
+    justify-items: center;
+    gap: 0;
+    padding: 8px 0;
+  }
+  .row .t {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+  .side .row .s,
+  .side .row .tr,
+  .side .empty-row,
+  .side .more {
+    display: none;
+  }
+  .side-foot {
+    justify-content: center;
+    padding: 10px 0;
+  }
+  .foot-status {
+    flex: none;
+    justify-content: center;
+  }
+  .foot-item.foot-received,
+  .foot-item .foot-text {
+    display: none;
+  }
+}
+
+.prow .t {
+  font-weight: 600;
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: horizontal;
+}
+
+.empty-row {
+  color: var(--fg3);
+  padding: 6px 10px 6px 40px;
+}
+
+.more {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: 0;
+  background: none;
+  color: var(--fg2);
+  padding: 7px 10px 7px 42px;
+  border-radius: var(--radius-row);
+  cursor: pointer;
+}
+
+.more:hover {
+  background: color-mix(in srgb, var(--sel) 60%, transparent);
+}
+
+.side-foot {
+  border-top: 1px solid var(--line);
+  padding: 11px 12px 11px 16px;
+  font-size: 12px;
+  color: var(--fg2);
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+}
+
+/* Status items wrap whole onto a second line when the sidebar is narrow. */
+.foot-status {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 3px 12px;
+}
+
+.foot-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+.side-foot > .settings-btn {
+  flex: none;
+}
+
+.side-foot .ic {
+  width: 14px;
+  height: 14px;
+}
+
+.main {
+  overflow: auto;
+  /* Keep the width when a page grows a scrollbar, so switching between a short
+     and a long page (Settings tabs) never shifts the layout. */
+  scrollbar-gutter: stable;
+  min-width: 0;
+  position: relative;
+  container-type: inline-size;
+  container-name: mainpane;
+}
+
+.view {
+  padding: var(--view-pad);
+  max-width: var(--view-max);
+  width: 100%;
+  box-sizing: border-box;
+  margin-inline: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--view-gap);
+}
+
+.stale {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--fill);
+  color: var(--fg);
+  font-size: 12.5px;
+}
+
+.stale .ic {
+  width: 15px;
+  height: 15px;
+  color: var(--fg2);
+}
+
+.stale .grow {
+  flex: 1;
+}
+
+.stale .link {
+  margin-left: auto;
+}
+
+.dev-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 16px;
+  background: var(--fill);
+  border-bottom: 1px solid var(--line);
+  color: var(--fg2);
+  font-size: 11.5px;
+  letter-spacing: 0.02em;
+}
+
+/* Menu bar popover (380 x 560): a glanceable status, progress, then what needs you. */
+.pop {
+  height: 100%;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  background: var(--win);
+  color: var(--fg);
+  font-size: var(--body);
+  line-height: var(--leading);
+  overflow: hidden;
+}
+
+/* Glass popover (macOS 26+): a rounded native-glass panel, with the same
+   legibility layer and text tiers as the glass sidebar. */
+:root:has(.pop[data-material="glass"]),
+:root:has(.pop[data-material="glass"]) body,
+:root:has(.pop[data-material="glass"]) #root,
+:root:has(.pop[data-material="glass"]) .app {
+  background: transparent;
+}
+.pop[data-material="glass"] {
+  border-radius: 16px;
+  border: 1px solid color-mix(in srgb, var(--fg) 12%, transparent);
+  background: color-mix(in srgb, var(--win) 80%, transparent);
+  --fg3: color-mix(in srgb, var(--fg) 70%, var(--win));
+  --fg2: color-mix(in srgb, var(--fg) 84%, var(--win));
+}
+.pop-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 16px 10px;
+}
+.pop-mark {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  background: var(--fill);
+  flex: none;
+}
+.pop-title {
+  display: grid;
+  min-width: 0;
+}
+.pop-name {
+  font-weight: 650;
+  font-size: 14px;
+}
+.pop-status {
+  color: var(--fg2);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pop-body {
+  overflow: auto;
+  /* A soft edge says the list continues under the footer. */
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 18px), transparent);
+  padding: 4px 12px 18px;
+  display: grid;
+  align-content: start;
+  gap: 16px;
+}
+.pop-sec {
+  display: grid;
+  gap: 6px;
+}
+.pop-h {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  padding: 0 4px;
+  color: var(--fg3);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.pop-badge {
+  display: inline-grid;
+  place-items: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--amber);
+  color: var(--on-accent);
+  font-size: 11px;
+  letter-spacing: 0;
+}
+.pop-more {
+  margin: 2px 4px 0;
+  color: var(--fg3);
+  font-size: 12px;
+}
+.pop-clear {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: var(--radius-strip);
+  background: var(--fill);
+  color: var(--fg2);
+}
+.pop-clear .ic {
+  width: 14px;
+  height: 14px;
+  color: var(--green);
+}
+.pop-ask {
+  display: grid;
+  gap: 6px;
+  padding: 12px 12px 12px 14px;
+  border-radius: var(--radius-card);
+  background: var(--fill);
+  box-shadow: inset 3px 0 0 var(--amber);
+}
+.pop-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--fg2);
+  font-size: 12px;
+  min-width: 0;
+}
+.pop-meta .ic {
+  width: 13px;
+  height: 13px;
+  flex: none;
+}
+.pop-q {
+  font-weight: 600;
+  font-size: 14px;
+  line-height: 1.3;
+}
+.pop-rec {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr);
+  gap: 6px;
+  font-size: 12.5px;
+}
+.pop-rec .ic {
+  width: 13px;
+  height: 13px;
+  margin-top: 2px;
+  color: var(--amber-ink);
+}
+.pop-rec-why {
+  display: block;
+  color: var(--fg2);
+  font-size: 12px;
+}
+.pop-acts {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+.pop-note {
+  margin: 0;
+  padding: 4px;
+  color: var(--fg2);
+  font-size: 12px;
+}
+.pop-meta .snooze {
+  margin-left: auto;
+  display: inline-flex;
+  gap: 2px;
+}
+/* Open snooze choices take a line of their own under the meta or the row, so
+   neither the meta text nor a choice wraps in the narrow tray. */
+.pop-ask .pop-meta {
+  flex-wrap: wrap;
+}
+.pop-meta .snooze[role="group"],
+.pop-row-wrap .snooze[role="group"] {
+  flex-basis: 100%;
+  justify-content: flex-end;
+  margin-left: 0;
+}
+.pop-row-wrap .snooze[role="group"] {
+  padding: 0 6px 4px;
+}
+/* A tray row and its "Not now" clock sit side by side: no nested buttons. */
+.pop-row-wrap {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px;
+}
+.pop-row-wrap .pop-row {
+  flex: 1;
+  min-width: 0;
+}
+.pop-row-wrap .snooze {
+  flex: none;
+  display: inline-flex;
+  gap: 2px;
+}
+.pop-row {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) 14px;
+  gap: 10px;
+  align-items: center;
+  padding: 9px 10px;
+  border: 0;
+  border-radius: var(--radius-strip);
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.pop-row:hover {
+  background: var(--sel);
+}
+.pop-row .ic {
+  width: 15px;
+  height: 15px;
+}
+.pop-row-main {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.pop-row-q {
+  font-weight: 500;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.pop-quiet {
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  padding: 72px 24px;
+  text-align: center;
+  color: var(--fg2);
+}
+.pop-quiet .app-logo {
+  opacity: 0.55;
+}
+.pop-quiet-t {
+  color: var(--fg);
+  font-weight: 600;
+  font-size: 15px;
+}
+.pop-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+}
+
+.app-logo {
+  display: block;
+  margin-bottom: 4px;
+}
+
+/* Settings entry in the sidebar footer. */
+.settings-btn {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: var(--fg2);
+  cursor: pointer;
+}
+.settings-btn:hover,
+.settings-btn[aria-current="page"] {
+  background: var(--sel);
+  color: var(--fg);
+}
+.settings-btn .ic {
+  width: 15px;
+  height: 15px;
+}

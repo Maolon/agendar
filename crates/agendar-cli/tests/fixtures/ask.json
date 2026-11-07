@@ -1,0 +1,41 @@
+{
+  "why_now": "Wake delivery is blocked until an approach is chosen.",
+  "question": "How should answers reach idle agents?",
+  "reversibility": "easy",
+  "reach": "local",
+  "external": false,
+  "domain": "arch",
+  "options": [
+    {
+      "id": "adapters",
+      "label": "Use harness adapters",
+      "consequence": "Use hooks for the current harness; verify continuation in a real session.",
+      "reversibility": "easy",
+      "external": false,
+      "eta": { "min_s": 1800, "max_s": 3600 },
+      "icon": "link"
+    },
+    {
+      "id": "inbox",
+      "label": "Use inbox on next start",
+      "consequence": "Deliver the answer when a new session explicitly reads its inbox.",
+      "reversibility": "easy",
+      "external": false,
+      "eta": { "min_s": 900, "max_s": 1800 },
+      "icon": "inbox"
+    }
+  ],
+  "recommended": {
+    "option": "adapters",
+    "confidence": "med",
+    "because": "It can preserve the original session if the harness spike succeeds."
+  },
+  "already_checked": [],
+  "done_when": [
+    {
+      "id": "continues",
+      "text": "The addressed agent reads the saved receipt and acknowledges the chosen answer."
+    }
+  ],
+  "on_timeout": { "kind": "hold" }
+}

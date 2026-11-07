@@ -1,0 +1,39 @@
+[package]
+name = "agendar-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Agendar desktop shell (Tauri): real Vault state, tray, native notification actions"
+publish = false
+
+[lib]
+name = "agendar_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agendar-app"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+agendar-core = { path = "../../crates/agendar-core" }
+agendar-notify = { path = "../../crates/agendar-notify", default-features = false }
+agendar-chrome = { path = "../../crates/agendar-chrome" }
+directories.workspace = true
+# macos-private-api: a transparent window behind the native glass (no-op elsewhere).
+tauri = { workspace = true, features = ["macos-private-api"] }
+tauri-plugin-positioner.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+# The delivery input parser itself: a proposed check reaches the app exactly as
+# `agendar deliver --json` writes it (local proposal journal), not a copy.
+agendar-cli = { path = "../../crates/agendar-cli" }
+tempfile.workspace = true
+serde_json.workspace = true

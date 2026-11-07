@@ -1,0 +1,1 @@
+{"assertions":{"accepted_edges":[["x","y"]],"rejected_edges":[["y","x"]],"rescue_ids":["rescue:cycle:00000000000000000000000004:y:x"],"source":"00000000000000000000000004"},"oracle_version":1}
