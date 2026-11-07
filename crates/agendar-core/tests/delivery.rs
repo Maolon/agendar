@@ -27,9 +27,9 @@ use agendar_core::runtime::Config;
 #[cfg(unix)]
 use agendar_core::runtime::sessions::RuntimeState;
 use agendar_core::runtime::sessions::process_identity;
-use agendar_core::runtime::steward::{
-    CLAUDE_RESUME_GRACE_S, SessionRegistration, register_session, steward_tick, steward_tick_at,
-};
+use agendar_core::runtime::steward::{SessionRegistration, register_session, steward_tick};
+#[cfg(unix)]
+use agendar_core::runtime::steward::{CLAUDE_RESUME_GRACE_S, steward_tick_at};
 use agendar_core::service::Service;
 use agendar_core::vault::Clock;
 
