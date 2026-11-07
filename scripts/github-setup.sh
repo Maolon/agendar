@@ -31,6 +31,7 @@ echo "Repository: $REPO"
 run gh repo edit "$REPO" \
   --description "An agenda for your AI coding agents: it lists only what needs you, and your answer wakes the agent." \
   --add-topic ai-agents --add-topic coding-agents --add-topic claude-code --add-topic codex \
+  --add-topic cursor --add-topic gemini-cli --add-topic opencode --add-topic antigravity \
   --add-topic mcp --add-topic agent-skills --add-topic tauri --add-topic rust
 run gh api -X PATCH "repos/$REPO" \
   -F allow_squash_merge=true -F allow_merge_commit=false -F allow_rebase_merge=false \
