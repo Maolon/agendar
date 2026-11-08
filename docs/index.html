@@ -596,13 +596,22 @@ td a { font-family: var(--mono); font-size: 14px; }
     : /Windows/.test(ua) ? "win"
     : /Linux/.test(ua) && !/Android/.test(ua) ? "linux" : "";
   var dl = document.getElementById("dl");
-  if (platform === "linux") dl.href = "#install";
+  // A Mac goes to the file table unless the browser says which chip it has
+  // (only Chromium-based browsers do), so an Intel Mac never gets the arm build.
+  if (platform === "linux" || platform === "mac") dl.href = "#install";
   var names = { mac: "macOS", win: "Windows", linux: "Linux" };
   if (platform) dl.textContent = "Download for " + names[platform];
+  var arch = Promise.resolve("");
+  if (platform === "mac" && navigator.userAgentData && navigator.userAgentData.getHighEntropyValues) {
+    arch = navigator.userAgentData.getHighEntropyValues(["architecture"])
+      .then(function (v) { return v.architecture || ""; }, function () { return ""; });
+  }
 
-  fetch("https://api.github.com/repos/Maolon/agendar/releases/latest", { headers: { Accept: "application/vnd.github+json" } })
-    .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
-    .then(function (rel) {
+  var release = fetch("https://api.github.com/repos/Maolon/agendar/releases/latest", { headers: { Accept: "application/vnd.github+json" } })
+    .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); });
+  Promise.all([release, arch])
+    .then(function (both) {
+      var rel = both[0], chip = both[1];
       var assets = rel.assets || [];
       var find = function (pattern) {
         var re = new RegExp(pattern);
@@ -613,23 +622,25 @@ td a { font-family: var(--mono); font-size: 14px; }
         var hit = find(a.getAttribute("data-asset"));
         if (hit) { a.href = hit.browser_download_url; a.textContent = hit.name; }
       });
-      var primary = platform === "mac" ? find("_aarch64\\.dmg$") : platform === "win" ? find("_x64-setup\\.exe$") : null;
+      var mac = { arm: ["_aarch64\\.dmg$", "Apple silicon", "_x64\\.dmg$", "Intel Mac"],
+                  x86: ["_x64\\.dmg$", "Intel", "_aarch64\\.dmg$", "Apple silicon Mac"] }[chip];
+      var primary = platform === "win" ? find("_x64-setup\\.exe$") : platform === "mac" && mac ? find(mac[0]) : null;
       if (primary) dl.href = primary.browser_download_url;
       var version = (rel.tag_name || "").replace(/^v/, "");
-      if (version) {
-        var fine = document.getElementById("dl-fine");
-        fine.textContent = "Version " + version + (platform === "mac" ? " for Apple silicon. " : ". ") + "Free and open source, for macOS, Windows and Linux.";
-        if (platform === "mac") {
-          var intel = find("_x64\\.dmg$");
-          if (intel) {
-            fine.textContent = "Version " + version + " for Apple silicon. ";
-            var link = document.createElement("a");
-            link.href = intel.browser_download_url;
-            link.textContent = "Intel Mac";
-            fine.appendChild(link);
-            fine.appendChild(document.createTextNode(". Free and open source."));
-          }
-        }
+      if (!version) return;
+      var fine = document.getElementById("dl-fine");
+      var other = primary && mac ? find(mac[2]) : null;
+      if (other) {
+        fine.textContent = "Version " + version + " for " + mac[1] + ". ";
+        var link = document.createElement("a");
+        link.href = other.browser_download_url;
+        link.textContent = mac[3];
+        fine.appendChild(link);
+        fine.appendChild(document.createTextNode(". Free and open source."));
+      } else if (platform === "mac") {
+        fine.textContent = "Version " + version + " for Apple silicon and Intel. Free and open source.";
+      } else {
+        fine.textContent = "Version " + version + ". Free and open source, for macOS, Windows and Linux.";
       }
     })
     .catch(function () {});
