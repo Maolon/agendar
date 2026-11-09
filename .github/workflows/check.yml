@@ -23,6 +23,8 @@ jobs:
           node-version: 26.12.1
       - name: One version everywhere
         run: node scripts/check-version.mjs
+      - name: Product page files are current
+        run: node scripts/build-llms.mjs --check
 
   seed-oracles:
     name: seed oracles

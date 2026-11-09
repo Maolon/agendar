@@ -1,0 +1,23 @@
+# Agendar
+
+> Agendar is an agenda for your AI coding agents: a desktop app and CLI that lists only what needs your call. Agents report their plan and progress through the `agendar` CLI or its MCP server, and ask for a decision with a card (the question, two to four options with what each one costs, a recommendation, and what the answer unblocks). You answer from the app, the menu bar or the notification, and the same agent session continues where it stopped.
+
+- Works with Claude Code and Codex (hooks), Cursor, Gemini CLI, Antigravity, opencode and pi (MCP server, `agendar mcp`), and anything that runs a shell (the `agendar` CLI and the Agent Skill).
+- Runs on macOS (Apple silicon and Intel), Windows and Linux; macOS is the platform it is tested on.
+- No server: each machine appends to its own files in a folder you choose (iCloud Drive, Dropbox, Syncthing or a local folder).
+- Free and open source under the MIT license.
+- Install the Agent Skill with `npx skills add Maolon/agendar -g`.
+
+## Docs
+
+- [Product page (Markdown)](https://mxlo.top/agendar/index.md): what Agendar does, how the loop works, supported agents, install and FAQ
+- [README](https://raw.githubusercontent.com/Maolon/agendar/main/README.md): overview, install, status and build from source
+- [Agent Skill](https://raw.githubusercontent.com/Maolon/agendar/main/skills/agendar/SKILL.md): the commands an agent runs to report progress, ask, wait for and acknowledge answers
+- [Releases](https://github.com/Maolon/agendar/releases/latest): the app for each platform, the standalone `agendar` CLI and checksums
+
+## Optional
+
+- [Full text](https://mxlo.top/agendar/llms-full.txt): the product page, README and Agent Skill in one file
+- [Changelog](https://raw.githubusercontent.com/Maolon/agendar/main/CHANGELOG.md): what changed in each release
+- [Contributing](https://raw.githubusercontent.com/Maolon/agendar/main/CONTRIBUTING.md): how changes and releases work
+- [Source code](https://github.com/Maolon/agendar): the GitHub repository

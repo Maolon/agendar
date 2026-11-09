@@ -9,15 +9,97 @@
 <meta name="theme-color" content="#eeeeeb" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#0f0f0e" media="(prefers-color-scheme: dark)">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
-<link rel="canonical" href="https://maolon.github.io/agendar/">
+<meta name="robots" content="index,follow">
+<link rel="canonical" href="https://mxlo.top/agendar/">
+<link rel="alternate" type="text/markdown" href="https://mxlo.top/agendar/index.md" title="Agendar (Markdown)">
 <meta property="og:type" content="website">
+<meta property="og:site_name" content="Agendar">
 <meta property="og:title" content="Agendar: an agenda for your AI coding agents">
 <meta property="og:description" content="It lists only what needs you. Your answer wakes the agent session that asked.">
-<meta property="og:url" content="https://maolon.github.io/agendar/">
-<meta property="og:image" content="https://maolon.github.io/agendar/images/og.png">
+<meta property="og:url" content="https://mxlo.top/agendar/">
+<meta property="og:image" content="https://mxlo.top/agendar/images/og.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Agendar: an agenda for your AI coding agents">
 <meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Agendar: an agenda for your AI coding agents">
+<meta name="twitter:description" content="It lists only what needs you. Your answer wakes the agent session that asked.">
+<meta name="twitter:image" content="https://mxlo.top/agendar/images/og.png">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "Agendar",
+  "description": "A desktop app and CLI that lists only what needs your call from your AI coding agents. Your answer wakes the agent session that asked. Works with Claude Code, Codex, Cursor, Gemini CLI, Antigravity, opencode, pi and anything that runs a shell.",
+  "applicationCategory": "DeveloperApplication",
+  "operatingSystem": "macOS, Windows, Linux",
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+  "license": "https://spdx.org/licenses/MIT.html",
+  "isAccessibleForFree": true,
+  "inLanguage": ["en", "zh-Hans", "zh-Hant"],
+  "url": "https://mxlo.top/agendar/",
+  "downloadUrl": "https://github.com/Maolon/agendar/releases/latest",
+  "releaseNotes": "https://github.com/Maolon/agendar/blob/main/CHANGELOG.md",
+  "sameAs": ["https://github.com/Maolon/agendar"],
+  "image": "https://mxlo.top/agendar/images/og.png"
+}
+</script>
+<script type="application/ld+json" id="faq-ld">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "What is Agendar?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "A desktop app and CLI that gives your AI coding agents one place to report their plan and one way to ask you for a decision. It lists only what needs your call, and your answer wakes the agent session that asked."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Which coding agents does it work with?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Claude Code and Codex connect through hooks, so the session waits for your answer and continues. Cursor, Gemini CLI, Antigravity, opencode and pi connect through the MCP server (agendar mcp). Anything that runs a shell can use the agendar CLI and the Agent Skill."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does it need a server? Where is my data kept?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No server. Each machine appends to its own files in a folder you choose: iCloud Drive, Dropbox, Syncthing or a local folder. The app works offline, and several machines can share one agenda."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Which platforms does it run on?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "macOS (Apple silicon and Intel), Windows and Linux (.deb or .AppImage). Each release also has the agendar CLI on its own for machines that only run agents. macOS is the platform it is tested on; Windows and Linux build and pass the tests in CI but have seen little real use."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How does my answer reach the agent?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "You answer from the app, the menu bar or the notification, and the answer becomes a receipt with done when criteria. Hooks hold Claude Code and Codex sessions open until you answer; other agents read their inbox. The agent applies the receipt, acknowledges it and reports the result back to the plan."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "What does it cost?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Nothing. Agendar is free and open source under the MIT license."
+      }
+    }
+  ]
+}
+</script>
 <style>
 :root {
   --page: #eeeeeb;
@@ -240,6 +322,24 @@ td a { font-family: var(--mono); font-size: 14px; }
 .note p:last-child { margin: 0; }
 .note strong { color: var(--fg); }
 
+/* Questions */
+.faq { max-width: 760px; margin: 32px 0 0; border-top: 1px solid var(--line); }
+.faq details { border-bottom: 1px solid var(--line); }
+.faq summary {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 16px 0; cursor: pointer; list-style: none;
+  font-weight: 600; letter-spacing: -0.01em;
+}
+.faq summary::-webkit-details-marker { display: none; }
+.faq summary::after {
+  content: ""; flex: none; width: 8px; height: 8px; margin: -4px 4px 0 0;
+  border-right: 1.5px solid var(--fg2); border-bottom: 1.5px solid var(--fg2);
+  transform: rotate(45deg); transition: transform .2s;
+}
+.faq details[open] summary::after { transform: rotate(-135deg); margin-top: 4px; }
+.faq summary:hover::after { border-color: var(--fg); }
+.faq details p { margin: -4px 0 18px; max-width: 62ch; color: var(--fg2); font-size: 15.5px; }
+
 /* Footer */
 .foot { margin-top: 120px; padding: 32px 0 48px; border-top: 1px solid var(--line); }
 .foot .wrap { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 16px 32px; align-items: center; font-size: 14px; color: var(--fg2); }
@@ -272,7 +372,7 @@ td a { font-family: var(--mono); font-size: 14px; }
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
   .s.doing, .radar::after { animation: none; }
-  .s { transition: none; }
+  .s, .faq summary::after { transition: none; }
 }
 </style>
 </head>
@@ -283,6 +383,7 @@ td a { font-family: var(--mono); font-size: 14px; }
   <a class="brand" href="./"><img src="favicon.svg" alt="" width="30" height="30">Agendar</a>
   <nav aria-label="Site">
     <a href="#install">Install</a>
+    <a href="#faq">FAQ</a>
     <a href="https://github.com/Maolon/agendar">GitHub</a>
   </nav>
 </header>
@@ -506,6 +607,37 @@ td a { font-family: var(--mono); font-size: 14px; }
     <div class="wrap">
       <h2>Status</h2>
       <p>Agendar is young and used every day to track its own development. macOS is the platform it is tested on. Windows and Linux build and pass the tests in CI but have seen little real use. Sharing one agenda across machines is built in and tested with simulated hosts; real multi-machine use is still thin.</p>
+    </div>
+  </section>
+  <section class="band" id="faq">
+    <div class="wrap">
+      <h2>Frequently asked questions</h2>
+      <div class="faq">
+        <details>
+          <summary>What is Agendar?</summary>
+          <p>A desktop app and CLI that gives your AI coding agents one place to report their plan and one way to ask you for a decision. It lists only what needs your call, and your answer wakes the agent session that asked.</p>
+        </details>
+        <details>
+          <summary>Which coding agents does it work with?</summary>
+          <p>Claude Code and Codex connect through hooks, so the session waits for your answer and continues. Cursor, Gemini CLI, Antigravity, opencode and pi connect through the MCP server (<code>agendar mcp</code>). Anything that runs a shell can use the <code>agendar</code> CLI and the Agent Skill.</p>
+        </details>
+        <details>
+          <summary>Does it need a server? Where is my data kept?</summary>
+          <p>No server. Each machine appends to its own files in a folder you choose: iCloud Drive, Dropbox, Syncthing or a local folder. The app works offline, and several machines can share one agenda.</p>
+        </details>
+        <details>
+          <summary>Which platforms does it run on?</summary>
+          <p>macOS (Apple silicon and Intel), Windows and Linux (<code>.deb</code> or <code>.AppImage</code>). Each release also has the <code>agendar</code> CLI on its own for machines that only run agents. macOS is the platform it is tested on; Windows and Linux build and pass the tests in CI but have seen little real use.</p>
+        </details>
+        <details>
+          <summary>How does my answer reach the agent?</summary>
+          <p>You answer from the app, the menu bar or the notification, and the answer becomes a receipt with <em>done when</em> criteria. Hooks hold Claude Code and Codex sessions open until you answer; other agents read their inbox. The agent applies the receipt, acknowledges it and reports the result back to the plan.</p>
+        </details>
+        <details>
+          <summary>What does it cost?</summary>
+          <p>Nothing. Agendar is free and open source under the MIT license.</p>
+        </details>
+      </div>
     </div>
   </section>
 </main>
