@@ -45,11 +45,14 @@ pub fn cold_split(vault_dir: &Path) -> Result<ColdSplit, FfiError> {
                 if path.extension().is_none_or(|ext| ext != "jsonl") {
                     continue;
                 }
+                // A source path is slash-separated on every platform.
                 let relative = path
                     .strip_prefix(vault_dir)
                     .map_err(|_| core_error("outside the Vault"))?
-                    .to_string_lossy()
-                    .into_owned();
+                    .components()
+                    .map(|part| part.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
                 let source = SourcePath::from_relative_path(&relative)?;
                 let text = std::fs::read(&path).map_err(io)?;
                 files += 1;

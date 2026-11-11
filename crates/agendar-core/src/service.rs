@@ -3391,7 +3391,16 @@ impl Service {
         self.require_session(session, project)?;
         if let WaitTarget::Verdict(delivery) = target {
             // Fails fast on an unknown delivery or one another session made.
-            let fresh = self.refresh(SystemClock.now(), true)?;
+            let mut fresh = self.refresh(SystemClock.now(), true)?;
+            // A delivery made a moment ago may not be in the committed index
+            // yet: read the Vault before calling it unknown.
+            let known = self.project(&fresh, project).is_ok_and(|state| {
+                crate::verdict::review_packet(state, &fresh.resolution.ordered, project, delivery)
+                    .is_ok()
+            });
+            if !known {
+                fresh = self.refresh(SystemClock.now(), false)?;
+            }
             let state = self.project(&fresh, project)?;
             crate::verdict::review_packet(state, &fresh.resolution.ordered, project, delivery)?;
             if !crate::verdict::made_by(&fresh.resolution.ordered, delivery, session)

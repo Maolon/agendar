@@ -55,7 +55,8 @@ fn no_hand_written_unsafe() {
             .strip_prefix(root)
             .unwrap_or(file)
             .display()
-            .to_string();
+            .to_string()
+            .replace('\\', "/");
         assert!(
             !has_unsafe_keyword(&text),
             "{name}: hand-written `{KEYWORD}` is forbidden in agendar-ffi"
