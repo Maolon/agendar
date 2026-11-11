@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/Maolon/agendar/compare/v0.1.0...v0.2.0) (2026-11-11)
+
+
+### Features
+
+* delivery review, a self-correcting board, search and update checks ([#4](https://github.com/Maolon/agendar/issues/4)) ([3cbd1ea](https://github.com/Maolon/agendar/commit/3cbd1eabef5cbf07050711cad4c9417d89247729))
+
 ## 0.1.0
 
 First public release.
