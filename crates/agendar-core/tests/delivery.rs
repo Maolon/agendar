@@ -452,7 +452,7 @@ fn a_resume_warning_is_queued_for_the_next_resume_never_reported_as_continued() 
 
 #[cfg(unix)]
 #[test]
-fn a_lost_feature_needs_an_explicit_handoff_before_a_new_session_may_start_it() {
+fn a_lost_feature_is_open_to_a_new_session_and_an_explicit_handoff_still_works() {
     let scratch = Scratch::new("handoff");
     let (service, _) = Service::init(&scratch.vault, &scratch.data).expect("init");
     let mut child = Command::new("sleep")
@@ -483,25 +483,16 @@ fn a_lost_feature_needs_an_explicit_handoff_before_a_new_session_may_start_it() 
     let second = register_session(&service, registration(&scratch, Harness::Generic, "second"))
         .expect("register replacement session");
 
-    // Without a handoff the lost feature is not runnable for the new session.
-    let error = service
-        .progress_started(
-            &project(),
-            &second,
-            &node(),
-            agendar_core::model::EtaRange {
-                min_s: agendar_core::model::Seconds::new(60).expect("min"),
-                max_s: agendar_core::model::Seconds::new(120).expect("max"),
-            },
-            None,
-            None,
-        )
-        .expect_err("a lost feature is not silently reassigned");
-    assert_eq!(error.code(), ErrorCode::Policy);
-
     let state = service
         .export_state(agendar_core::vault::SystemClock.now())
         .expect("state");
+    // A lost session's step is free: open to any agent without a hand-off.
+    // The owner may still hand it over from its row.
+    assert!(agendar_core::reduce::attention::runnable_for(
+        &second,
+        &node(),
+        state.projects.get(&project()).expect("project"),
+    ));
     let need = state
         .projects
         .get(&project())

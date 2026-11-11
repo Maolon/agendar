@@ -11,7 +11,7 @@
 use serde::Serialize;
 
 use crate::model::ids::{SessionId, UtcTime};
-use crate::model::state::{Liveness, Progress, ProjectState, TimeRange};
+use crate::model::state::{Lease, Liveness, Phase, Progress, ProjectState, TimeRange};
 
 /// Finished steps needed before a typical step duration means anything.
 pub const MIN_BASIS_STEPS: usize = 3;
@@ -20,6 +20,12 @@ pub const MIN_BASIS_STEPS: usize = 3;
 pub struct Forecast {
     /// Steps not finished yet (in progress or not started; dropped left out).
     pub open_steps: u32,
+    /// Of those: an agent's claim stands (held or stalled).
+    pub in_progress: u32,
+    /// Of those: the claim ended (session lost or silent past its lease).
+    pub abandoned: u32,
+    /// Of those: nobody started them.
+    pub not_started: u32,
     /// Agents working now; the remaining work is split between them.
     pub agents: u32,
     /// Remaining agent work, low and high, in milliseconds.
@@ -48,17 +54,28 @@ pub fn forecast(
     let median = percentile(sorted_durations, 50);
     let high = percentile(sorted_durations, 75);
     let mut open = 0_u32;
+    let mut split = Split::default();
     let mut work = [0_u64, 0_u64];
     let mut agents: Vec<&SessionId> = Vec::new();
     for feature in project.features.values() {
         if matches!(
             feature.progress,
             Progress::Done | Progress::Verified | Progress::Dropped
-        ) {
+        ) || feature.phase == Some(Phase::InReview)
+        {
+            // A step in review waits for the owner, not for agent work.
             continue;
         }
         open += 1;
-        let running = feature.progress == Progress::Doing && feature.liveness == Liveness::Live;
+        split.count(feature);
+        // A step whose claim ended has nobody on it, even if its session is
+        // busy elsewhere.
+        let running = feature.progress == Progress::Doing
+            && feature.liveness == Liveness::Live
+            && feature
+                .claim
+                .as_ref()
+                .is_none_or(|claim| claim.state != Lease::Free);
         match (running, feature.eta.as_ref()) {
             (true, Some(eta)) => {
                 let window = eta.likely_finish.as_ref().unwrap_or(&eta.agent_finish);
@@ -93,12 +110,36 @@ pub fn forecast(
     });
     Some(Forecast {
         open_steps: open,
+        in_progress: split.in_progress,
+        abandoned: split.abandoned,
+        not_started: split.not_started,
         agents: u32::try_from(agents.len()).unwrap_or(u32::MAX),
         work_ms: work,
         finish,
         step_ms: [low, high],
         basis_steps: u32::try_from(sorted_durations.len()).unwrap_or(u32::MAX),
     })
+}
+
+/// Work left by who stands behind it.
+#[derive(Debug, Default)]
+struct Split {
+    in_progress: u32,
+    abandoned: u32,
+    not_started: u32,
+}
+
+impl Split {
+    fn count(&mut self, feature: &crate::model::state::FeatureState) {
+        match (
+            feature.progress,
+            feature.claim.as_ref().map(|claim| claim.state),
+        ) {
+            (Progress::Planned, _) => self.not_started += 1,
+            (_, Some(Lease::Free)) => self.abandoned += 1,
+            _ => self.in_progress += 1,
+        }
+    }
 }
 
 /// Nearest-rank percentile of a sorted, non-empty slice.

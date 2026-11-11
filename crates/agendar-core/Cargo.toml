@@ -20,6 +20,12 @@ fs2.workspace = true
 tempfile.workspace = true
 rusqlite.workspace = true
 notify.workspace = true
+ureq.workspace = true
+semver.workspace = true
+
+# Process inspection for session liveness. iOS exposes no process table to
+# apps (sysinfo does not build there) and a mobile client hosts no agent sessions.
+[target.'cfg(not(target_os = "ios"))'.dependencies]
 sysinfo.workspace = true
 
 # `O_NOFOLLOW` for the no-follow lock leaf open; the constant is platform ABI,

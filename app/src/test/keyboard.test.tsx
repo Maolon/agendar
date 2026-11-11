@@ -56,20 +56,21 @@ describe("keyboard and action guards", () => {
     expect(screen.getByRole("heading", { name: /Since you last looked/ })).toBeInTheDocument();
   });
 
-  it("focuses search with ⌘/Ctrl-K and never navigates or submits while typing", async () => {
+  it("focuses search with ⌘/Ctrl-K; typing never moves the sidebar or submits an answer", async () => {
     const user = userEvent.setup();
     const { client } = await setup();
     await user.keyboard("{Control>}k{/Control}");
-    const search = screen.getByRole("searchbox");
+    const search = screen.getByRole("combobox", { name: "Search everything" });
     expect(search).toHaveFocus();
 
-    await user.keyboard("alpha{ArrowDown}{Enter}");
+    await user.keyboard("alpha{ArrowDown}");
     expect(search).toHaveValue("alpha");
     expect(screen.getByRole("heading", { name: /Since you last looked/ })).toBeInTheDocument();
     expect(client.order).not.toContain("answer_decision");
 
     await user.keyboard("{Escape}");
     expect(search).not.toHaveFocus();
+    expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
   });
 
   it("selects a costly option by number but plain Enter cannot submit it", async () => {
@@ -303,12 +304,12 @@ describe("keyboard and action guards", () => {
     expect(client.order).not.toContain("answer_decision");
   });
 
-  it("shows All clear only when all six brief sections are empty", async () => {
+  it("says All quiet only when nothing moves, stalls, waits, finished or is next", async () => {
     const snapshot = emptyBrief(makeSnapshot());
     const client = new FakeClient(snapshot);
     const store = new SnapshotStore(client);
     render(<App client={client} store={store} surface="main" />);
-    expect(await screen.findByRole("heading", { name: "All clear" })).toBeInTheDocument();
+    expect(await screen.findByText("All quiet")).toBeInTheDocument();
   });
 
   it("does not show All clear when only the needs list is empty", async () => {
@@ -319,7 +320,7 @@ describe("keyboard and action guards", () => {
     const store = new SnapshotStore(client);
     render(<App client={client} store={store} surface="main" />);
     expect(await screen.findByRole("heading", { name: /Since you last looked/ })).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: "All clear" })).toBeNull();
+    expect(screen.queryByText("All quiet")).toBeNull();
   });
 
   it("shows a recoverable error screen and reloads after retry", async () => {
@@ -346,6 +347,7 @@ function emptyBrief(snapshot: Snapshot): Snapshot {
   for (const project of Object.values(next.state.projects)) {
     project.needs_you = [];
     project.summary.needs_count = 0;
+    project.features = {};
   }
   return next;
 }

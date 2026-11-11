@@ -28,6 +28,7 @@ pub const MAIN_ONLY: &[&str] = &[
     "resolve_rescue",
     "update_project",
     "update_feature",
+    "drop_steps",
     "set_policy",
     "set_rule",
     "read_report",
@@ -37,6 +38,7 @@ pub const MAIN_ONLY: &[&str] = &[
     "configure_vault",
     "get_setup_locations",
     "get_local_config",
+    "get_storage_usage",
     "test_notice",
     "open_report",
     "get_bindings",
@@ -45,6 +47,8 @@ pub const MAIN_ONLY: &[&str] = &[
     "link_repo",
     "unlink_repo",
     "open_preview",
+    "check_updates",
+    "open_release",
 ];
 
 fn caller(window: &WebviewWindow, command: &str) -> ApiResult<String> {
@@ -295,6 +299,38 @@ pub async fn unlink_repo(
     }
 }
 
+/// Settings → About "Check now": one request to the public releases API.
+#[tauri::command]
+pub async fn check_updates(
+    window: WebviewWindow,
+    state: State<'_, HostHandle>,
+    _request: Value,
+) -> Result<Value, ()> {
+    match caller(&window, "check_updates") {
+        Ok(_) => {
+            let host = Arc::clone(&state.host);
+            blocking(move || host.check_updates()).await
+        }
+        Err(error) => Ok(error::err(error)),
+    }
+}
+
+/// Open the cached latest release page in the browser.
+#[tauri::command]
+pub async fn open_release(
+    window: WebviewWindow,
+    state: State<'_, HostHandle>,
+    _request: Value,
+) -> Result<Value, ()> {
+    match caller(&window, "open_release") {
+        Ok(_) => {
+            let host = Arc::clone(&state.host);
+            blocking(move || host.open_release()).await
+        }
+        Err(error) => Ok(error::err(error)),
+    }
+}
+
 #[tauri::command]
 pub async fn get_local_config(
     window: WebviewWindow,
@@ -305,6 +341,21 @@ pub async fn get_local_config(
         Ok(_) => {
             let host = Arc::clone(&state.host);
             blocking(move || host.get_local_config()).await
+        }
+        Err(error) => Ok(error::err(error)),
+    }
+}
+
+#[tauri::command]
+pub async fn get_storage_usage(
+    window: WebviewWindow,
+    state: State<'_, HostHandle>,
+    _request: Value,
+) -> Result<Value, ()> {
+    match caller(&window, "get_storage_usage") {
+        Ok(_) => {
+            let host = Arc::clone(&state.host);
+            blocking(move || host.get_storage_usage()).await
         }
         Err(error) => Ok(error::err(error)),
     }
@@ -408,6 +459,11 @@ pub async fn show_main(
 ) -> Result<Value, ()> {
     match caller(&window, "show_main") {
         Ok(_) => {
+            // The tray's Update button opens Settings › About.
+            if request.get("view").and_then(Value::as_str) == Some("about") {
+                state.host.show_about();
+                return Ok(error::ok(serde_json::json!({})));
+            }
             // Optional target: the tray opens the main window on one item.
             let project = request
                 .get("project")
@@ -557,6 +613,21 @@ pub async fn update_feature(
     }
 }
 
+#[tauri::command]
+pub async fn drop_steps(
+    window: WebviewWindow,
+    state: State<'_, HostHandle>,
+    request: Value,
+) -> Result<Value, ()> {
+    match caller(&window, "drop_steps") {
+        Ok(_) => {
+            let host = Arc::clone(&state.host);
+            blocking(move || host.drop_steps(&request)).await
+        }
+        Err(error) => Ok(error::err(error)),
+    }
+}
+
 unsupported_command!(open_preview);
 
 #[tauri::command]
@@ -645,6 +716,7 @@ pub const COMMANDS: &[&str] = &[
     "resolve_rescue",
     "update_project",
     "update_feature",
+    "drop_steps",
     "set_policy",
     "set_rule",
     "read_report",
@@ -656,6 +728,7 @@ pub const COMMANDS: &[&str] = &[
     "configure_vault",
     "get_setup_locations",
     "get_local_config",
+    "get_storage_usage",
     "test_notice",
     "open_report",
     "get_bindings",
@@ -668,4 +741,6 @@ pub const COMMANDS: &[&str] = &[
     "open_preview",
     "window_chrome",
     "set_glass_regions",
+    "check_updates",
+    "open_release",
 ];

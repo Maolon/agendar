@@ -20,11 +20,15 @@ import type {
   Reversibility,
   RuleState,
   Snapshot,
+  StorageUsage,
   Theme,
+  UsageNumbers,
+  UsageTally,
 } from "../api/types";
 import type { Transport } from "../api/client";
 import { buildFixtureGraph, buildFixtureSnapshot, FIXTURE_STARTED_SESSION } from "./fixtures";
 import { buildShowcaseSnapshot } from "./showcase";
+import { RECEIPT_FREE_EXCERPT } from "./diffExcerpt";
 
 const RISK: Record<Reversibility, number> = { easy: 0, costly: 1, irreversible: 2 };
 const RISK_NAME: Reversibility[] = ["easy", "costly", "irreversible"];
@@ -51,6 +55,99 @@ function notImplemented(command: string): ApiEnvelope<never> {
       retryable: false,
     },
   };
+}
+
+const NO_FILES: UsageTally = { count: 0, bytes: 0, local_bytes: 0 };
+
+function usageNumbers(
+  eventBytes: number,
+  parts: { delivery: UsageTally; other?: UsageTally; superseded?: UsageTally; unreferenced?: UsageTally },
+  archived: boolean,
+): UsageNumbers {
+  const other = parts.other ?? NO_FILES;
+  const unreferenced = parts.unreferenced ?? NO_FILES;
+  const attachments: UsageTally = {
+    count: parts.delivery.count + other.count + unreferenced.count,
+    bytes: parts.delivery.bytes + other.bytes + unreferenced.bytes,
+    local_bytes: parts.delivery.local_bytes + other.local_bytes + unreferenced.local_bytes,
+  };
+  return {
+    total_bytes: eventBytes + attachments.bytes,
+    total_local_bytes: eventBytes + attachments.local_bytes,
+    event_bytes: eventBytes,
+    event_local_bytes: eventBytes,
+    attachments,
+    categories: { delivery: parts.delivery, report: other, unreferenced },
+    reclaimable: archived ? parts.delivery : NO_FILES,
+    superseded: parts.superseded ?? NO_FILES,
+    unreferenced,
+  };
+}
+
+/**
+ * Made-up sizes for the snapshot's projects, plus one archived project so the
+ * "could free" column has a value. The real numbers come from the core.
+ */
+function fixtureUsage(snapshot: Snapshot): StorageUsage {
+  const projects = Object.values(snapshot.state.projects).map((project, index) => {
+    const deliveries = Object.keys(project.deliveries).length + 2;
+    const delivery: UsageTally = {
+      count: deliveries * 4,
+      bytes: deliveries * 612_000 + index * 37_000,
+      // The first project has attachments that are not on this computer.
+      local_bytes: index === 0 ? deliveries * 250_000 : deliveries * 612_000 + index * 37_000,
+    };
+    const archived = project.summary.archived;
+    return {
+      project: project.summary.slug,
+      title: project.summary.title,
+      archived,
+      ...usageNumbers(
+        210_000 + index * 86_000,
+        {
+          delivery,
+          other: { count: 3, bytes: 96_000, local_bytes: 96_000 },
+          superseded: index === 0 && !archived ? { count: 21, bytes: 3_100_000, local_bytes: 900_000 } : NO_FILES,
+          unreferenced: index === 1 ? { count: 2, bytes: 48_000, local_bytes: 48_000 } : NO_FILES,
+        },
+        archived,
+      ),
+    };
+  });
+  projects.push({
+    project: "launch-2025",
+    title: "Launch site 2025",
+    archived: true,
+    ...usageNumbers(
+      1_240_000,
+      {
+        delivery: { count: 64, bytes: 41_800_000, local_bytes: 41_800_000 },
+        other: { count: 9, bytes: 730_000, local_bytes: 730_000 },
+      },
+      true,
+    ),
+  });
+  projects.sort((a, b) => b.total_bytes - a.total_bytes || a.project.localeCompare(b.project));
+  const add = (a: UsageTally, b: UsageTally): UsageTally => ({
+    count: a.count + b.count,
+    bytes: a.bytes + b.bytes,
+    local_bytes: a.local_bytes + b.local_bytes,
+  });
+  const total = projects.reduce<UsageNumbers>(
+    (sum, project) => ({
+      total_bytes: sum.total_bytes + project.total_bytes,
+      total_local_bytes: sum.total_local_bytes + project.total_local_bytes,
+      event_bytes: sum.event_bytes + project.event_bytes,
+      event_local_bytes: sum.event_local_bytes + project.event_local_bytes,
+      attachments: add(sum.attachments, project.attachments),
+      categories: {},
+      reclaimable: add(sum.reclaimable, project.reclaimable),
+      superseded: add(sum.superseded, project.superseded),
+      unreferenced: add(sum.unreferenced, project.unreferenced),
+    }),
+    usageNumbers(0, { delivery: NO_FILES }, false),
+  );
+  return { evaluated_at: new Date().toISOString(), superseded_after_days: 30, total, projects };
 }
 
 function findDecision(
@@ -96,6 +193,36 @@ function nextRevision(): string {
  * a media token for images; a real Vault would verify hash and size first.
  */
 const REPORT_TEXT: Record<string, { mime: string; text?: string }> = {
+  [digest(0x8d)]: { mime: "text/plain", text: RECEIPT_FREE_EXCERPT },
+  [digest(0x8e)]: {
+    mime: "text/plain",
+    text: [
+      "$ cargo test -p agendar-core --test checks receipt_free",
+      "   Compiling agendar-core v0.1.0",
+      "    Finished `test` profile [unoptimized] target(s) in 11.84s",
+      "     Running tests/checks.rs",
+      "",
+      "running 2 tests",
+      "test a_receipt_free_delivery_lists_no_criteria ... ok",
+      "test a_receipt_free_delivery_reaches_review ... ok",
+      "",
+      "test result: ok. 2 passed; 0 failed; 0 ignored",
+    ].join("\n"),
+  },
+  [digest(0x8f)]: {
+    mime: "text/plain",
+    text: [
+      "$ cargo test -p agendar-core --test checks receipt_free",
+      "    Finished `test` profile [unoptimized] target(s) in 10.02s",
+      "     Running tests/checks.rs",
+      "",
+      "running 2 tests",
+      "test a_receipt_free_delivery_reaches_review ... ok",
+      "test a_receipt_free_delivery_lists_no_criteria ... FAILED",
+      "",
+      "test result: FAILED. 1 passed; 1 failed; 0 ignored",
+    ].join("\n"),
+  },
   [digest(0x81)]: {
     mime: "text/plain",
     text: [
@@ -136,6 +263,8 @@ export function createFixtureTransport(dataset: "test" | "showcase" = "test"): T
     { askId: string; optionId: string; label: string; expiresAt: number }
   >();
   const approvals = new Map<string, unknown>();
+  /** `drop_steps` results by request id, with the payload they answered. */
+  const drops = new Map<string, { payload: string; data: { event_ids: string[] } }>();
   let tokenCounter = 0;
 
   function emit(event: string, payload: unknown): void {
@@ -178,7 +307,34 @@ export function createFixtureTransport(dataset: "test" | "showcase" = "test"): T
       case "get_setup_locations":
         return ok({ locations: [] });
       case "open_report":
+      case "open_release":
         return ok({ opened: true });
+      case "check_updates": {
+        if (!snapshot.update || snapshot.preferences.update_check === false) {
+          return {
+            v: 1,
+            ok: false,
+            error: { code: "E_POLICY", message: "Update checks are turned off.", hint: "", retryable: false },
+          };
+        }
+        // Simulate the host: a "started" event at once, the result after a
+        // beat. Each check flips between "0.2.0 is out" and "up to date", so
+        // repeated Check now clicks walk the footer tag through every state.
+        const before = snapshot.update;
+        snapshot.update = { ...before, checking: true };
+        emit("agendar://update", { v: 1, phase: "started", update: snapshot.update });
+        await new Promise((done) => setTimeout(done, 1500));
+        const newer = !before.available;
+        snapshot.update = {
+          ...before,
+          checking: false,
+          latest: newer ? "0.2.0" : before.current,
+          available: newer && before.channel === "release",
+          checked_at: new Date().toISOString(),
+        };
+        emit("agendar://update", { v: 1, phase: "finished", update: snapshot.update });
+        return ok({ update: snapshot.update });
+      }
       case "get_bindings":
         return ok({
           cli_path: "/Applications/Agendar.app/Contents/MacOS/agendar",
@@ -207,6 +363,8 @@ export function createFixtureTransport(dataset: "test" | "showcase" = "test"): T
           cli_path: "/Applications/Agendar.app/Contents/MacOS/agendar",
           app_version: "0.1.0",
         });
+      case "get_storage_usage":
+        return ok(fixtureUsage(snapshot));
       case "get_project": {
         const project = snapshot.state.projects[String(input.project)];
         if (!project) {
@@ -541,9 +699,23 @@ export function createFixtureTransport(dataset: "test" | "showcase" = "test"): T
             },
           } satisfies ApiEnvelope<never>;
         }
+        const comments = Array.isArray(input.comments) ? input.comments : [];
+        if (comments.length && verdict !== "send_back") {
+          return {
+            v: 1,
+            ok: false,
+            error: {
+              code: "E_VALIDATION",
+              message: "Comments are only allowed when sending a delivery back.",
+              field: "/comments",
+              hint: "Remove the comments or send it back.",
+              retryable: false,
+            },
+          } satisfies ApiEnvelope<never>;
+        }
         if (verdict === "send_back") {
           const reason = String(input.reason ?? "").trim();
-          if (!reason) {
+          if (!reason && !comments.length) {
             return {
               v: 1,
               ok: false,
@@ -834,8 +1006,60 @@ export function createFixtureTransport(dataset: "test" | "showcase" = "test"): T
           feature.field_sources.priority = event;
           feature.field_revisions.priority = nextRevision();
         }
+        // Any owner event on the step clears `untouched` for good, as in the core.
+        delete feature.untouched;
         publish(project.summary.slug, "local");
         return ok({ event_id: event });
+      }
+      case "drop_steps": {
+        const refuse = (code: string, message: string, field?: string): ApiEnvelope<never> => ({
+          v: 1,
+          ok: false,
+          error: { code, message, ...(field ? { field } : {}), hint: "Refresh the project.", retryable: false },
+        });
+        const { request_id: requestId, ...rest } = input as { request_id?: string };
+        const payload = JSON.stringify(rest);
+        const replay = drops.get(String(requestId));
+        if (replay) {
+          return replay.payload === payload
+            ? ok(replay.data)
+            : refuse("E_REQUEST_CONFLICT", "This request id was already used with different input.");
+        }
+        const project = snapshot.state.projects[String(input.project)];
+        if (!project) return refuse("E_NOT_FOUND", "That project is not projected.");
+        const nodes = Array.isArray(input.nodes) ? input.nodes.map(String) : [];
+        if (!nodes.length) return refuse("E_VALIDATION", "Name at least one step to drop.", "/nodes");
+        // Every node is checked before anything changes, as the core does.
+        for (const [index, node] of nodes.entries()) {
+          const feature = project.features[node];
+          if (!feature) return refuse("E_NOT_FOUND", `Feature ${node} was not found.`);
+          if (nodes.indexOf(node) !== index) {
+            return refuse("E_VALIDATION", `${node} is listed twice.`, `/nodes/${index}`);
+          }
+          if (feature.progress === "dropped") {
+            return refuse("E_VALIDATION", `${node} is already dropped.`, `/nodes/${index}`);
+          }
+          if (feature.progress === "done" || feature.progress === "verified") {
+            return refuse("E_VALIDATION", `${node} is already finished.`, `/nodes/${index}`);
+          }
+        }
+        const note = typeof input.note === "string" ? input.note.trim() : "";
+        const at = new Date().toISOString();
+        const eventIds = nodes.map((node, index) => {
+          const feature = project.features[node]!;
+          const event = ulid(Date.now() + index);
+          feature.progress = "dropped";
+          feature.owner_drop = { event, at, ...(note ? { note } : {}) };
+          delete feature.untouched;
+          delete feature.claim;
+          delete feature.phase;
+          delete feature.eta;
+          return event;
+        });
+        const data = { event_ids: eventIds };
+        drops.set(String(requestId), { payload, data });
+        publish(project.summary.slug, "local");
+        return ok(data);
       }
       case "read_report": {
         const blob = input.blob as { sha256?: string; ext?: string } | undefined;
@@ -977,6 +1201,10 @@ export function createFixtureTransport(dataset: "test" | "showcase" = "test"): T
           snapshot.preferences.language = input.language as NonNullable<typeof snapshot.preferences.language>;
         }
         if (typeof input.notifications === "boolean") snapshot.preferences.notifications = input.notifications;
+        if (typeof input.update_check === "boolean") {
+          snapshot.preferences.update_check = input.update_check;
+          if (snapshot.update) snapshot.update = { ...snapshot.update, enabled: input.update_check };
+        }
         snapshot.preferences.revision = snapshot.preferences.revision
           .split("")
           .reverse()
@@ -992,12 +1220,17 @@ export function createFixtureTransport(dataset: "test" | "showcase" = "test"): T
       case "snooze_need": {
         const itemId = String(input.item_id);
         const until = String(input.until);
-        const kept = Object.entries({ ...snapshot.preferences.snoozed, [itemId]: until }).filter(
-          ([, end]) => Date.parse(end) > Date.now(),
-        );
-        snapshot.preferences.snoozed = Object.fromEntries(kept);
-        snapshot.preferences.revision = snapshot.preferences.revision.split("").reverse().join("");
-        return ok({ preferences: snapshot.preferences });
+        // As the reducer does: the row carries the snooze while it lasts.
+        const rows = [
+          ...snapshot.needs,
+          ...Object.values(snapshot.state.projects).flatMap((project) => project.needs_you),
+        ];
+        for (const row of rows) {
+          if (row.id !== itemId) continue;
+          if (Date.parse(until) > Date.now()) row.snoozed_until = until;
+          else delete row.snoozed_until;
+        }
+        return ok({ event_id: "0".repeat(26), snoozed_until: until });
       }
       case "show_main":
       case "hide_popover":

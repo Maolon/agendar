@@ -996,6 +996,102 @@ fn expect_index_error<T>(result: agendar_core::Result<T>) -> agendar_core::Agend
 }
 
 #[test]
+fn the_source_cursor_changes_on_append_and_same_length_rewrite() {
+    let scratch = scratch();
+    let fixture = fixture("one-question");
+    for event in &fixture.events {
+        support::append_event_to_vault(&scratch.vault, event, 1).expect("append event");
+    }
+    let (service, _) =
+        agendar_core::service::Service::init(scratch.vault.root(), scratch.local.data_root())
+            .expect("service");
+    let first = service
+        .refresh(fixture.as_of, false)
+        .expect("first refresh");
+    let first_digest = first.source_digest.clone().expect("source cursor");
+    assert_eq!(
+        agendar_core::index::ingest::current_source_digest(&scratch.vault).expect("current cursor"),
+        first_digest
+    );
+
+    let mut pulse = support::valid_event("pulse.session");
+    pulse["id"] = serde_json::json!(ulid::Ulid::generate().to_string());
+    pulse["seq"] = serde_json::json!(1000);
+    let pulse = support::parse_value(&pulse).expect("pulse");
+    support::append_event_to_vault(&scratch.vault, &pulse, 1).expect("append pulse");
+    let second = service
+        .refresh(fixture.as_of, false)
+        .expect("append refresh");
+    let second_digest = second.source_digest.clone().expect("source cursor");
+    assert_ne!(second_digest, first_digest, "an append changes the cursor");
+    assert_eq!(
+        agendar_core::index::ingest::current_source_digest(&scratch.vault).expect("current cursor"),
+        second_digest
+    );
+
+    let path = scratch
+        .vault
+        .root()
+        .join(format!("projects/{}/{}", support::PROJECT, support::AGENT))
+        .with_extension("jsonl");
+    let before = std::fs::read_to_string(&path).expect("source text");
+    let after = before.replacen("Started.", "Started?", 1);
+    assert_eq!(before.len(), after.len(), "the rewrite keeps its length");
+    std::fs::write(&path, after).expect("same-length rewrite");
+    let third = service
+        .refresh(fixture.as_of, false)
+        .expect("rewrite refresh");
+    let third_digest = third.source_digest.clone().expect("source cursor");
+    assert_ne!(third_digest, second_digest, "a rewrite changes the cursor");
+    assert_eq!(
+        agendar_core::index::ingest::current_source_digest(&scratch.vault).expect("current cursor"),
+        third_digest
+    );
+}
+
+#[test]
+fn an_unchanged_refresh_skips_the_ingest_lock_and_reevaluates_time() {
+    let scratch = scratch();
+    let fixture = fixture("attempts");
+    for event in &fixture.events {
+        support::append_event_to_vault(&scratch.vault, event, 1).expect("append event");
+    }
+    let (service, _) =
+        agendar_core::service::Service::init(scratch.vault.root(), scratch.local.data_root())
+            .expect("service");
+    let first = service
+        .refresh(fixture.as_of, false)
+        .expect("first refresh");
+    let project = ProjectSlug::parse("example").expect("project");
+    let before = first.state.projects[&project].needs_you[0].waiting_minutes;
+
+    let lock = scratch
+        .local
+        .ensure_layout(scratch.vault.root(), scratch.vault.id())
+        .expect("layout")
+        .locks
+        .join("ingest.lock");
+    let held = agendar_core::runtime::acquire_lock(&lock).expect("hold ingest lock");
+    let later = fixture.as_of.add_seconds(3600);
+    let second = service
+        .refresh_until(later, false, Some(std::time::Instant::now()))
+        .expect("the unchanged committed read does not need the ingest lock");
+    assert_eq!(second.generation, first.generation);
+    assert_eq!(second.state.evaluated_at, later);
+    assert_eq!(
+        second.state.projects[&project].needs_you[0].waiting_minutes,
+        before + 60,
+        "the cached events are reduced again at the later clock"
+    );
+    assert!(
+        !agendar_core::index::query::recent_project_events(&second.index, &project, 20)
+            .expect("the read-only index supports extras")
+            .is_empty()
+    );
+    drop(held);
+}
+
+#[test]
 fn a_same_length_rewrite_is_never_skipped() {
     let scratch = scratch();
     let fixture = fixture("one-question");

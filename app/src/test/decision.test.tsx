@@ -1,5 +1,5 @@
 import { useReducer } from "react";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { ApiError } from "../api/client";
@@ -7,7 +7,7 @@ import { ClientContext } from "../api/store";
 import { ICON_NAMES, Icon, PROJECT_GLYPHS, isIconName, isProjectGlyph } from "../components/Icon";
 import { initialUiState, uiReducer } from "../state/ui";
 import { useAnswerAction } from "../state/answer";
-import type { AnswerDecisionData, DecisionCard as DecisionCardDto } from "../api/types";
+import type { AnswerDecisionData, BlobRef, DecisionCard as DecisionCardDto, ReportState } from "../api/types";
 import { Decision } from "../views/Decision";
 import {
   ASK_ONE,
@@ -18,6 +18,7 @@ import {
   makeNeed,
   makeProject,
   makeSnapshot,
+  sha,
 } from "./fixtures";
 
 function Harness({
@@ -26,9 +27,11 @@ function Harness({
   canMutate = true,
   onAnswered = vi.fn(),
   onRefresh = vi.fn(),
+  reports,
 }: {
   client: FakeClient;
   card: DecisionCardDto;
+  reports?: ReportState[];
   canMutate?: boolean;
   onAnswered?: (data: AnswerDecisionData) => void;
   onRefresh?: () => void;
@@ -37,6 +40,7 @@ function Harness({
   const decision = makeDecision(ASK_ONE, card);
   const project = makeProject("alpha");
   project.decisions = { [ASK_ONE]: decision };
+  if (reports) project.reports = reports;
   const need = makeNeed({ id: "need-one" });
   const { action } = useAnswerAction(client, { onAnswered, onRefresh });
   return (
@@ -60,7 +64,45 @@ function Harness({
   );
 }
 
+const LINKED: BlobRef = { host: "h-01h0000000000000000000000", sha256: sha(0x91), bytes: 900, ext: "html" };
+
 describe("decision view", () => {
+  it("shows a linked report before the choices, with its title and summary, and opens it", async () => {
+    const client = new FakeClient();
+    const report: ReportState = {
+      id: "01H00000000000000000000091",
+      title: "Waking idle agents compared",
+      summary: "Hooks wake within a second; an inbox waits for the next run.",
+      report: LINKED,
+      kind: "proposal",
+      domain: "arch",
+      ts: "2026-02-10T14:00:00.000Z",
+      session: "01H00000000000000000000092",
+      harness: "claude_code",
+    };
+    render(<Harness client={client} card={{ ...easyCard(), report: LINKED }} reports={[report]} />);
+
+    const linked = screen.getByRole("region", { name: "Waking idle agents compared" });
+    expect(linked).toHaveTextContent("Hooks wake within a second; an inbox waits for the next run.");
+    expect(linked.querySelector(".ra-kicker")?.textContent).toBe("Proposal · Architecture");
+    const choices = screen.getByRole("group", { name: "Options" });
+    expect(linked.compareDocumentPosition(choices) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    await userEvent.click(within(linked).getByRole("button", { name: /Open report/ }));
+    const opened = client.calls.find((call) => call.command === "open_report")?.request as {
+      project: string;
+      blob: BlobRef;
+    };
+    expect(opened.project).toBe("alpha");
+    expect(opened.blob.sha256).toBe(LINKED.sha256);
+  });
+
+  it("names a linked report the project does not list", () => {
+    render(<Harness client={new FakeClient()} card={{ ...easyCard(), report: LINKED }} />);
+    const linked = screen.getByRole("region", { name: "Attached report" });
+    expect(linked.querySelector(".ra-kicker")?.textContent).toBe("Report");
+  });
+
   it("shows the chosen option as the primary label and previews the receipt", () => {
     const client = new FakeClient();
     const { container } = render(<Harness client={client} card={easyCard()} />);

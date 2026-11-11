@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Agendar: an agenda for your AI coding agents</title>
-<meta name="description" content="A desktop app and CLI that lists only what needs your call. Your answer wakes the agent session that asked. Works with Claude Code, Codex, Cursor, Gemini CLI and more.">
+<title>Agendar: manage your coding agents like a product manager</title>
+<meta name="description" content="A desktop app and CLI where your coding agents report their plan, ask for decisions and deliver work for review. It lists only what needs you. Works with Claude Code, Codex, Cursor, Gemini CLI and more.">
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#eeeeeb" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#0f0f0e" media="(prefers-color-scheme: dark)">
@@ -14,23 +14,23 @@
 <link rel="alternate" type="text/markdown" href="https://mxlo.top/agendar/index.md" title="Agendar (Markdown)">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="Agendar">
-<meta property="og:title" content="Agendar: an agenda for your AI coding agents">
-<meta property="og:description" content="It lists only what needs you. Your answer wakes the agent session that asked.">
+<meta property="og:title" content="Agendar: manage your coding agents like a product manager">
+<meta property="og:description" content="An agenda for your AI coding agents. It lists only what needs you. Your answer wakes the agent session that asked.">
 <meta property="og:url" content="https://mxlo.top/agendar/">
 <meta property="og:image" content="https://mxlo.top/agendar/images/og.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="Agendar: an agenda for your AI coding agents">
+<meta property="og:image:alt" content="Agendar: manage your coding agents like a product manager">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="Agendar: an agenda for your AI coding agents">
-<meta name="twitter:description" content="It lists only what needs you. Your answer wakes the agent session that asked.">
+<meta name="twitter:title" content="Agendar: manage your coding agents like a product manager">
+<meta name="twitter:description" content="An agenda for your AI coding agents. It lists only what needs you. Your answer wakes the agent session that asked.">
 <meta name="twitter:image" content="https://mxlo.top/agendar/images/og.png">
 <script type="application/ld+json">
 {
   "@context": "https://schema.org",
   "@type": "SoftwareApplication",
   "name": "Agendar",
-  "description": "A desktop app and CLI that lists only what needs your call from your AI coding agents. Your answer wakes the agent session that asked. Works with Claude Code, Codex, Cursor, Gemini CLI, Antigravity, opencode, pi and anything that runs a shell.",
+  "description": "A desktop app and CLI for managing AI coding agents like a product manager: agents report their plan, ask for decisions with a card and deliver work for review. It lists only what needs you, and your answer wakes the agent session that asked. Works with Claude Code, Codex, Cursor, Gemini CLI, Antigravity, opencode, pi and anything that runs a shell.",
   "applicationCategory": "DeveloperApplication",
   "operatingSystem": "macOS, Windows, Linux",
   "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
@@ -54,7 +54,23 @@
       "name": "What is Agendar?",
       "acceptedAnswer": {
         "@type": "Answer",
-        "text": "A desktop app and CLI that gives your AI coding agents one place to report their plan and one way to ask you for a decision. It lists only what needs your call, and your answer wakes the agent session that asked."
+        "text": "A desktop app and CLI for managing AI coding agents the way a product manager manages a team. Agents report their plan, ask you for decisions, and deliver their work in one place. It lists only what needs you. Your answer wakes the agent session that asked."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "How is it different from an agent environment like Paseo, Conductor, or the Claude and Codex desktop apps?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "Those run agents. They give each one a worktree, a terminal, and a chat. They are the workshop. Agendar does not run agents. It is the board and decision loop beside whichever environment you use, and it covers all of them at once. If you use one environment and one agent at a time, its built-in chat may be all you need."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does Agendar start agents or assign work to them?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No. Agents declare the plan and take steps themselves. You answer, review, edit the goal, pause a step, or drop it. Agendar records that intent. It never starts, resumes, or stops a session."
       }
     },
     {
@@ -62,23 +78,7 @@
       "name": "Which coding agents does it work with?",
       "acceptedAnswer": {
         "@type": "Answer",
-        "text": "Claude Code and Codex connect through hooks, so the session waits for your answer and continues. Cursor, Gemini CLI, Antigravity, opencode and pi connect through the MCP server (agendar mcp). Anything that runs a shell can use the agendar CLI and the Agent Skill."
-      }
-    },
-    {
-      "@type": "Question",
-      "name": "Does it need a server? Where is my data kept?",
-      "acceptedAnswer": {
-        "@type": "Answer",
-        "text": "No server. Each machine appends to its own files in a folder you choose: iCloud Drive, Dropbox, Syncthing or a local folder. The app works offline, and several machines can share one agenda."
-      }
-    },
-    {
-      "@type": "Question",
-      "name": "Which platforms does it run on?",
-      "acceptedAnswer": {
-        "@type": "Answer",
-        "text": "macOS (Apple silicon and Intel), Windows and Linux (.deb or .AppImage). Each release also has the agendar CLI on its own for machines that only run agents. macOS is the platform it is tested on; Windows and Linux build and pass the tests in CI but have seen little real use."
+        "text": "Claude Code and Codex connect through hooks. Cursor, Gemini CLI, Antigravity, opencode, and pi connect through the MCP server (agendar mcp). Anything that runs a shell can use the agendar CLI and the Agent Skill."
       }
     },
     {
@@ -86,15 +86,31 @@
       "name": "How does my answer reach the agent?",
       "acceptedAnswer": {
         "@type": "Answer",
-        "text": "You answer from the app, the menu bar or the notification, and the answer becomes a receipt with done when criteria. Hooks hold Claude Code and Codex sessions open until you answer; other agents read their inbox. The agent applies the receipt, acknowledges it and reports the result back to the plan."
+        "text": "In Claude Code, a background hook waits for the answer and wakes the idle session with it. Codex gets it through its hooks at the thread's next turn. MCP agents call the wait tool. Any other agent runs agendar wait or reads agendar inbox. The agent applies the receipt and acknowledges it."
       }
     },
     {
       "@type": "Question",
-      "name": "What does it cost?",
+      "name": "What happens if I do not answer?",
       "acceptedAnswer": {
         "@type": "Answer",
-        "text": "Nothing. Agendar is free and open source under the MIT license."
+        "text": "A card can carry a default. When its timer expires, the agent proceeds with the recommendation, and the answer appears as an assumption for you to confirm. Without a default, that step holds while other steps keep going."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Does it need a server? Where is my data kept?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "No server and no account. Each machine appends to its own plain files in a folder you choose: iCloud Drive, OneDrive, Dropbox, Syncthing, or a local folder. The app works offline, sends no telemetry, and lets several machines share one agenda."
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Which platforms does it run on, and what does it cost?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "macOS (Apple silicon and Intel), Windows, and Linux (.deb or .AppImage). macOS is the platform it is tested on. Agendar is free and open source under the MIT license."
       }
     }
   ]
@@ -170,14 +186,14 @@ svg.i { width: 1em; height: 1em; flex: none; fill: none; stroke: currentColor; s
 .hero { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 470px); gap: 64px; align-items: center; padding: 56px 24px 96px; }
 .hero h1 {
   font-family: var(--display);
-  font-size: clamp(2.6rem, 5.6vw, 4.5rem);
+  font-size: clamp(2.4rem, 5vw, 3.9rem);
   font-weight: 700;
   line-height: 1.02;
   letter-spacing: -0.04em;
   margin: 0 0 24px;
-  max-width: 11ch;
+  max-width: 14ch;
 }
-.lede { font-size: clamp(1.1rem, 1.6vw, 1.3rem); line-height: 1.45; color: var(--fg2); margin: 0 0 32px; max-width: 30ch; }
+.lede { font-size: clamp(1.1rem, 1.6vw, 1.3rem); line-height: 1.45; color: var(--fg2); margin: 0 0 32px; max-width: 34ch; }
 .actions { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
 .btn {
   display: inline-flex; align-items: center; justify-content: center; gap: 8px;
@@ -239,9 +255,7 @@ svg.i { width: 1em; height: 1em; flex: none; fill: none; stroke: currentColor; s
 @keyframes breathe { 50% { opacity: 0.45; } }
 
 .demo-foot { display: flex; align-items: center; gap: 8px; margin: 18px 10px 2px; padding-top: 12px; border-top: 1px solid var(--line); color: var(--fg2); font-size: 13px; }
-.radar { position: relative; width: 14px; height: 14px; border-radius: 50%; border: 1.5px solid var(--fg3); overflow: hidden; }
-.radar::after { content: ""; position: absolute; inset: 0; background: conic-gradient(from 0deg, transparent 0 70%, var(--fg2) 100%); animation: sweep 2.8s linear infinite; }
-@keyframes sweep { to { transform: rotate(1turn); } }
+.live { width: 8px; height: 8px; border-radius: 50%; background: var(--green); animation: breathe 2.4s ease-in-out infinite; }
 
 /* Sections */
 .band { padding-top: 104px; }
@@ -273,26 +287,41 @@ svg.i { width: 1em; height: 1em; flex: none; fill: none; stroke: currentColor; s
 .shots { display: grid; grid-template-columns: minmax(0, 2.15fr) minmax(0, 1fr); gap: 20px; align-items: start; margin-top: 40px; }
 .shots .shot { margin: 0; }
 
-/* Steps of the loop */
-.loop { list-style: none; margin: 44px 0 0; padding: 0; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 36px; position: relative; }
-.loop::before { content: ""; position: absolute; left: 15px; right: 15px; top: 15px; height: 1.5px; background: var(--line); }
-.loop li { position: relative; }
-.mark {
-  position: relative; display: grid; place-items: center;
-  width: 32px; height: 32px; border-radius: 8px; margin-bottom: 18px;
-  font: 650 14px/1 var(--ui);
-  border: 1.5px solid var(--fg); background: var(--page); color: var(--fg);
-}
-.mark.m-doing { background: var(--fg); color: var(--page); }
-.mark.m-need { background: var(--amber); border-color: var(--amber); color: #1d1d1f; }
-.mark.m-done { background: var(--green); border-color: var(--green); color: #fff; }
-.loop h3 { font-size: 18px; font-weight: 650; letter-spacing: -0.01em; margin: 0 0 6px; }
-.loop p { margin: 0; color: var(--fg2); font-size: 15.5px; }
-
 /* Feature list */
 .feats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 32px 40px; margin: 48px 0 0; }
 .feats dt { font-weight: 650; margin-bottom: 4px; }
 .feats dd { margin: 0; color: var(--fg2); font-size: 15.5px; }
+
+.fine.names { margin-top: 6px; }
+.role { display: block; margin-bottom: 6px; font-size: 12.5px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--fg3); }
+
+/* The agent's side: terminal transcripts, and the review it leads to */
+.duo { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr); gap: 20px; align-items: start; margin-top: 40px; }
+.duo .shot { margin: 0; }
+.term { margin: 0; background: var(--win); border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow); overflow: hidden; }
+.term figcaption { padding: 11px 18px; border-bottom: 1px solid var(--line); font-size: 13px; font-weight: 600; color: var(--fg2); }
+.term pre, .card pre { margin: 0; overflow-x: auto; font: 13.5px/1.6 var(--mono); }
+.term pre { padding: 16px 18px; }
+.term code, .card pre code { font-size: inherit; }
+.term .p { color: var(--fg3); user-select: none; }
+.term .o, .term .c { color: var(--fg2); }
+.term .cap { margin: 0; padding: 11px 18px; border-top: 1px solid var(--line); font-size: 13px; color: var(--fg2); }
+.review { background: var(--side); border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow); padding: 22px 20px 20px; font-size: 14.5px; }
+.review-t { margin: 0 0 16px; font-size: 17px; font-weight: 650; letter-spacing: -0.01em; }
+.claims { list-style: none; margin: 0 0 20px; padding: 0; display: grid; gap: 8px; }
+.claims li { display: flex; align-items: baseline; gap: 10px; padding: 10px 12px; background: var(--win); border: 1px solid var(--line); border-radius: 10px; }
+.tag { flex: none; min-width: 104px; font-size: 12px; font-weight: 600; color: var(--fg2); }
+.tag.t-seen { color: var(--green); }
+.tag.t-not { color: var(--count); }
+.review-a { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 10px; }
+.btn-sm { height: 36px; padding: 0 14px; border-radius: 9px; font-size: 14px; }
+
+/* Ways in for agents */
+.cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; margin-top: 32px; }
+.card { display: flex; flex-direction: column; background: var(--win); border: 1px solid var(--line); border-radius: 14px; padding: 18px 18px 16px; min-width: 0; }
+.card h3 { margin: 0 0 6px; font-size: 17px; font-weight: 650; }
+.card p { margin: 0 0 14px; color: var(--fg2); font-size: 14.5px; }
+.card pre { margin-top: auto; padding-top: 12px; border-top: 1px solid var(--line); font-size: 12.5px; }
 
 /* Tables */
 .table-wrap { margin-top: 32px; overflow-x: auto; max-width: 760px; }
@@ -351,10 +380,10 @@ td a { font-family: var(--mono); font-size: 14px; }
 
 @media (max-width: 960px) {
   .hero { grid-template-columns: 1fr; gap: 48px; padding-top: 32px; }
-  .hero h1 { max-width: 13ch; }
+  .hero h1 { max-width: 16ch; }
+  .duo { grid-template-columns: 1fr; }
+  .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .demo { max-width: 520px; }
-  .loop { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .loop::before { display: none; }
   .feats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 640px) {
@@ -365,13 +394,15 @@ td a { font-family: var(--mono); font-size: 14px; }
   .band { padding-top: 76px; }
   .shots { grid-template-columns: 1fr; }
   .shots .shot:last-child { max-width: 320px; }
-  .loop, .feats { grid-template-columns: 1fr; gap: 28px; }
+  .feats { grid-template-columns: 1fr; gap: 28px; }
+  .cards { grid-template-columns: 1fr; }
+  .term pre { font-size: 12.5px; }
   .cmd code { font-size: 13.5px; }
   .copy span { display: none; }
 }
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
-  .s.doing, .radar::after { animation: none; }
+  .s.doing, .live { animation: none; }
   .s, .faq summary::after { transition: none; }
 }
 </style>
@@ -382,6 +413,7 @@ td a { font-family: var(--mono); font-size: 14px; }
 <header class="wrap top">
   <a class="brand" href="./"><img src="favicon.svg" alt="" width="30" height="30">Agendar</a>
   <nav aria-label="Site">
+    <a href="#how">How it works</a>
     <a href="#install">Install</a>
     <a href="#faq">FAQ</a>
     <a href="https://github.com/Maolon/agendar">GitHub</a>
@@ -391,16 +423,17 @@ td a { font-family: var(--mono); font-size: 14px; }
 <main id="main">
   <section class="wrap hero">
     <div>
-      <h1>An agenda for your AI coding agents</h1>
-      <p class="lede">It lists only what needs you. Your answer wakes the agent session that asked.</p>
+      <h1>Manage your coding agents like a product manager</h1>
+      <p class="lede">An agenda for your AI coding agents. It lists only what needs you. Your answer wakes the agent session that asked.</p>
       <div class="actions">
         <a class="btn btn-primary" id="dl" href="https://github.com/Maolon/agendar/releases/latest">Download</a>
         <a class="btn" href="https://github.com/Maolon/agendar">View on GitHub</a>
       </div>
       <p class="fine" id="dl-fine">Free and open source. macOS, Windows and Linux.</p>
+      <p class="fine names">Works with Claude Code, Codex, Cursor, Gemini CLI, Antigravity, opencode and pi.</p>
     </div>
 
-    <div class="demo" aria-label="Example: an agenda with one open question">
+    <div class="demo" role="group" aria-label="Example: an agenda with one open question">
       <div class="demo-sec">
         <div class="demo-h"><span>Needs you</span><span class="count" id="count">1</span></div>
         <div class="ask" id="ask">
@@ -461,58 +494,115 @@ td a { font-family: var(--mono); font-size: 14px; }
           </li>
         </ul>
       </div>
-      <div class="demo-foot"><span class="radar" aria-hidden="true"></span><span id="working">2 agents working</span></div>
+      <div class="demo-foot"><span class="live" aria-hidden="true"></span><span id="working">2 agents working</span></div>
     </div>
   </section>
 
   <section class="wrap" aria-label="Why">
-    <p class="pitch">You run several coding agents across repositories. Most of the time they do not need you. When one hits a decision that is yours, the question sits in a terminal tab you are not looking at, and the agent waits in silence or guesses. <strong>Agendar gives every agent one place to report its plan and one way to ask.</strong></p>
+    <p class="pitch">A product manager does not watch the team type. They agree on the plan, answer the questions no one else can, review the demo, and accept it or send it back. With coding agents, you do that job by reading a wall of terminals. <strong>Agendar is the desk for it: agents report, ask, and deliver in one place, and you see only what needs you.</strong></p>
   </section>
 
-  <section class="band" id="card">
+  <section class="band" id="job">
     <div class="wrap">
-      <h2>Every question arrives as a card</h2>
-      <p>The question, two to four options with what each one costs, the agent's recommendation and why, and what your answer unblocks. Pick an option or write your own; the agent gets a receipt with <em>done when</em> criteria.</p>
-      <div class="shot">
-        <picture>
-          <source media="(prefers-color-scheme: dark)" srcset="images/decision-dark.webp">
-          <img src="images/decision-light.webp" width="1600" height="814" alt="A decision card in Agendar: the question, three options with consequences and expected finish times, the recommended one marked, and the answer button">
-        </picture>
-      </div>
+      <h2>The job, part by part</h2>
+      <p>Run your agents wherever you like. Agendar does not start them or assign their work. Agents declare the plan and report on it. You decide and review.</p>
+      <dl class="feats">
+        <div>
+          <dt><span class="role">Roadmap</span>The plan</dt>
+          <dd>Agents declare the project and its steps, with dependencies. You see one square per step, a plan graph, and a finish forecast adjusted by how long past steps took.</dd>
+        </div>
+        <div>
+          <dt><span class="role">Standup</span>The board</dt>
+          <dd>Shows what is moving, stalled, or untouched. If a session stops, its step is freed for another agent. You never chase updates.</dd>
+        </div>
+        <div>
+          <dt><span class="role">Your desk</span>Decision cards</dt>
+          <dd>Each card shows the question, two to four options with what each costs, a recommendation, and what your answer unblocks. Ranked by cost of delay.</dd>
+        </div>
+        <div>
+          <dt><span class="role">Sign-off</span>Deliveries</dt>
+          <dd>Finished work arrives with demos and a disclosure of what is proven. Accept it, or send it back with comments on the demo.</dd>
+        </div>
+        <div>
+          <dt><span class="role">Reading</span>Reports</dt>
+          <dd>Proposals to read before a choice, or findings from a test or an audit. Read the summary in the app and the full document in your browser.</dd>
+        </div>
+        <div>
+          <dt><span class="role">Guardrails</span>Budgets and policy</dt>
+          <dd>Work with no demo after four hours is flagged. A policy sets which questions reach you and which an agent may assume.</dd>
+        </div>
+      </dl>
     </div>
   </section>
 
   <section class="band" id="how">
     <div class="wrap">
-      <h2>How it works</h2>
-      <ol class="loop">
-        <li>
-          <span class="mark m-doing" aria-hidden="true">1</span>
-          <h3>Agents report</h3>
-          <p>Through the <code>agendar</code> CLI or its MCP server, an agent declares the steps it plans, marks each one started and finished, and sends a short pulse as it goes.</p>
-        </li>
-        <li>
-          <span class="mark m-need" aria-hidden="true">2</span>
-          <h3>Agents ask</h3>
-          <p>When a decision is yours, the agent sends a card. It also says when it may go ahead with its recommendation if you stay silent.</p>
-        </li>
-        <li>
-          <span class="mark" aria-hidden="true">3</span>
-          <h3>You answer</h3>
-          <p>From the app, the menu bar or the notification. Questions are ranked by how many agents wait on them and for how long.</p>
-        </li>
-        <li>
-          <span class="mark m-done" aria-hidden="true">4</span>
-          <h3>The same session continues</h3>
-          <p>Hooks hold Claude Code and Codex sessions open until you answer; other agents read their inbox. The agent applies your answer and reports back to the plan.</p>
-        </li>
-      </ol>
+      <h2>A question reaches your desk</h2>
+      <p>The agent asks with one command. It first does the steps that do not depend on the answer, then waits. You get a card. Pick an option or write your own. The session that asked gets a receipt with <em>done when</em> criteria and continues.</p>
+      <div class="duo">
+        <figure class="term" aria-label="Terminal: an agent asks and waits">
+          <figcaption>The agent's terminal</figcaption>
+<pre><code><span class="p">$</span> agendar ask --question "Delete the build cache?" \
+    --option "Delete: frees 49 GB" \
+    --option "Keep: next build is fast" --recommend 1
+<span class="o">{"ok":true,"command":"ask","data":{"ask_id":"01K9…",
+ "should_wait":false,"runnable_nodes":["core/retry"],…}}</span>
+
+<span class="p">$</span> agendar wait 01K9…
+<span class="c"># run when nothing else is runnable; blocks until
+# you answer, then prints the receipt:
+# the option you chose, what you ruled out, done when</span>
+
+<span class="p">$</span> agendar ack &lt;answer-id&gt;</code></pre>
+          <p class="cap">Output shortened. Agents learn these commands from the Agent Skill.</p>
+        </figure>
+        <div class="shot">
+          <picture>
+            <source media="(prefers-color-scheme: dark)" srcset="images/decision-dark.webp">
+            <img src="images/decision-light.webp" width="1600" height="814" alt="A decision card in Agendar: the question, three options with consequences and expected finish times, the recommended one marked, and the answer button">
+          </picture>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="band" id="review">
+    <div class="wrap">
+      <h2>Done means you saw the demo</h2>
+      <p>An agent's "done" is a claim. A delivery shows the work: a screenshot, a CLI transcript, the few diff hunks that matter, and what is not proven yet. Accept closes the step. Send back reopens it and sends your comments to the same session.</p>
+      <div class="duo">
+        <figure class="term" aria-label="Terminal: an agent delivers and waits for the verdict">
+          <figcaption>The agent's terminal</figcaption>
+<pre><code><span class="p">$</span> agendar deliver --node sync/conflicts \
+    --attempt &lt;attempt-id&gt; --json delivery.json
+<span class="c"># uploads the demos, then appends one delivery</span>
+
+<span class="p">$</span> agendar wait --delivery &lt;delivery-id&gt;
+<span class="c"># blocks until you accept or send back</span>
+
+<span class="p">$</span> agendar settle
+<span class="c"># what this session still owes the board</span></code></pre>
+        </figure>
+        <div class="review" role="img" aria-label="Illustration of a delivery review: three claims marked Seen, Agent says and Not proven yet, with Send back and Accept buttons">
+          <p class="review-t">Sync conflicts is ready for review.</p>
+          <ul class="claims">
+            <li><span class="tag t-seen">Seen</span>Edits to different paragraphs both survive</li>
+            <li><span class="tag">Agent says</span>Same-paragraph edits show both versions</li>
+            <li><span class="tag t-not">Not proven yet</span>Three devices editing at once</li>
+          </ul>
+          <div class="review-a">
+            <span class="btn btn-sm">Send back…</span>
+            <span class="btn btn-sm btn-primary">Accept Sync conflicts</span>
+          </div>
+        </div>
+      </div>
     </div>
   </section>
 
   <section class="band" id="see">
     <div class="wrap">
-      <h2>What you see</h2>
+      <h2>Step away from the terminals</h2>
+      <p>The menu bar shows what is waiting for you. Notifications bring questions and finished milestones. Approve the recommendation in one click. Choices that are hard to undo require confirmation in the main window.</p>
       <div class="shots">
         <div class="shot">
           <picture>
@@ -527,48 +617,56 @@ td a { font-family: var(--mono); font-size: 14px; }
           </picture>
         </div>
       </div>
-      <dl class="feats">
-        <div>
-          <dt>Needs you, ranked by cost of delay</dt>
-          <dd>Waiting agents times how long they have waited, weighted by how hard the choice is to undo.</dd>
-        </div>
-        <div>
-          <dt>Projects, step by step</dt>
-          <dd>One square per step, what each agent is doing now, and a finish forecast calibrated on how long past steps took.</dd>
-        </div>
-        <div>
-          <dt>A plan graph</dt>
-          <dd>Steps and their dependencies. A question shows which steps it unblocks.</dd>
-        </div>
-        <div>
-          <dt>The menu bar</dt>
-          <dd>The top question with <em>Approve recommended</em>. Easy questions can be answered straight from the notification.</dd>
-        </div>
-        <div>
-          <dt>No server</dt>
-          <dd>Each machine appends to its own files in a folder you choose: iCloud Drive, Dropbox, Syncthing or a local folder. Several machines can share one agenda.</dd>
-        </div>
-        <div>
-          <dt>Three languages</dt>
-          <dd>English, <span lang="zh-Hans">简体中文</span> and <span lang="zh-Hant">繁體中文</span>, in light and dark.</dd>
-        </div>
-      </dl>
     </div>
   </section>
 
   <section class="band" id="agents">
     <div class="wrap">
       <h2>Works with your agents</h2>
+      <p>Agent environments like Paseo and Conductor, or the Claude and Codex desktop apps, are the workshop where agents run. Agendar is the desk beside them, and it works with any of them.</p>
       <div class="table-wrap">
         <table>
           <thead><tr><th scope="col">Agent</th><th scope="col">How it connects</th></tr></thead>
           <tbody>
-            <tr><td>Claude Code</td><td>Hooks: the session waits for your answer and continues</td></tr>
-            <tr><td>Codex</td><td>Hooks</td></tr>
+            <tr><td>Claude Code</td><td>Hooks. A background hook wakes the idle session with your answer or verdict</td></tr>
+            <tr><td>Codex</td><td>Hooks. The thread gets your answer at its next turn</td></tr>
             <tr><td>Cursor, Gemini CLI, Antigravity, opencode, pi</td><td>MCP server (<code>agendar mcp</code>)</td></tr>
             <tr><td>Anything that runs a shell</td><td>The <code>agendar</code> CLI and the Agent Skill</td></tr>
           </tbody>
         </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="band" id="automation">
+    <div class="wrap">
+      <h2>Built for agents to drive</h2>
+      <p>You use the app. Agents use one of these.</p>
+      <div class="cards">
+        <div class="card">
+          <h3>CLI</h3>
+          <p>Output is JSON, one envelope per command. A repeated <code>--request-id</code> replays instead of writing twice.</p>
+<pre><code>agendar board
+agendar progress started --node core/wake \
+  --eta 30m..1h30m</code></pre>
+        </div>
+        <div class="card">
+          <h3>MCP</h3>
+          <p>The same commands as typed tools: <code>board</code>, <code>start</code>, <code>pulse</code>, <code>ask</code>, <code>wait</code>, <code>ack</code>, <code>report</code>, <code>settle</code>.</p>
+<pre><code>agendar mcp
+agendar install-mcp --harness cursor</code></pre>
+        </div>
+        <div class="card">
+          <h3>Hooks</h3>
+          <p>For Claude Code and Codex. Answers and verdicts reach the session without the agent polling.</p>
+<pre><code>agendar bind
+agendar bindings</code></pre>
+        </div>
+        <div class="card">
+          <h3>Skill</h3>
+          <p>The <a href="https://github.com/Maolon/agendar/blob/main/skills/agendar/SKILL.md">Agent Skill</a> teaches the loop: read the board, report, ask, deliver, settle.</p>
+<pre><code>agendar skill print</code></pre>
+        </div>
       </div>
       <div class="cmd">
         <code id="skill-cmd">npx skills add Maolon/agendar -g</code>
@@ -576,14 +674,45 @@ td a { font-family: var(--mono); font-size: 14px; }
           <svg class="i" viewBox="0 0 24 24" aria-hidden="true"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg><span id="copy-t">Copy</span>
         </button>
       </div>
-      <p class="after">The <a href="https://github.com/Maolon/agendar/blob/main/skills/agendar/SKILL.md">Agent Skill</a> teaches agents the loop. Connect them in <strong>Settings &gt; Agents</strong>, or let an agent run <code>agendar bind</code>.</p>
+    </div>
+  </section>
+
+  <section class="band" id="principles">
+    <div class="wrap">
+      <h2>Principles</h2>
+      <dl class="feats">
+        <div>
+          <dt>Local</dt>
+          <dd>Records are plain files in a folder you choose: iCloud Drive, OneDrive, Dropbox, Syncthing, or one disk. No server, no account.</dd>
+        </div>
+        <div>
+          <dt>Private</dt>
+          <dd>No telemetry. The only network request checks the GitHub releases API for updates, and you can turn it off.</dd>
+        </div>
+        <div>
+          <dt>Independent</dt>
+          <dd>Not tied to one model or one agent tool. Seven harnesses connect today, and anything with a shell can use the CLI.</dd>
+        </div>
+        <div>
+          <dt>Honest</dt>
+          <dd>What an agent claims is labeled <em>Agent says</em>. Only what the app observed is labeled <em>Seen</em>.</dd>
+        </div>
+        <div>
+          <dt>Quiet</dt>
+          <dd>Agents that make progress stay out of your way. The list holds only what needs you.</dd>
+        </div>
+        <div>
+          <dt>Open</dt>
+          <dd>MIT license. Setup installs nothing until you click its button.</dd>
+        </div>
+      </dl>
     </div>
   </section>
 
   <section class="band" id="install">
     <div class="wrap">
       <h2>Install</h2>
-      <p>Download the app for your platform. On first launch, Setup picks the folder for your agenda and links <code>agendar</code> onto your PATH.</p>
+      <p>Download the app for your platform. The CLI is bundled inside. On first launch, Setup asks where to store your agenda and offers to link <code>agendar</code> onto your PATH.</p>
       <div class="table-wrap">
         <table>
           <thead><tr><th scope="col">Platform</th><th scope="col">File</th></tr></thead>
@@ -595,47 +724,50 @@ td a { font-family: var(--mono); font-size: 14px; }
           </tbody>
         </table>
       </div>
-      <p class="after">Each <a href="https://github.com/Maolon/agendar/releases/latest">release</a> also has the <code>agendar</code> CLI on its own for machines that only run agents, and a <code>.sha256</code> checksum for every file.</p>
+      <p class="after">Then connect your agents in <strong>Settings &gt; Agents</strong>, or let an agent run <code>agendar bind</code>. Each <a href="https://github.com/Maolon/agendar/releases/latest">release</a> also includes the standalone <code>agendar</code> CLI for machines that only run agents, and a <code>.sha256</code> checksum for every file.</p>
       <div class="note">
-        <p><strong>macOS:</strong> the app is not notarized yet. The first time, open it, then go to System Settings &gt; Privacy &amp; Security and choose Open Anyway. Or run <code>xattr -dr com.apple.quarantine /Applications/Agendar.app</code> once.</p>
-        <p><strong>Windows:</strong> SmartScreen may warn about an unknown publisher; choose More info &gt; Run anyway.</p>
+        <p><strong>macOS:</strong> The app is not notarized yet. On first launch, open it, then go to System Settings &gt; Privacy &amp; Security and choose Open Anyway. Or run <code>xattr -dr com.apple.quarantine /Applications/Agendar.app</code> once.</p>
+        <p><strong>Windows:</strong> SmartScreen may warn about an unknown publisher. Choose More info &gt; Run anyway.</p>
+        <p><strong>Status:</strong> Agendar is young and used every day to track its own development. macOS is the platform it is tested on. Windows and Linux build and pass the tests in CI, but have seen little real use.</p>
       </div>
     </div>
   </section>
 
-  <section class="band" id="status">
-    <div class="wrap">
-      <h2>Status</h2>
-      <p>Agendar is young and used every day to track its own development. macOS is the platform it is tested on. Windows and Linux build and pass the tests in CI but have seen little real use. Sharing one agenda across machines is built in and tested with simulated hosts; real multi-machine use is still thin.</p>
-    </div>
-  </section>
   <section class="band" id="faq">
     <div class="wrap">
       <h2>Frequently asked questions</h2>
       <div class="faq">
         <details>
           <summary>What is Agendar?</summary>
-          <p>A desktop app and CLI that gives your AI coding agents one place to report their plan and one way to ask you for a decision. It lists only what needs your call, and your answer wakes the agent session that asked.</p>
+          <p>A desktop app and CLI for managing AI coding agents the way a product manager manages a team. Agents report their plan, ask you for decisions, and deliver their work in one place. It lists only what needs you. Your answer wakes the agent session that asked.</p>
+        </details>
+        <details>
+          <summary>How is it different from an agent environment like Paseo, Conductor, or the Claude and Codex desktop apps?</summary>
+          <p>Those run agents. They give each one a worktree, a terminal, and a chat. They are the workshop. Agendar does not run agents. It is the board and decision loop beside whichever environment you use, and it covers all of them at once. If you use one environment and one agent at a time, its built-in chat may be all you need.</p>
+        </details>
+        <details>
+          <summary>Does Agendar start agents or assign work to them?</summary>
+          <p>No. Agents declare the plan and take steps themselves. You answer, review, edit the goal, pause a step, or drop it. Agendar records that intent. It never starts, resumes, or stops a session.</p>
         </details>
         <details>
           <summary>Which coding agents does it work with?</summary>
-          <p>Claude Code and Codex connect through hooks, so the session waits for your answer and continues. Cursor, Gemini CLI, Antigravity, opencode and pi connect through the MCP server (<code>agendar mcp</code>). Anything that runs a shell can use the <code>agendar</code> CLI and the Agent Skill.</p>
-        </details>
-        <details>
-          <summary>Does it need a server? Where is my data kept?</summary>
-          <p>No server. Each machine appends to its own files in a folder you choose: iCloud Drive, Dropbox, Syncthing or a local folder. The app works offline, and several machines can share one agenda.</p>
-        </details>
-        <details>
-          <summary>Which platforms does it run on?</summary>
-          <p>macOS (Apple silicon and Intel), Windows and Linux (<code>.deb</code> or <code>.AppImage</code>). Each release also has the <code>agendar</code> CLI on its own for machines that only run agents. macOS is the platform it is tested on; Windows and Linux build and pass the tests in CI but have seen little real use.</p>
+          <p>Claude Code and Codex connect through hooks. Cursor, Gemini CLI, Antigravity, opencode, and pi connect through the MCP server (<code>agendar mcp</code>). Anything that runs a shell can use the <code>agendar</code> CLI and the Agent Skill.</p>
         </details>
         <details>
           <summary>How does my answer reach the agent?</summary>
-          <p>You answer from the app, the menu bar or the notification, and the answer becomes a receipt with <em>done when</em> criteria. Hooks hold Claude Code and Codex sessions open until you answer; other agents read their inbox. The agent applies the receipt, acknowledges it and reports the result back to the plan.</p>
+          <p>In Claude Code, a background hook waits for the answer and wakes the idle session with it. Codex gets it through its hooks at the thread's next turn. MCP agents call the <code>wait</code> tool. Any other agent runs <code>agendar wait</code> or reads <code>agendar inbox</code>. The agent applies the receipt and acknowledges it.</p>
         </details>
         <details>
-          <summary>What does it cost?</summary>
-          <p>Nothing. Agendar is free and open source under the MIT license.</p>
+          <summary>What happens if I do not answer?</summary>
+          <p>A card can carry a default. When its timer expires, the agent proceeds with the recommendation, and the answer appears as an assumption for you to confirm. Without a default, that step holds while other steps keep going.</p>
+        </details>
+        <details>
+          <summary>Does it need a server? Where is my data kept?</summary>
+          <p>No server and no account. Each machine appends to its own plain files in a folder you choose: iCloud Drive, OneDrive, Dropbox, Syncthing, or a local folder. The app works offline, sends no telemetry, and lets several machines share one agenda.</p>
+        </details>
+        <details>
+          <summary>Which platforms does it run on, and what does it cost?</summary>
+          <p>macOS (Apple silicon and Intel), Windows, and Linux (<code>.deb</code> or <code>.AppImage</code>). macOS is the platform it is tested on. Agendar is free and open source under the MIT license.</p>
         </details>
       </div>
     </div>
@@ -651,6 +783,7 @@ td a { font-family: var(--mono); font-size: 14px; }
       <a href="https://github.com/Maolon/agendar/releases">Releases</a>
       <a href="https://github.com/Maolon/agendar/blob/main/CHANGELOG.md">Changelog</a>
       <a href="https://github.com/Maolon/agendar/blob/main/CONTRIBUTING.md">Contributing</a>
+      <a href="https://github.com/Maolon/agendar/blob/main/README.zh-CN.md" lang="zh-Hans">简体中文</a>
     </nav>
   </div>
 </footer>

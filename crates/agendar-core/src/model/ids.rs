@@ -274,6 +274,16 @@ pub enum Domain {
     Ux,
 }
 
+/// What a report asks of its reader: a proposal is read before choosing (its
+/// questions link it), a finding is read to know (an experiment, an audit, an
+/// investigation). Finished work is a delivery, not a report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportKind {
+    Proposal,
+    Finding,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {

@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
@@ -20,28 +21,49 @@ use ulid::Ulid;
 use crate::error::{AgendarError, ErrorCode, Result};
 use crate::model::ProjectSlug;
 
-/// Maximum time a contending process waits for a local lock before `E_BUSY`.
+/// How long a contending process waits for a local lock before `E_BUSY`,
+/// unless it chose otherwise with [`set_lock_wait`].
 pub const LOCK_WAIT: Duration = Duration::from_secs(5);
+
+static LOCK_WAIT_MS: AtomicU64 = AtomicU64::new(LOCK_WAIT.as_millis() as u64);
+
+/// Choose how long this process waits for a contended local lock before
+/// `E_BUSY`. A caller's own deadline still wins when it is earlier.
+///
+/// Every lock here is held for well under a second, but several processes
+/// (the app, MCP servers, waiting agents) refresh together after each Vault
+/// change, and on a loaded machine the queue can pass five seconds. An agent
+/// command that gives up then loses its work: an ack it must repeat, an answer
+/// it never sees. The CLI therefore waits longer than the app.
+pub fn set_lock_wait(wait: Duration) {
+    let millis = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
+    LOCK_WAIT_MS.store(millis, Ordering::Relaxed);
+}
+
+/// The wait [`acquire_lock`] uses in this process.
+pub fn lock_wait() -> Duration {
+    Duration::from_millis(LOCK_WAIT_MS.load(Ordering::Relaxed))
+}
 
 /// Bound for every local JSON journal read so a damaged file cannot allocate
 /// without limit.
 pub const MAX_LOCAL_JSON_BYTES: u64 = 1_048_576;
 
 /// Acquire an exclusive advisory file lock, retrying only for contention until
-/// the five-second deadline
+/// [`lock_wait`] has passed.
 pub fn acquire_lock(path: &Path) -> Result<File> {
     acquire_lock_until(path, None)
 }
 
 /// Acquire an exclusive advisory file lock, never waiting past `deadline`.
 ///
-/// The caller-supplied deadline bounds the ordinary five-second wait so a
+/// The caller-supplied deadline bounds the ordinary [`lock_wait`] so a
 /// long-running operation with an end-to-end budget (the Claude Code Stop hook)
 /// cannot spend the budget waiting for another process. An elapsed deadline is
 /// `E_BUSY` immediately, never a lock violation.
 pub fn acquire_lock_until(path: &Path, until: Option<Instant>) -> Result<File> {
     let file = open_lock_file(path)?;
-    let mut deadline = Instant::now() + LOCK_WAIT;
+    let mut deadline = Instant::now() + lock_wait();
     if let Some(until) = until {
         deadline = deadline.min(until);
     }

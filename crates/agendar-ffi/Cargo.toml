@@ -1,0 +1,37 @@
+[package]
+name = "agendar-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "UniFFI facade over agendar-core for mobile clients"
+publish = false
+
+[lib]
+name = "agendar_ffi"
+# `staticlib` is what the iOS xcframework links; `lib` lets the desktop tests
+# call the facade directly.
+crate-type = ["lib", "staticlib"]
+
+# The pinned binding generator (`scripts/ios-build.sh`). Behind a feature so
+# the library build (desktop checks, iOS slices) never compiles the generator.
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen-cli"]
+
+[features]
+bindgen-cli = ["uniffi/cli", "uniffi/cargo-metadata"]
+
+[dependencies]
+agendar-core = { path = "../agendar-core" }
+serde_json.workspace = true
+uniffi = { version = "=0.32.2", default-features = false }
+
+[build-dependencies]
+uniffi = { version = "=0.32.2", default-features = false, features = ["build"] }
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true

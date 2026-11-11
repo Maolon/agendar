@@ -175,6 +175,65 @@ export function firstDemo(delivery: DeliveryState): Demo | undefined {
   return delivery.demos[0];
 }
 
+/** Which demo kind makes the most telling thumbnail, best first. */
+const THUMB_ORDER: readonly Demo["kind"][] = ["screenshot", "diff", "cli_transcript"];
+
+/**
+ * The demo a project-page card shows: a screenshot if there is one (what the
+ * human would see), else the diff (what changed), else the transcript, else
+ * whatever comes first.
+ */
+export function thumbnailDemo(delivery: DeliveryState): Demo | undefined {
+  for (const kind of THUMB_ORDER) {
+    const demo = delivery.demos.find((item) => item.kind === kind);
+    if (demo) return demo;
+  }
+  return firstDemo(delivery);
+}
+
+export interface DeliveryStatus {
+  icon: "check" | "undo-2" | "eye" | "message-square" | "help-circle";
+  /** Colour class of the icon. */
+  tone: "cgreen" | "c2";
+  text: string;
+}
+
+/**
+ * The card's status line. Once a human reviewed the delivery their verdict
+ * leads ("Accepted · seen", "Sent back"); a delivery still waiting leads with
+ * how far it is proven ("Seen · Waiting for you"). An accepted delivery whose
+ * criteria nobody proved says only "Accepted": the human's word settles it.
+ */
+export function deliveryStatus(delivery: DeliveryState): DeliveryStatus {
+  if (delivery.review === "accepted") {
+    const provenance = deliveryProvenance(delivery);
+    const text =
+      provenance === "seen"
+        ? tx("dl.status.accepted_seen")
+        : provenance === "agent_says"
+          ? tx("dl.status.accepted_agent")
+          : tx("dl.rev.accepted");
+    return { icon: "check", tone: "cgreen", text };
+  }
+  if (delivery.review === "sent_back") {
+    return { icon: "undo-2", tone: "c2", text: tx("dl.rev.sent_back") };
+  }
+  const provenance = deliveryProvenance(delivery);
+  return {
+    icon: provenanceIcon(provenance),
+    tone: "c2",
+    text: `${provenanceLabel(provenance)} · ${reviewLabel(delivery.review)}`,
+  };
+}
+
+/**
+ * Activity cards, newest first. Delivery ids are ULIDs, so their order is the
+ * order the deliveries were made.
+ */
+export function newestFirst(deliveries: DeliveryState[]): DeliveryState[] {
+  return [...deliveries].sort((a, b) => (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
+}
+
 export function demoBlob(demo: Demo): BlobRef | undefined {
   const blob = demo.body?.blob;
   if (!blob || typeof blob !== "object") return undefined;

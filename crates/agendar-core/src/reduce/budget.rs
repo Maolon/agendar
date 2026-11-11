@@ -16,13 +16,38 @@ use crate::reduce::assumptions;
 
 /// Counts derived from one converged project state.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Activity {
+pub struct Activity<'a> {
     pub speculative_features: u32,
     pub pending_slices: u32,
     pub demo_gap_s: u64,
+    /// The step the demo clock runs for, when one is in progress.
+    pub demo_step: Option<DemoStep<'a>>,
 }
 
-impl Activity {
+/// The started, undelivered step the demo clock runs for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DemoStep<'a> {
+    pub node: &'a NodePath,
+    pub title: &'a str,
+    pub attempt: Option<&'a EventId>,
+}
+
+impl<'a> DemoStep<'a> {
+    /// The step as the board holds it; `None` for a node the board lacks.
+    pub fn of(
+        node: Option<&NodePath>,
+        features: &'a BTreeMap<NodePath, FeatureState>,
+    ) -> Option<Self> {
+        let feature = features.get(node?)?;
+        Some(Self {
+            node: &feature.node,
+            title: &feature.title,
+            attempt: feature.attempt.as_ref(),
+        })
+    }
+}
+
+impl Activity<'_> {
     pub fn into_usage(self, budget: &Budget) -> BudgetUsage {
         usage(budget, self)
     }
@@ -68,7 +93,7 @@ pub fn pending_slices(
     deliveries: &BTreeMap<EventId, DeliveryState>,
     features: &BTreeMap<NodePath, FeatureState>,
 ) -> u32 {
-    let mut keys: BTreeSet<(String, EventId)> = BTreeSet::new();
+    let mut keys: BTreeSet<(String, Option<EventId>)> = BTreeSet::new();
     for delivery in deliveries.values() {
         if delivery.superseded_by.is_some() || delivery.review != ReviewStatus::Pending {
             continue;
@@ -100,6 +125,33 @@ pub fn demo_gap(
     u64::try_from((as_of.millis() - base.millis()).max(0) / 1000).unwrap_or(0)
 }
 
+/// The demo-gap reason: how long, the limit, and the step to deliver.
+fn demo_gap_reason(activity: Activity<'_>, max_gap: u64) -> String {
+    let gap = duration_label(activity.demo_gap_s);
+    let limit = duration_label(max_gap);
+    match activity.demo_step {
+        Some(step) => format!(
+            "No demo for {gap} (limit {limit}): {} ({}) is started, not delivered; agendar deliver on it clears the clock.",
+            step.title,
+            step.node.as_str()
+        ),
+        None => format!("No demo for {gap} (limit {limit})."),
+    }
+}
+
+/// The refusal's hint: the delivery that restarts the clock when the demo gap
+/// is among the reasons and a step is in progress.
+fn refusal_hint(demo_step: Option<DemoStep<'_>>) -> String {
+    match demo_step {
+        Some(step) => format!(
+            "Deliver what works so far: agendar deliver --node {} --attempt {} --json delivery.json",
+            step.node.as_str(),
+            step.attempt.map_or("<attempt-id>", EventId::as_str)
+        ),
+        None => "Ask the human or work on a feature without unconfirmed choices.".to_owned(),
+    }
+}
+
 fn duration_label(seconds: u64) -> String {
     let hours = seconds / 3600;
     let minutes = (seconds % 3600) / 60;
@@ -111,7 +163,7 @@ fn duration_label(seconds: u64) -> String {
 }
 
 /// Project the usage DTO and its blocking reasons.
-pub fn usage(budget: &Budget, activity: Activity) -> BudgetUsage {
+pub fn usage(budget: &Budget, activity: Activity<'_>) -> BudgetUsage {
     let mut reasons = Vec::new();
     if activity.speculative_features > budget.max_speculative_features {
         reasons.push(format!(
@@ -127,16 +179,13 @@ pub fn usage(budget: &Budget, activity: Activity) -> BudgetUsage {
     }
     let max_gap = u64::from(budget.max_demo_gap_s);
     if activity.demo_gap_s >= max_gap {
-        reasons.push(format!(
-            "No demo for {} (limit {}).",
-            duration_label(activity.demo_gap_s),
-            duration_label(max_gap)
-        ));
+        reasons.push(demo_gap_reason(activity, max_gap));
     }
     BudgetUsage {
         speculative_features: activity.speculative_features,
         pending_slices: activity.pending_slices,
         demo_gap_s: activity.demo_gap_s,
+        demo_gap_node: activity.demo_step.map(|step| step.node.clone()),
         blocked: !reasons.is_empty(),
         reasons,
     }
@@ -149,10 +198,11 @@ pub fn usage(budget: &Budget, activity: Activity) -> BudgetUsage {
 /// not raise the count; the next unrelated speculative feature fails.
 pub fn refuse_new_speculation(
     budget: &Budget,
-    activity: Activity,
+    activity: Activity<'_>,
     projected_speculative: u32,
 ) -> Option<AgendarError> {
     let mut reasons = Vec::new();
+    let mut over_gap = false;
     if projected_speculative > budget.max_speculative_features {
         reasons.push(format!(
             "{} features would be built on unconfirmed choices (limit {}).",
@@ -167,11 +217,8 @@ pub fn refuse_new_speculation(
     }
     let max_gap = u64::from(budget.max_demo_gap_s);
     if activity.demo_gap_s >= max_gap {
-        reasons.push(format!(
-            "No demo for {} (limit {}).",
-            duration_label(activity.demo_gap_s),
-            duration_label(max_gap)
-        ));
+        reasons.push(demo_gap_reason(activity, max_gap));
+        over_gap = true;
     }
     if reasons.is_empty() {
         return None;
@@ -182,14 +229,14 @@ pub fn refuse_new_speculation(
             format!("Speculation budget exceeded: {}", reasons.join(" ")),
         )
         .with_detail("budget_exceeded")
-        .with_hint("Ask the human or work on a feature without unconfirmed choices."),
+        .with_hint(refusal_hint(activity.demo_step.filter(|_| over_gap))),
     )
 }
 
 /// Admission check for one proposed speculative operation.
 pub fn admit_speculation(
     budget: &Budget,
-    activity: Activity,
+    activity: Activity<'_>,
     node: &NodePath,
     speculative: &BTreeSet<NodePath>,
 ) -> Result<()> {
@@ -204,13 +251,22 @@ pub fn admit_speculation(
 }
 
 /// Whether a feature counts as in-flight work for the demo-gap clock.
-pub fn in_flight(feature: &FeatureState, deliveries: &BTreeMap<EventId, DeliveryState>) -> bool {
+///
+/// `review_pending` is [`review_pending_nodes`] of the project's deliveries.
+pub fn in_flight(feature: &FeatureState, review_pending: &BTreeSet<&NodePath>) -> bool {
     let doing = feature.progress == Progress::Doing;
-    let awaiting_review = feature.progress == Progress::Done
-        && deliveries.values().any(|delivery| {
-            delivery.node == feature.node
-                && delivery.superseded_by.is_none()
-                && delivery.review == ReviewStatus::Pending
-        });
+    let awaiting_review =
+        feature.progress == Progress::Done && review_pending.contains(&feature.node);
     doing || awaiting_review
+}
+
+/// Nodes with a current (not superseded) delivery still awaiting review.
+pub fn review_pending_nodes(deliveries: &BTreeMap<EventId, DeliveryState>) -> BTreeSet<&NodePath> {
+    deliveries
+        .values()
+        .filter(|delivery| {
+            delivery.superseded_by.is_none() && delivery.review == ReviewStatus::Pending
+        })
+        .map(|delivery| &delivery.node)
+        .collect()
 }

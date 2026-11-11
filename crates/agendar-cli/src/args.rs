@@ -7,7 +7,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 
 use agendar_core::error::{AgendarError, ErrorCode, Result};
-use agendar_core::model::{EtaRange, Harness, Mode, ProjectSlug, Seconds, SessionId};
+use agendar_core::model::{
+    Domain, EtaRange, Harness, Mode, ProjectSlug, ReportKind, Seconds, SessionId,
+};
 use agendar_core::runtime::Config;
 
 /// Agendar command-line interface.
@@ -104,6 +106,11 @@ pub enum Command {
         /// Quick form: why it is needed now (≤100).
         #[arg(long, value_name = "TEXT")]
         why: Option<String>,
+        /// Ask the owner to let you continue a step another agent holds
+        /// (with --node): what you read of its work (≤140). Their answer id
+        /// then goes to `progress started --applies`.
+        #[arg(long, value_name = "TEXT", conflicts_with_all = ["json", "question", "options"])]
+        takeover: Option<String>,
         /// `ask` reaches the human; `assume`/`auto` let their policy answer
         /// easy, local questions without them.
         #[arg(long, value_enum, default_value_t = ModeArg::Ask)]
@@ -114,9 +121,14 @@ pub enum Command {
         #[arg(long, value_name = "PATH")]
         node: Option<String>,
     },
-    /// Block until a current answer exists, then print it once.
+    /// Block until a current answer exists, or with `--delivery` until the
+    /// human accepted or sent back that delivery, then print it once.
     Wait {
-        ask_id: String,
+        #[arg(required_unless_present = "delivery", conflicts_with = "delivery")]
+        ask_id: Option<String>,
+        /// Wait for the verdict on this delivery (the `deliver` event_id).
+        #[arg(long, value_name = "DELIVERY_ID")]
+        delivery: Option<String>,
         #[arg(long, value_name = "DURATION")]
         timeout: Option<String>,
     },
@@ -145,6 +157,13 @@ pub enum Command {
         /// The step it is about, when there is one.
         #[arg(long, value_name = "PATH")]
         node: Option<String>,
+        /// proposal: read before a choice (link it from the questions);
+        /// finding: an experiment, audit or investigation to know about.
+        #[arg(long, value_enum)]
+        kind: Option<ReportKindArg>,
+        /// What it is about: arch, code or ux.
+        #[arg(long, value_enum)]
+        domain: Option<DomainArg>,
     },
     /// Publish an attachment blob or deliver a feature's completed work.
     Blob {
@@ -157,8 +176,10 @@ pub enum Command {
         node: String,
         #[arg(long, value_name = "ULID")]
         attempt: String,
+        /// The decision receipt this delivery answers. Omit it for finished work
+        /// no decision asked for; then list no criteria.
         #[arg(long, value_name = "ULID")]
-        receipt: String,
+        receipt: Option<String>,
         #[arg(long, value_name = "FILE|-")]
         json: String,
         #[arg(long, value_name = "ULID")]
@@ -167,10 +188,40 @@ pub enum Command {
     /// Enabled house rules.
     Rules,
     /// The project as an arriving agent needs it: declared or not, who works on
-    /// which step, what you own and what you may start. Read-only.
-    Board,
-    /// Local Vault/index health.
+    /// which step, what you own and what you may start. Lists open steps and a
+    /// page per milestone with the command that fetches it (`--milestone`);
+    /// `--all` lists every step; `--out FILE` saves instead of printing. Read-only.
+    Board {
+        /// One milestone: its open steps in full, finished ones as node, title
+        /// and progress. `--milestone ''` is the steps without a milestone.
+        #[arg(long, value_name = "NAME", conflicts_with = "all")]
+        milestone: Option<String>,
+        /// Every step, finished ones included, with full reconcile entries.
+        #[arg(long)]
+        all: bool,
+        /// Write the JSON to FILE (its folder must exist; never inside the
+        /// Vault) and print only its path, size and step count.
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+    },
+    /// What this session still owes the board, one line each with the
+    /// command: steps it holds (and when they free), steps it may take, its
+    /// questions on closed steps, and a few planned steps to look at.
+    /// Read-only; run it before you stop.
+    Settle,
+    /// Local Vault/index health, and the last known update check (read only).
     Status,
+    /// What the Vault holds and what a cleanup could free, per project: event
+    /// bytes, attachments by category, and every attachment with its status
+    /// and reason. Lists only: it deletes nothing and writes nothing to the
+    /// Vault. Pass --project for one project; without it, every project.
+    Prune,
+    /// Ask GitHub whether a newer Agendar release exists (never installs).
+    Update {
+        /// Check now over the network (the default for now).
+        #[arg(long)]
+        check: bool,
+    },
     /// Vault/index maintenance.
     Index {
         #[command(subcommand)]
@@ -259,8 +310,10 @@ impl Command {
             Self::Inbox { .. }
                 | Self::Wait { .. }
                 | Self::Rules
-                | Self::Board
+                | Self::Board { .. }
+                | Self::Settle
                 | Self::Status
+                | Self::Prune
                 | Self::State { .. }
         )
     }
@@ -293,7 +346,9 @@ pub enum FeatureCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ProgressCommand {
-    /// Start an attempt with an ETA.
+    /// Start an attempt with an ETA: a planned step, your own, or a free
+    /// (abandoned) one. A step another agent still holds needs the owner's
+    /// answer first: `ask --node <step> --takeover`, then `--applies`.
     Started {
         #[arg(long, value_name = "PATH")]
         node: String,
@@ -428,6 +483,38 @@ impl From<ModeArg> for Mode {
             ModeArg::Auto => Mode::Auto,
             ModeArg::Assume => Mode::Assume,
             ModeArg::Ask => Mode::Ask,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ReportKindArg {
+    Proposal,
+    Finding,
+}
+
+impl From<ReportKindArg> for ReportKind {
+    fn from(value: ReportKindArg) -> Self {
+        match value {
+            ReportKindArg::Proposal => ReportKind::Proposal,
+            ReportKindArg::Finding => ReportKind::Finding,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DomainArg {
+    Arch,
+    Code,
+    Ux,
+}
+
+impl From<DomainArg> for Domain {
+    fn from(value: DomainArg) -> Self {
+        match value {
+            DomainArg::Arch => Domain::Arch,
+            DomainArg::Code => Domain::Code,
+            DomainArg::Ux => Domain::Ux,
         }
     }
 }

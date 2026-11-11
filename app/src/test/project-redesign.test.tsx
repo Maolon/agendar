@@ -212,7 +212,7 @@ describe("finished work and the Now section", () => {
   it("never calls a finished step stopped when its session ended", () => {
     const done = feature("a", { progress: "done", liveness: "lost" });
     const node = { id: "feature:a", kind: "feature" as const, label: "a", feature: "a", state: "done", assumed: false };
-    expect(nodeDisplay(node, done).sub).toBe("Ready for review");
+    expect(nodeDisplay(node, done).sub).toBe("Done");
     const doing = feature("b", { progress: "doing", liveness: "lost" });
     expect(nodeDisplay({ ...node, id: "feature:b", feature: "b" }, doing).sub).toBe("Stopped");
   });

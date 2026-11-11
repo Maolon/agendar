@@ -40,14 +40,24 @@ async function started(client: FakeClient): Promise<SnapshotStore> {
 }
 
 describe("SnapshotStore", () => {
+  it("passes on the tray's request to open Settings › About once", async () => {
+    const client = new FakeClient();
+    const store = await started(client);
+    client.emit("agendar://navigate", { view: "settings", tab: "about" });
+    expect(store.getState().navigate).toEqual({ tab: "about", seq: 1 });
+    store.clearNavigate();
+    expect(store.getState().navigate).toBeNull();
+    store.stop();
+  });
+
   it("subscribes to every push event before fetching the first snapshot", async () => {
     const client = new FakeClient();
     const store = await started(client);
-    expect(client.subscribeCountAtFirstFetch).toBe(4);
+    expect(client.subscribeCountAtFirstFetch).toBe(7);
     expect(client.snapshotCalls).toBe(1);
     expect(store.getState().snapshot?.generation).toBe(7);
     store.stop();
-    expect(client.unsubscribed).toHaveLength(4);
+    expect(client.unsubscribed).toHaveLength(7);
   });
 
   it("coalesces an event burst into one in-flight fetch plus one catch-up", async () => {

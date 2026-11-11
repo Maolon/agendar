@@ -205,6 +205,49 @@ pub fn descendants(
     seen.into_iter().collect()
 }
 
+/// [`descendants`] of every node in `nodes` along the accepted edges (whose
+/// ends are all in `nodes`), computed over integer ids. Each list is sorted by
+/// node path, as id order is path order.
+pub fn all_descendants(
+    nodes: &BTreeSet<NodePath>,
+    accepted: &[AcceptedEdge],
+) -> BTreeMap<NodePath, Vec<NodePath>> {
+    let paths: Vec<&NodePath> = nodes.iter().collect();
+    let id_of: BTreeMap<&NodePath, usize> = paths
+        .iter()
+        .enumerate()
+        .map(|(id, path)| (*path, id))
+        .collect();
+    let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); paths.len()];
+    for edge in accepted {
+        if let (Some(&from), Some(&to)) = (id_of.get(&edge.upstream), id_of.get(&edge.downstream)) {
+            adjacency[from].push(to);
+        }
+    }
+    let mut seen_by = vec![usize::MAX; paths.len()];
+    let mut result = BTreeMap::new();
+    for (start, path) in paths.iter().enumerate() {
+        seen_by[start] = start;
+        let mut found: Vec<usize> = Vec::new();
+        let mut queue = VecDeque::from([start]);
+        while let Some(node) = queue.pop_front() {
+            for &next in &adjacency[node] {
+                if seen_by[next] != start {
+                    seen_by[next] = start;
+                    found.push(next);
+                    queue.push_back(next);
+                }
+            }
+        }
+        found.sort_unstable();
+        result.insert(
+            (*path).clone(),
+            found.into_iter().map(|id| paths[id].clone()).collect(),
+        );
+    }
+    result
+}
+
 /// Sorted unique ancestors of `start` (excluding `start`).
 pub fn ancestors(
     adjacency: &BTreeMap<NodePath, BTreeSet<NodePath>>,

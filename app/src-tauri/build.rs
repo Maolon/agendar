@@ -13,6 +13,7 @@ fn main() {
         "resolve_rescue",
         "update_project",
         "update_feature",
+        "drop_steps",
         "set_policy",
         "set_rule",
         "read_report",
@@ -24,6 +25,7 @@ fn main() {
         "configure_vault",
         "get_setup_locations",
         "get_local_config",
+        "get_storage_usage",
         "test_notice",
         "open_report",
         "get_bindings",
@@ -36,6 +38,8 @@ fn main() {
         "open_preview",
         "window_chrome",
         "set_glass_regions",
+        "check_updates",
+        "open_release",
     ];
     tauri_build::try_build(
         tauri_build::Attributes::new()

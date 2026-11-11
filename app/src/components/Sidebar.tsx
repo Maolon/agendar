@@ -1,8 +1,10 @@
 import { needQuestion, needReason } from "../i18n/msg";
+import { shortcut } from "../state/shortcut";
 import { tx, type MessageKey } from "../i18n";
 import { useState } from "react";
-import { formatAge, formatAgo, formatWaiting } from "../api/format";
-import { activeNeeds, snoozedNeeds } from "../state/snooze";
+import { formatAge, formatWaiting } from "../api/format";
+import { activeNeeds, closedStepNeeds, snoozedNeeds } from "../state/snooze";
+import { isActiveNeed } from "../state/claim";
 import type {
   FeatureState,
   NeedsYouItem,
@@ -11,8 +13,11 @@ import type {
   Snapshot,
   Variance,
 } from "../api/types";
-import { agentsLine, idleAgents, projectFinishLabel, workingAgents } from "../state/project";
+import { agentsLine, projectFinishLabel, totalAgents } from "../state/project";
+import { demoGap, demoGapLine } from "../state/demoGap";
+import { isRadarCandidate } from "../graph/display";
 import type { Selection } from "../state/ui";
+import { FootStatus } from "./FootStatus";
 import { Icon, type IconName } from "./Icon";
 import { ProjectAvatar } from "./ProjectAvatar";
 
@@ -32,20 +37,11 @@ const NEED_ICON: Record<NeedsYouItem["kind"], IconName> = {
   rescue: "alert-triangle",
 };
 
-export function sidebarRows(
-  snapshot: Snapshot,
-  filter: string,
-  quietOpen: boolean,
-): Selection[] {
-  const text = filter.trim().toLowerCase();
-  const matches = (value: string): boolean => !text || value.toLowerCase().includes(text);
-  const needs = activeNeeds(snapshot).filter(
-    (item) => matches(item.question) || matches(item.project),
-  );
+/** Visible needs then project rows, in shown order (↑/↓ traversal). */
+export function sidebarRows(snapshot: Snapshot, quietOpen: boolean): Selection[] {
+  const needs = activeNeeds(snapshot);
   const visible = orderedProjects(snapshot).filter(
-    (summary) =>
-      matches(projectText(snapshot, summary)) &&
-      (summary.variance !== "quiet" || quietOpen || text.length > 0),
+    (summary) => summary.variance !== "quiet" || quietOpen,
   );
   return [
     ...needs.map((item) => ({ kind: "need" as const, id: item.id })),
@@ -58,7 +54,7 @@ export function orderedProjects(snapshot: Snapshot): ProjectSummary[] {
     .map((project) => project.summary)
     .filter((summary) => !summary.archived);
   const firstNeed = (slug: string): number => {
-    const needs = snapshot.needs.filter((item) => item.project === slug);
+    const needs = snapshot.needs.filter((item) => item.project === slug && isActiveNeed(item));
     if (!needs.length) return Number.POSITIVE_INFINITY;
     return Math.min(...needs.map((item) => Date.parse(item.since)).filter((value) => !Number.isNaN(value)));
   };
@@ -74,16 +70,13 @@ export function orderedProjects(snapshot: Snapshot): ProjectSummary[] {
   });
 }
 
-function projectText(snapshot: Snapshot, summary: ProjectSummary): string {
-  const features = Object.values(snapshot.state.projects[summary.slug]?.features ?? {});
-  return [summary.slug, summary.title, ...features.map((feature) => feature.title)].join(" ");
-}
-
 function needIcon(item: NeedsYouItem, snapshot: Snapshot): { icon: IconName; red: boolean } {
   const feature = item.node
     ? snapshot.state.projects[item.project]?.features[item.node]
     : undefined;
-  return { icon: NEED_ICON[item.kind], red: item.kind === "rescue" && feature?.liveness === "lost" };
+  // The same claim the board shows: a step whose claim ended is red.
+  const ended = feature?.claim ? feature.claim.state === "free" : feature?.liveness === "lost";
+  return { icon: NEED_ICON[item.kind], red: item.kind === "rescue" && ended === true };
 }
 
 export function ProjectTrack({
@@ -257,11 +250,22 @@ function ProjectRow({
   const summary = project.summary;
   const variance = summary.variance;
   const eta = projectFinishLabel(project);
+  // "No demo" says what is missing and what clears it.
+  const gap = variance === "no_demo" ? demoGap(project) : null;
+  const why = gap ? demoGapLine(gap) : undefined;
+  // A project that still has live work keeps its state; its stopped steps are
+  // a count beside it. A project that is only stopped says so by its chip.
+  const stoppedSteps = variance === "stopped" ? 0 : (summary.stopped_steps ?? 0);
+  const stoppedLabel =
+    stoppedSteps === 1
+      ? tx("variance.stopped_steps.one")
+      : tx("variance.stopped_steps.other", { n: stoppedSteps });
   return (
     <button
       type="button"
       className="row prow"
       title={summary.title}
+      aria-description={why}
       aria-current={selected}
       data-row={`project:${summary.slug}`}
       onClick={onSelect}
@@ -282,6 +286,12 @@ function ProjectRow({
             ) : null}
           </span>
         ) : null}
+        {stoppedSteps > 0 ? (
+          <span className="pstop" role="img" aria-label={stoppedLabel} title={stoppedLabel}>
+            <Icon name="pause-circle" />
+            <span aria-hidden="true">{stoppedSteps}</span>
+          </span>
+        ) : null}
         {variance === "active" ? (
           <ProjectTrack
             features={project.features}
@@ -290,10 +300,10 @@ function ProjectRow({
             pulses={pulses}
           />
         ) : (
-          <>
+          <span className="pvar" title={why}>
             <Icon name={VARIANCE_LABEL[variance].icon} className="c2" />
             {tx(VARIANCE_LABEL[variance].text)}
-          </>
+          </span>
         )}
       </span>
     </button>
@@ -303,7 +313,6 @@ function ProjectRow({
 interface SidebarProps {
   snapshot: Snapshot;
   selection: Selection | null;
-  filter: string;
   quietOpen: boolean;
   /** Motion is allowed right now; the track segment flashes on a pulse. */
   motion?: boolean;
@@ -319,7 +328,6 @@ interface SidebarProps {
 export function Sidebar({
   snapshot,
   selection,
-  filter,
   quietOpen,
   motion,
   pulses,
@@ -328,18 +336,15 @@ export function Sidebar({
   onOpenSettings,
   settingsOpen = false,
 }: SidebarProps) {
-  const evaluatedAt = snapshot.state.evaluated_at;
-  const text = filter.trim().toLowerCase();
-  const matches = (value: string): boolean => !text || value.toLowerCase().includes(text);
-  const active = activeNeeds(snapshot);
-  const needs = active.filter((item) => matches(item.question) || matches(item.project));
+  const needs = activeNeeds(snapshot);
   // Snoozed items leave Needs you until their time but stay reachable to restore.
   const snoozed = snoozedNeeds(snapshot);
   const [snoozedOpen, setSnoozedOpen] = useState(false);
+  // Questions on closed steps fold away; they stay answerable here.
+  const closed = closedStepNeeds(snapshot);
+  const [closedOpen, setClosedOpen] = useState(false);
   const projects = orderedProjects(snapshot);
-  const visibleProjects = projects.filter(
-    (summary) => matches(projectText(snapshot, summary)) && (summary.variance !== "quiet" || quietOpen || text.length > 0),
-  );
+  const visibleProjects = projects.filter((summary) => summary.variance !== "quiet" || quietOpen);
   const quiet = projects.filter((summary) => summary.variance === "quiet");
   // Archived projects leave the lists but stay reachable, to look or restore.
   const archived = Object.values(snapshot.state.projects)
@@ -349,22 +354,15 @@ export function Sidebar({
   const live = projects
     .map((summary) => snapshot.state.projects[summary.slug])
     .filter((project): project is ProjectState => project !== undefined);
-  const working = live.reduce((total, project) => total + workingAgents(project), 0);
-  const idle = live.reduce((total, project) => total + idleAgents(project), 0);
+  const agents = agentsLine(totalAgents(live)) ?? tx("agents.none");
   const health = snapshot.local.health;
   // The footer radar means the fleet has work in progress: a live agent on a
   // doing feature. Without one it is not decoration, so it is not shown.
   const moving = projects.some((summary) => {
     const project = snapshot.state.projects[summary.slug];
     if (!project) return false;
-    return Object.values(project.features).some(
-      (feature) =>
-        feature.progress === "doing" &&
-        feature.gate === "open" &&
-        feature.liveness === "live" &&
-        feature.basis !== "tainted" &&
-        !feature.paused,
-    );
+    // The plan's rule: a step waiting for the owner's review is not moving.
+    return Object.values(project.features).some(isRadarCandidate);
   });
 
   return (
@@ -372,7 +370,7 @@ export function Sidebar({
       <div className="side-scroll">
         <div className="gh">
           {tx("side.needs")}{" "}
-          <span className={active.length ? "n on" : "n"}>{active.length}</span>
+          <span className={needs.length ? "n on" : "n"}>{needs.length}</span>
         </div>
         {needs.length ? (
           needs.map((item) => (
@@ -385,15 +383,33 @@ export function Sidebar({
             />
           ))
         ) : (
-          <div className="empty-row">{active.length ? tx("side.no_match") : tx("side.nothing")}</div>
+          <div className="empty-row">{tx("side.nothing")}</div>
         )}
-        {!text && snoozed.length ? (
+        {snoozed.length ? (
           <>
             <button type="button" className="more" onClick={() => setSnoozedOpen((open) => !open)}>
               {snoozedOpen ? tx("side.snoozed_hide") : tx("side.snoozed", { n: snoozed.length })}
             </button>
             {snoozedOpen
               ? snoozed.map((item) => (
+                  <NeedRow
+                    key={item.id}
+                    item={item}
+                    snapshot={snapshot}
+                    selected={selection?.kind === "need" && selection.id === item.id}
+                    onSelect={() => onSelect({ kind: "need", id: item.id })}
+                  />
+                ))
+              : null}
+          </>
+        ) : null}
+        {closed.length ? (
+          <>
+            <button type="button" className="more" onClick={() => setClosedOpen((open) => !open)}>
+              {closedOpen ? tx("side.closed_hide") : tx("side.closed", { n: closed.length })}
+            </button>
+            {closedOpen
+              ? closed.map((item) => (
                   <NeedRow
                     key={item.id}
                     item={item}
@@ -422,7 +438,7 @@ export function Sidebar({
             />
           );
         })}
-        {!text && quiet.length ? (
+        {quiet.length ? (
           <button type="button" className="more" onClick={onToggleQuiet}>
             {quietOpen ? tx("side.quiet_hide") : tx("side.quiet_more", { n: quiet.length })}
           </button>
@@ -448,32 +464,11 @@ export function Sidebar({
       </div>
       <div className="side-foot">
         <span className="foot-status">
-          <span className="foot-item foot-agents" title={agentsLine(working, idle) ?? tx("agents.none")}>
+          <span className="foot-item foot-agents" title={agents}>
             {moving ? <span className="radar" aria-hidden="true" /> : null}
-            <span className="foot-text">{agentsLine(working, idle) ?? tx("agents.none")}</span>
+            <span className="foot-text">{agents}</span>
           </span>
-          <span
-            className="foot-item foot-received"
-            title={tx("side.received_title", {
-              age: formatAge(snapshot.local.received_at, evaluatedAt),
-              ago: formatAgo(snapshot.local.received_at, evaluatedAt),
-              time: snapshot.local.received_at,
-            })}
-          >
-            <Icon name="cloud" />
-            <span
-              className="foot-text"
-              aria-label={tx("side.received_label", {
-                age: formatAge(snapshot.local.received_at, evaluatedAt),
-                ago: formatAgo(snapshot.local.received_at, evaluatedAt),
-              })}
-            >
-              {tx("side.received", {
-                age: formatAge(snapshot.local.received_at, evaluatedAt),
-                ago: formatAgo(snapshot.local.received_at, evaluatedAt),
-              })}
-            </span>
-          </span>
+          <FootStatus snapshot={snapshot} onOpenAbout={() => onSelect({ kind: "settings", id: "about" })} />
           {health !== "healthy" ? <span className="foot-item c3">{health}</span> : null}
         </span>
         {onOpenSettings ? (
@@ -481,7 +476,7 @@ export function Sidebar({
             type="button"
             className="settings-btn"
             aria-label={tx("side.settings")}
-            title={tx("side.settings_title")}
+            title={tx("side.settings_title", { key: shortcut("mod+,") })}
             aria-current={settingsOpen ? "page" : undefined}
             onClick={onOpenSettings}
           >

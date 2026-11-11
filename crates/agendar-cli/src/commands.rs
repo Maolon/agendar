@@ -9,6 +9,7 @@ use std::sync::atomic::AtomicBool;
 use serde_json::{Value, json};
 
 use agendar_core::adapters::Adapter;
+use agendar_core::board::BoardView;
 use agendar_core::error::{AgendarError, ErrorCode, Result};
 use agendar_core::model::{
     BlobExt, CriterionId, DecisionCard, DeliveredOutcome, EventId, Harness, NodePath, PlanFeature,
@@ -17,7 +18,7 @@ use agendar_core::model::{
 use agendar_core::runtime::sessions::process_identity;
 use agendar_core::runtime::steward::steward_tick;
 use agendar_core::runtime::{SessionRegistration, register_session};
-use agendar_core::service::{Freshness, Service, WaitOptions};
+use agendar_core::service::{Freshness, Service, WaitOptions, WaitTarget};
 use agendar_core::vault::Clock;
 use agendar_core::vault::SystemClock;
 
@@ -33,7 +34,17 @@ use crate::output;
 pub const MAX_JSON_INPUT_BYTES: usize = 65_536;
 
 /// Dispatch one parsed invocation.
+/// How long an agent command waits for a local lock that other Agendar
+/// processes hold before it gives up with `E_BUSY`.
+const CLI_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub fn dispatch(cli: Cli) -> i32 {
+    // An agent command waits out the other processes' refreshes instead of
+    // failing after the app's short wait. Hooks keep the short wait: they run
+    // inside the harness's own time budget, often in front of the user.
+    if !matches!(cli.command, Command::Hook { .. }) {
+        agendar_core::runtime::set_lock_wait(CLI_LOCK_WAIT);
+    }
     // The MCP server resolves context per tool call (it runs this CLI).
     if let Command::Mcp { harness } = &cli.command {
         return crate::mcp::run((*harness).into());
@@ -77,6 +88,10 @@ pub fn dispatch(cli: Cli) -> i32 {
             Some(value) => output::success("schema", value, None),
             None => 2,
         };
+    }
+    // The update check reads and writes the local data directory only.
+    if let Command::Update { .. } = &cli.command {
+        return run_update(&cli);
     }
     // Repository links are local config only; they must work before a Vault
     // exists on this host.
@@ -123,6 +138,7 @@ pub fn dispatch(cli: Cli) -> i32 {
             options,
             recommend,
             why,
+            takeover,
             mode,
         } => {
             let quick = QuickAsk {
@@ -130,6 +146,7 @@ pub fn dispatch(cli: Cli) -> i32 {
                 options,
                 recommend,
                 why,
+                takeover,
             };
             run_ask(
                 &context,
@@ -140,7 +157,11 @@ pub fn dispatch(cli: Cli) -> i32 {
             )
         }
         Command::Inbox { node } => run_inbox(&context, node),
-        Command::Wait { ask_id, timeout } => run_wait(&context, &ask_id, timeout),
+        Command::Wait {
+            ask_id,
+            delivery,
+            timeout,
+        } => run_wait(&context, ask_id.as_deref(), delivery.as_deref(), timeout),
         Command::Ack {
             answer_id,
             restarted,
@@ -151,7 +172,17 @@ pub fn dispatch(cli: Cli) -> i32 {
             summary,
             file,
             node,
-        } => run_report(&context, title, summary, &file, node.as_deref()),
+            kind,
+            domain,
+        } => run_report(
+            &context,
+            title,
+            summary,
+            &file,
+            node.as_deref(),
+            kind.map(Into::into),
+            domain.map(Into::into),
+        ),
         Command::Blob { action } => match action {
             BlobCommand::Put { file, ext } => run_blob_put(&context, &file, &ext),
         },
@@ -165,13 +196,26 @@ pub fn dispatch(cli: Cli) -> i32 {
             &context,
             &node,
             &attempt,
-            &receipt,
+            receipt.as_deref(),
             &json,
             supersedes.as_deref(),
         ),
         Command::Rules => run_rules(&context),
-        Command::Board => run_board(&context),
+        Command::Board {
+            milestone,
+            all,
+            out,
+        } => {
+            let view = match (milestone, all) {
+                (Some(name), _) => BoardView::Milestone(Some(name).filter(|name| !name.is_empty())),
+                (None, true) => BoardView::All,
+                (None, false) => BoardView::Open,
+            };
+            run_board(&context, &view, out.as_deref())
+        }
+        Command::Settle => run_settle(&context),
         Command::Status => run_status(&context),
+        Command::Prune => run_prune(&context),
         Command::Index { action } => match action {
             IndexCommand::Rebuild => run_rebuild(&context),
         },
@@ -191,7 +235,8 @@ pub fn dispatch(cli: Cli) -> i32 {
         | Command::InstallMcp { .. }
         | Command::Bind { .. }
         | Command::Unbind { .. }
-        | Command::Bindings => 2,
+        | Command::Bindings
+        | Command::Update { .. } => 2,
     }
 }
 
@@ -333,6 +378,50 @@ fn finish(service: &Service, command: &str, data: Value, cached: bool) -> i32 {
     output::success(command, data, freshness(service, cached))
 }
 
+/// Add the session's debt line (`debt`) to a boundary command's result when
+/// it owes anything: `open: 2 yours (1 past ETA), 1 free to take, 26 planned
+/// · agendar settle`.
+fn with_debt(
+    service: &Service,
+    project: &agendar_core::model::ProjectSlug,
+    session: &agendar_core::model::SessionId,
+    mut data: Value,
+) -> Value {
+    if let (Some(line), Some(object)) = (service.debt_line(project, session), data.as_object_mut())
+    {
+        object.insert("debt".into(), Value::from(line));
+    }
+    data
+}
+
+fn run_settle(context: &Context) -> i32 {
+    let (project, session) = match (context.require_project(), context.require_session()) {
+        (Ok(project), Ok(session)) => (project, session),
+        (Err(error), _) | (_, Err(error)) => return output::error(&error),
+    };
+    let service = match open(context) {
+        Ok(service) => service,
+        Err(error) => return output::error(&error),
+    };
+    match service.settle(&project, &session, context.cached) {
+        Ok((data, shown)) => {
+            let code = finish(&service, "settle", data, context.cached);
+            // Shown candidates rest for a week, only once the agent saw them.
+            if code == 0
+                && let Err(error) = service.mark_settle_shown(&project, &shown)
+                && context.verbose
+            {
+                eprintln!(
+                    "agendar settle: shown cursor was not recorded: {}",
+                    error.message()
+                );
+            }
+            code
+        }
+        Err(error) => output::error(&error),
+    }
+}
+
 fn run_init(
     context: &Context,
     harness: Option<crate::args::HarnessArg>,
@@ -449,6 +538,7 @@ fn run_init(
         return output::error(&error);
     }
     let mut session = None;
+    let mut not_bound = None;
     if registration_requested {
         let project = match repo_project.clone() {
             Some(project) => project,
@@ -478,19 +568,35 @@ fn run_init(
                 );
             }
         };
-        match register_session(
-            &service,
-            SessionRegistration {
-                project,
-                harness,
-                harness_session_id: harness_session,
-                pid,
-                process_start,
-                repo_root: repo,
-            },
-        ) {
-            Ok(id) => session = Some(id),
-            Err(error) => return output::error(&error),
+        let registration = SessionRegistration {
+            project,
+            harness,
+            harness_session_id: harness_session,
+            pid,
+            process_start,
+            repo_root: repo,
+        };
+        // `--session X`: the agent already has an Agendar session (its
+        // harness session id changed, for example after `/clear`). Bind the
+        // new id to X when X is this process's or its process is gone;
+        // otherwise register as usual and say why X was not kept.
+        if let Some(wanted) = &context.session {
+            match agendar_core::runtime::steward::bind_session(&service, wanted, &registration) {
+                Ok(Ok(())) => session = Some(wanted.clone()),
+                Ok(Err(why)) => {
+                    not_bound = Some(format!(
+                        "Session {} was not kept: {why}. This is a new session.",
+                        wanted.as_str()
+                    ));
+                }
+                Err(error) => return output::error(&error),
+            }
+        }
+        if session.is_none() {
+            match register_session(&service, registration) {
+                Ok(id) => session = Some(id),
+                Err(error) => return output::error(&error),
+            }
         }
     }
     let mut data = json!({
@@ -502,8 +608,12 @@ fn run_init(
         if let Some(project) = repo_project.as_ref() {
             data["project"] = json!(project);
             data["context_prefix"] = json!(service.command_prefix(project, &session));
+            data = with_debt(&service, project, &session, data);
         }
         data["session"] = json!(session);
+    }
+    if let Some(note) = not_bound {
+        data["session_note"] = json!(note);
     }
     output::success("init", data, None)
 }
@@ -573,6 +683,7 @@ fn run_progress(context: &Context, action: ProgressCommand) -> i32 {
         Ok(service) => service,
         Err(error) => return output::error(&error),
     };
+    let boundary = !matches!(action, ProgressCommand::Started { .. });
     let result = match action {
         ProgressCommand::Started {
             node,
@@ -660,6 +771,10 @@ fn run_progress(context: &Context, action: ProgressCommand) -> i32 {
         },
     };
     match result {
+        Ok(data) if boundary => {
+            let data = with_debt(&service, &project, &session, data);
+            finish(&service, "progress", data, context.cached)
+        }
         Ok(data) => finish(&service, "progress", data, context.cached),
         Err(error) => output::error(&error),
     }
@@ -736,6 +851,56 @@ pub struct QuickAsk {
     pub options: Vec<String>,
     pub recommend: Option<usize>,
     pub why: Option<String>,
+    /// The takeover form: what the agent read of the other agent's work.
+    pub takeover: Option<String>,
+}
+
+/// The card by which an agent asks the owner to let it continue a step
+/// another agent holds. Choosing `takeover` admits its start.
+fn takeover_card(node: Option<&str>, read: &str, why: Option<&str>) -> Result<Value> {
+    let node = node.ok_or_else(|| {
+        AgendarError::new(ErrorCode::Usage, "Name the step you want to continue.")
+            .with_detail("ask_node_missing")
+            .with_hint("agendar ask --node <step> --takeover \"<what you read of its work>\"")
+    })?;
+    let question = format!("May I continue {node}?");
+    let question = if question.chars().count() > agendar_core::validate::limits::CARD_QUESTION {
+        "May I continue this step?".to_owned()
+    } else {
+        question
+    };
+    Ok(json!({
+        "why_now": why.unwrap_or("Another agent holds this step; I can continue it now."),
+        "question": question,
+        "reversibility": "easy",
+        "reach": "local",
+        "external": false,
+        "domain": "code",
+        "options": [
+            {
+                "id": agendar_core::model::TAKEOVER_OPTION,
+                "label": "Let this agent continue",
+                "consequence": "It takes the step from where the work stands; the agent that held it is told to stop.",
+                "reversibility": "easy",
+                "external": false,
+            },
+            {
+                "id": "leave",
+                "label": "Leave it with its agent",
+                "consequence": "The step stays with the agent that started it; this one does other work.",
+                "reversibility": "easy",
+                "external": false,
+            },
+        ],
+        "recommended": {
+            "option": agendar_core::model::TAKEOVER_OPTION,
+            "confidence": "low",
+            "because": "The agent's request; your call.",
+        },
+        "already_checked": [{"text": read, "claim": "agent_says"}],
+        "done_when": [{"id": "answered", "text": "The step goes on with the agent you chose."}],
+        "on_timeout": {"kind": "hold"},
+    }))
 }
 
 const QUICK_IDS: [&str; 4] = ["a", "b", "c", "d"];
@@ -848,10 +1013,16 @@ fn run_ask(
             Ok(input) => input,
             Err(error) => return output::error(&error),
         },
-        None => match quick_card(&quick) {
-            Ok(input) => input,
-            Err(error) => return output::error(&error),
-        },
+        None => {
+            let card = match quick.takeover.as_deref() {
+                Some(read) => takeover_card(node, read, quick.why.as_deref()),
+                None => quick_card(&quick),
+            };
+            match card {
+                Ok(input) => input,
+                Err(error) => return output::error(&error),
+            }
+        }
     };
     let node = match node {
         Some(node) => match NodePath::parse(node) {
@@ -937,23 +1108,26 @@ fn run_inbox(context: &Context, node: Option<String>) -> i32 {
                         .is_none_or(|node| nudge.node.as_ref().is_none_or(|own| own == node))
                 })
                 .collect();
-            let fresh = freshness(&service, context.cached);
-            let code = output::success(
-                "inbox",
+            let data = with_debt(
+                &service,
+                &project,
+                &session,
                 json!({
                     "packets": packets,
                     "rules": rules,
                     "session": session,
                     "nudges": nudges,
                 }),
-                fresh,
             );
+            let fresh = freshness(&service, context.cached);
+            let code = output::success("inbox", data, fresh);
             if code == 0
-                && let Err(error) = service.mark_delivered(
+                && let Err(error) = service.mark_delivered_via(
                     &project,
                     &session,
                     &packets,
                     DeliveredOutcome::InboxRead,
+                    "inbox",
                 )
                 && context.verbose
             {
@@ -980,13 +1154,27 @@ fn run_inbox(context: &Context, node: Option<String>) -> i32 {
     }
 }
 
-fn run_wait(context: &Context, ask_id: &str, timeout: Option<String>) -> i32 {
+fn run_wait(
+    context: &Context,
+    ask_id: Option<&str>,
+    delivery: Option<&str>,
+    timeout: Option<String>,
+) -> i32 {
     let (project, session) = match (context.require_project(), context.require_session()) {
         (Ok(project), Ok(session)) => (project, session),
         (Err(error), _) | (_, Err(error)) => return output::error(&error),
     };
-    let ask = match EventId::parse(ask_id) {
-        Ok(ask) => ask,
+    let target = match (ask_id, delivery) {
+        (_, Some(delivery)) => EventId::parse(delivery).map(WaitTarget::Verdict),
+        (Some(ask), None) => EventId::parse(ask).map(WaitTarget::Answer),
+        (None, None) => Err(AgendarError::validation_at(
+            "/ask_id",
+            "wait_target_missing",
+            "Name an ask id, or --delivery <id>.",
+        )),
+    };
+    let target = match target {
+        Ok(target) => target,
         Err(error) => return output::error(&error),
     };
     let timeout = match timeout {
@@ -1009,7 +1197,14 @@ fn run_wait(context: &Context, ask_id: &str, timeout: Option<String>) -> i32 {
         });
     }
     if context.verbose {
-        eprintln!("agendar wait: waiting for a current answer to {ask}.");
+        match &target {
+            WaitTarget::Answer(ask) => {
+                eprintln!("agendar wait: waiting for a current answer to {ask}.")
+            }
+            WaitTarget::Verdict(delivery) => {
+                eprintln!("agendar wait: waiting for the verdict on delivery {delivery}.")
+            }
+        }
     }
     let options = WaitOptions {
         timeout,
@@ -1017,17 +1212,34 @@ fn run_wait(context: &Context, ask_id: &str, timeout: Option<String>) -> i32 {
         ..WaitOptions::default()
     };
     let mut observer = agendar_core::service::NoopWaitObserver;
-    match service.wait_for_answer(&project, &session, &ask, &options, &mut observer) {
+    match service.wait_for(&project, &session, &target, &options, &mut observer) {
         Ok(packet) => {
             let fresh = freshness(&service, false);
-            output::success(
-                "wait",
-                json!({
-                    "ask_id": ask,
-                    "packet": packet,
-                }),
-                fresh,
-            )
+            let data = match &target {
+                WaitTarget::Answer(ask) => json!({"ask_id": ask, "packet": packet}),
+                WaitTarget::Verdict(delivery) => {
+                    json!({"delivery_id": delivery, "packet": packet})
+                }
+            };
+            let code = output::success("wait", data, fresh);
+            // A verdict has no ack: printing it is this session's one sighting,
+            // so a later Stop or rewake does not wake for it again.
+            if matches!(target, WaitTarget::Verdict(_))
+                && let Err(error) = service.mark_delivered_via(
+                    &project,
+                    &session,
+                    std::slice::from_ref(&packet),
+                    DeliveredOutcome::Accepted,
+                    "wait",
+                )
+                && context.verbose
+            {
+                eprintln!(
+                    "agendar wait: the sighting was not recorded: {}",
+                    error.message()
+                );
+            }
+            code
         }
         Err(error) => output::error(&error),
     }
@@ -1136,7 +1348,7 @@ fn run_deliver(
     context: &Context,
     node: &str,
     attempt: &str,
-    receipt: &str,
+    receipt: Option<&str>,
     json: &str,
     supersedes: Option<&str>,
 ) -> i32 {
@@ -1152,7 +1364,7 @@ fn run_deliver(
         Ok(attempt) => attempt,
         Err(error) => return output::error(&error),
     };
-    let receipt = match EventId::parse(receipt) {
+    let receipt = match receipt.map(EventId::parse).transpose() {
         Ok(receipt) => receipt,
         Err(error) => return output::error(&error),
     };
@@ -1179,9 +1391,15 @@ fn run_deliver(
         .iter()
         .map(|criterion| criterion.criterion.clone())
         .collect();
-    if let Err(error) =
-        service.validate_delivery_target(&project, &node, &attempt, &receipt, &criteria_ids)
-    {
+    if let Err(error) = service.validate_delivery_target(
+        &project,
+        &node,
+        &attempt,
+        receipt.as_ref(),
+        &criteria_ids,
+        supersedes.as_ref(),
+        &input.replies,
+    ) {
         return output::error(&error);
     }
     let body =
@@ -1197,7 +1415,7 @@ fn run_deliver(
         &session,
         &node,
         &attempt,
-        &receipt,
+        receipt.as_ref(),
         supersedes.as_ref(),
         body,
         context.request_id.as_deref(),
@@ -1212,6 +1430,7 @@ fn run_deliver(
             {
                 return output::error(&error);
             }
+            let data = with_debt(&service, &project, &session, data);
             finish(&service, "deliver", data, context.cached)
         }
         Err(error) => output::error(&error),
@@ -1244,7 +1463,7 @@ fn run_rules(context: &Context) -> i32 {
     }
 }
 
-fn run_board(context: &Context) -> i32 {
+fn run_board(context: &Context, view: &BoardView, out: Option<&std::path::Path>) -> i32 {
     let project = match context.require_project() {
         Ok(project) => project,
         Err(error) => return output::error(&error),
@@ -1253,9 +1472,16 @@ fn run_board(context: &Context) -> i32 {
         Ok(service) => service,
         Err(error) => return output::error(&error),
     };
-    match service.board(&project, context.session.as_ref(), context.cached) {
-        Ok(board) => finish(&service, "board", board, context.cached),
-        Err(error) => output::error(&error),
+    let board = match service.board(&project, context.session.as_ref(), context.cached, view) {
+        Ok(board) => board,
+        Err(error) => return output::error(&error),
+    };
+    match out {
+        None => finish(&service, "board", board, context.cached),
+        Some(out) => match crate::board::write_out(&context.vault, out, &board) {
+            Ok(saved) => finish(&service, "board", saved, context.cached),
+            Err(error) => output::error(&error),
+        },
     }
 }
 
@@ -1265,7 +1491,71 @@ fn run_status(context: &Context) -> i32 {
         Err(error) => return output::error(&error),
     };
     match service.status(context.cached) {
-        Ok(data) => finish(&service, "status", data, context.cached),
+        Ok(mut data) => {
+            // The cached update check only: `status` never reaches the network.
+            if let Value::Object(object) = &mut data {
+                object.insert(
+                    "update".to_owned(),
+                    json!(agendar_core::update::cached_status(
+                        &context.data_dir,
+                        false
+                    )),
+                );
+            }
+            finish(&service, "status", data, context.cached)
+        }
+        Err(error) => output::error(&error),
+    }
+}
+
+/// `prune`: the usage and reclaimable listing. It only lists; there is no
+/// delete. One project when `--project` (or `AGENDAR_PROJECT`) names it, every
+/// project otherwise: the repository link of the working directory does not
+/// narrow it.
+fn run_prune(context: &Context) -> i32 {
+    let service = match open(context) {
+        Ok(service) => service,
+        Err(error) => return output::error(&error),
+    };
+    let project = context
+        .project
+        .as_ref()
+        .filter(|_| context.project_explicit);
+    let result = service
+        .refresh(SystemClock.now(), context.cached)
+        .and_then(|fresh| {
+            let usage = service.storage_usage(&fresh, project)?;
+            Ok((usage, Service::freshness(&fresh, context.cached)?))
+        });
+    match result {
+        Ok((usage, freshness)) => output::success("prune", json!(usage), Some(freshness)),
+        Err(error) => output::error(&error),
+    }
+}
+
+/// `update [--check]`: one network check against the latest public release,
+/// cached in the local data directory.
+fn run_update(cli: &Cli) -> i32 {
+    use agendar_core::update;
+    let data_root = match crate::args::resolve_data_root(cli) {
+        Ok(root) => root,
+        Err(error) => return output::error(&error),
+    };
+    let url = match update::endpoint() {
+        Ok(url) => url,
+        Err(error) => return output::error(&error),
+    };
+    match update::check(&data_root, &update::HttpFetcher, &url, SystemClock.now()) {
+        Ok(cache) => output::success(
+            "update",
+            json!(update::status(
+                &cache,
+                update::Channel::of_build(),
+                update::current_version(),
+                true,
+            )),
+            None,
+        ),
         Err(error) => output::error(&error),
     }
 }
@@ -1400,6 +1690,11 @@ fn run_steward(context: &Context, once: bool) -> i32 {
 }
 
 fn hook_error(error: &AgendarError) -> i32 {
+    // Hooks are installed for every repository on the machine. In one that is
+    // not linked to a project the session is not Agendar's: say nothing.
+    if error.detail() == Some("unlinked_repository") {
+        return 0;
+    }
     eprintln!(
         "agendar hook: {} ({})",
         error.message(),
@@ -1636,6 +1931,8 @@ fn run_report(
     summary: String,
     file: &str,
     node: Option<&str>,
+    kind: Option<agendar_core::model::ReportKind>,
+    domain: Option<agendar_core::model::Domain>,
 ) -> i32 {
     let (project, session) = match (context.require_project(), context.require_session()) {
         (Ok(project), Ok(session)) => (project, session),
@@ -1684,9 +1981,13 @@ fn run_report(
         &project,
         &session,
         node.as_ref(),
-        title,
-        summary,
-        report,
+        agendar_core::service::ReportDraft {
+            title,
+            summary,
+            report,
+            kind,
+            domain,
+        },
         context.request_id.as_deref(),
     ) {
         Ok(data) => finish(&service, "report", data, context.cached),

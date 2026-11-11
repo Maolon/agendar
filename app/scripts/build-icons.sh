@@ -20,8 +20,10 @@ full 512 "$icons/icon.png"
 # Tray: macOS template glyphs (black + alpha, 28x18 pt @2x) and colour tiles elsewhere.
 rsvg-convert -w 44 -h 36 "$src/tray-idle.svg" -o "$icons/tray-idle.png"
 rsvg-convert -w 44 -h 36 "$src/tray-needs.svg" -o "$icons/tray-needs.png"
+rsvg-convert -w 44 -h 36 "$src/tray-empty.svg" -o "$icons/tray-empty.png"
 rsvg-convert -w 32 -h 32 "$src/tray-idle-color.svg" -o "$icons/tray-idle-color.png"
 rsvg-convert -w 32 -h 32 "$src/tray-needs-color.svg" -o "$icons/tray-needs-color.png"
+rsvg-convert -w 32 -h 32 "$src/tray-empty-color.svg" -o "$icons/tray-empty-color.png"
 
 # Windows .ico: small glyph at 16/24/32, full mark above.
 small 16 "$work/16.png"; small 24 "$work/24.png"; small 32 "$work/32.png"

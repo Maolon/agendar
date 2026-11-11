@@ -12,6 +12,7 @@ use crate::model::event::{Delivery, Event, EventPayload, EvidenceObserved};
 use crate::model::ids::{BlobRef, CriterionId, EventId, NodePath, ProjectSlug, UtcTime, WriterId};
 use crate::model::state::{
     DecisionState, DeliveryState, ProjectedCriterion, Provenance, Receipt, ReviewStatus,
+    SentBackNote,
 };
 use crate::reduce::CausalView;
 
@@ -110,10 +111,10 @@ fn causal_maximal<'a, T>(
 
 fn effective_receipt<'a>(
     decisions: &'a BTreeMap<EventId, DecisionState>,
-    receipt: &Receipt,
+    receipt: Option<&Receipt>,
 ) -> Option<&'a EventId> {
     decisions
-        .get(&receipt.ask)
+        .get(&receipt?.ask)
         .and_then(|decision| decision.effective_receipt.as_ref())
 }
 
@@ -146,18 +147,24 @@ pub fn finalize(
         let EventPayload::Delivery(body) = &event.payload else {
             continue;
         };
-        let Some(receipt_id) = event.refs.receipt.clone() else {
-            continue;
+        // A delivery of finished work no decision asked for has no receipt.
+        let receipt_id = event.refs.receipt.clone();
+        let receipt = match &receipt_id {
+            Some(id) => match receipts.get(id) {
+                Some(receipt) => Some(receipt),
+                // The resolver keeps a delivery pending until its receipt exists.
+                None => continue,
+            },
+            None => None,
         };
-        let Some(receipt) = receipts.get(&receipt_id) else {
-            // The resolver keeps a delivery pending until its receipt exists.
-            continue;
-        };
-        let node = event
+        let Some(node) = event
             .refs
             .node
             .clone()
-            .unwrap_or_else(|| receipt.node.clone());
+            .or_else(|| receipt.map(|receipt| receipt.node.clone()))
+        else {
+            continue;
+        };
         let superseded_by = superseded.get(delivery_id).cloned();
         let criteria = project_criteria(fold, delivery_id, body, receipt, causal, order_index);
         let observation_frontier: Vec<EventId> = criteria
@@ -197,17 +204,51 @@ pub fn finalize(
                 review_history,
                 review_frontier,
                 review_conflict,
+                supersedes: supersedes_on_feature(fold, event),
+                replies: body.replies.clone(),
+                sent_back: latest_send_back(fold, delivery_id, order_index),
             },
         );
     }
     states
 }
 
+/// The delivery this one replaces, when it exists on the same feature.
+fn supersedes_on_feature(fold: &EvidenceFold, event: &Event) -> Option<EventId> {
+    let previous = event.refs.supersedes.as_ref()?;
+    let target = fold.deliveries.get(previous)?;
+    (target.refs.node.is_some() && target.refs.node == event.refs.node).then(|| previous.clone())
+}
+
+/// The delivery's latest send-back by order, whatever happened after it.
+fn latest_send_back(
+    fold: &EvidenceFold,
+    delivery_id: &EventId,
+    order_index: &BTreeMap<EventId, usize>,
+) -> Option<SentBackNote> {
+    fold.reviews
+        .values()
+        .filter(|event| event.refs.delivery.as_ref() == Some(delivery_id))
+        .filter_map(|event| match &event.payload {
+            EventPayload::ReviewResult(body) if body.verdict == ReviewVerdict::SendBack => {
+                Some((event, body))
+            }
+            _ => None,
+        })
+        .max_by_key(|(event, _)| (order_of(order_index, &event.id), event.id.clone()))
+        .map(|(event, body)| SentBackNote {
+            review: event.id.clone(),
+            at: event.ts,
+            reason: body.reason.clone(),
+            comments: body.comments.clone(),
+        })
+}
+
 fn project_criteria(
     fold: &EvidenceFold,
     delivery_id: &EventId,
     body: &Delivery,
-    receipt: &Receipt,
+    receipt: Option<&Receipt>,
     causal: &CausalView<'_>,
     order_index: &BTreeMap<EventId, usize>,
 ) -> Vec<ProjectedCriterion> {
@@ -215,9 +256,12 @@ fn project_criteria(
         .iter()
         .map(|result| {
             let criterion = receipt
-                .done_when
-                .iter()
-                .find(|criterion| criterion.id == result.criterion)
+                .and_then(|receipt| {
+                    receipt
+                        .done_when
+                        .iter()
+                        .find(|criterion| criterion.id == result.criterion)
+                })
                 .cloned()
                 .unwrap_or_else(|| Criterion {
                     id: result.criterion.clone(),
@@ -289,7 +333,7 @@ fn project_reviews(
     fold: &EvidenceFold,
     delivery_id: &EventId,
     delivery: &Event,
-    receipt: &Receipt,
+    receipt: Option<&Receipt>,
     decisions: &BTreeMap<EventId, DecisionState>,
     observation_frontier: &[EventId],
     causal: &CausalView<'_>,
@@ -327,13 +371,16 @@ fn project_reviews(
     let eligible: Vec<&Review<'_>> = history
         .iter()
         .filter(|review| {
+            // A delivery bound to a receipt is reviewed only while that
+            // receipt is current; one without a receipt has nothing to go stale.
+            let receipt_current = match delivery.refs.receipt.as_ref() {
+                Some(bound) => {
+                    current_receipt.as_ref() == Some(bound) && review.causes.contains(bound)
+                }
+                None => true,
+            };
             !superseded
-                && current_receipt.as_ref() == delivery.refs.receipt.as_ref()
-                && delivery
-                    .refs
-                    .receipt
-                    .as_ref()
-                    .is_some_and(|receipt| review.causes.contains(receipt))
+                && receipt_current
                 && observation_frontier
                     .iter()
                     .all(|observation| causal.before(observation, &review.event.id))
@@ -379,32 +426,11 @@ pub fn blob_referenced(
         if &event.project != project {
             return false;
         }
-        match &event.payload {
-            EventPayload::Delivery(body) => {
-                body.demos
-                    .iter()
-                    .any(|demo| demo_blobs(demo).iter().any(|item| item == blob))
-                    || body
-                        .criteria
-                        .iter()
-                        .any(|criterion| criterion.evidence.as_ref() == Some(blob))
-            }
-            EventPayload::EvidenceObserved(body) => &body.output == blob,
-            EventPayload::WorkProgress(body) => body
-                .evidence
-                .iter()
-                .any(|criterion| criterion.evidence.as_ref() == Some(blob)),
-            EventPayload::DecisionAsk(body) => {
-                body.card
-                    .options
-                    .iter()
-                    .any(|option| option.image.as_ref() == Some(blob))
-                    || (include_reports && body.card.report.as_ref() == Some(blob))
-            }
-            EventPayload::ProjectDeclared(body) => body.icon.as_ref() == Some(blob),
-            EventPayload::ReportPublished(body) => include_reports && &body.report == blob,
-            _ => false,
-        }
+        let mut found = false;
+        crate::reduce::usage::visit_event_blobs(event, &mut |usage, item| {
+            found |= item == blob && (include_reports || !usage.is_report());
+        });
+        found
     })
 }
 
@@ -415,16 +441,6 @@ pub fn project_icon_referenced(events: &[Event], project: &ProjectSlug, blob: &B
         &event.project == project
             && matches!(&event.payload, EventPayload::ProjectDeclared(body) if body.icon.as_ref() == Some(blob))
     })
-}
-
-fn demo_blobs(demo: &crate::model::Demo) -> Vec<BlobRef> {
-    use crate::model::Demo;
-    match demo {
-        Demo::Screenshot(value) => vec![value.blob.clone()],
-        Demo::CliTranscript(value) => vec![value.blob.clone()],
-        Demo::PreviewUrl(_) => Vec::new(),
-        Demo::Recording(value) => vec![value.blob.clone(), value.poster.clone()],
-    }
 }
 
 /// Nodes whose active delivery still needs a human review before downstream work

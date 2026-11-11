@@ -15,6 +15,7 @@
     "allow-resolve-rescue",
     "allow-update-project",
     "allow-update-feature",
+    "allow-drop-steps",
     "allow-set-policy",
     "allow-set-rule",
     "allow-read-report",
@@ -26,6 +27,7 @@
     "allow-configure-vault",
     "allow-get-setup-locations",
     "allow-get-local-config",
+    "allow-get-storage-usage",
     "allow-test-notice",
     "allow-open-report",
     "allow-get-bindings",
@@ -38,6 +40,8 @@
     "allow-open-preview",
     "allow-window-chrome",
     "allow-set-glass-regions",
+    "allow-check-updates",
+    "allow-open-release",
     "core:window:allow-start-dragging"
   ]
 }

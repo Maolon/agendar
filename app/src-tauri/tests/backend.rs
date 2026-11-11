@@ -60,11 +60,15 @@ struct FakeUi {
     shown_main: AtomicUsize,
     hidden: AtomicUsize,
     focus: Mutex<Vec<Value>>,
+    settings: Mutex<Vec<String>>,
     changed: Mutex<Vec<Value>>,
     unblock: Mutex<Vec<Value>>,
     started: AtomicUsize,
     attention: Mutex<Vec<usize>>,
     working: Mutex<Vec<usize>>,
+    projects: Mutex<Vec<usize>>,
+    updates: Mutex<Vec<Value>>,
+    uploads: Mutex<Vec<Value>>,
 }
 
 impl Ui for FakeUi {
@@ -80,6 +84,10 @@ impl Ui for FakeUi {
         self.focus.lock().expect("focus").push(focus.clone());
     }
 
+    fn open_settings(&self, tab: &str) {
+        self.settings.lock().expect("settings").push(tab.to_owned());
+    }
+
     fn emit_changed(&self, event: &Value) {
         self.changed.lock().expect("changed").push(event.clone());
     }
@@ -90,13 +98,22 @@ impl Ui for FakeUi {
 
     fn emit_health(&self, _event: &Value) {}
 
+    fn emit_update(&self, event: &Value) {
+        self.updates.lock().expect("updates").push(event.clone());
+    }
+
+    fn emit_upload(&self, event: &Value) {
+        self.uploads.lock().expect("uploads").push(event.clone());
+    }
+
     fn start_notifications(&self) {
         self.started.fetch_add(1, Ordering::SeqCst);
     }
 
-    fn attention(&self, needs: usize, working: usize) {
+    fn attention(&self, needs: usize, working: usize, projects: usize) {
         self.attention.lock().expect("attention").push(needs);
         self.working.lock().expect("working").push(working);
+        self.projects.lock().expect("projects").push(projects);
     }
 }
 
@@ -428,6 +445,20 @@ fn an_unconfigured_host_reports_the_setup_revision_tokens() {
 }
 
 #[test]
+fn the_tray_update_button_opens_settings_about_in_the_main_window() {
+    let root = tempfile::tempdir().expect("root");
+    let ui = Arc::new(FakeUi::default());
+    let sink = FakeSink::available();
+    let host = Host::new(root.path(), ManualClock::new(), ui.clone(), sink).expect("host");
+    host.show_about();
+    assert_eq!(
+        *ui.settings.lock().expect("settings"),
+        vec!["about".to_owned()]
+    );
+    assert!(ui.focus.lock().expect("focus").is_empty());
+}
+
+#[test]
 fn commands_read_and_answer_a_real_temp_vault() {
     let fixture = scratch(vec![(
         "core/wake",
@@ -454,6 +485,7 @@ fn commands_read_and_answer_a_real_temp_vault() {
     assert_eq!(answered["receipt"]["chose"]["label"], label);
     assert_eq!(answered["awaiting_ack"], true);
     assert_eq!(fixture.answer_count(&host), 1);
+    assert!(host.publish_pending(), "the publisher converges the write");
     assert!(!ui.changed.lock().expect("changed").is_empty());
 
     let after = fixture.snapshot(&host);
@@ -687,6 +719,8 @@ fn synthetic_need(ask: &EventId, kind: NeedsKind, stalled: u32) -> NeedsYouItem 
         reason_msg: None,
         question_msg: None,
         unblocks: Vec::new(),
+        closed_step: None,
+        snoozed_until: None,
     }
 }
 
@@ -984,6 +1018,7 @@ fn the_menu_bar_glyph_ignores_snoozed_items() {
         "until": "2026-01-01T01:00:00.000Z",
     }))
     .expect("snooze");
+    assert!(host.publish_pending(), "the publisher converges the write");
     assert_eq!(
         ui.attention.lock().expect("attention").last(),
         Some(&(waiting - 1)),
@@ -995,14 +1030,24 @@ fn the_menu_bar_glyph_ignores_snoozed_items() {
         "until": "2026-01-01T00:00:00.000Z",
     }))
     .expect("restore");
+    assert!(host.publish_pending(), "the publisher converges the write");
     assert_eq!(
         ui.attention.lock().expect("attention").last(),
         Some(&waiting)
     );
 }
 
+fn need_in<'a>(snapshot: &'a Value, item: &str) -> &'a Value {
+    snapshot["needs"]
+        .as_array()
+        .expect("needs")
+        .iter()
+        .find(|need| need["id"] == item)
+        .expect("the item is still listed")
+}
+
 #[test]
-fn snooze_need_patches_one_entry_and_only_for_a_waiting_item() {
+fn snooze_need_writes_the_owners_event_and_only_for_a_waiting_item() {
     let fixture = scratch(vec![(
         "core/wake",
         card("easy", "med", false, "Wake is blocked."),
@@ -1014,17 +1059,49 @@ fn snooze_need_patches_one_entry_and_only_for_a_waiting_item() {
         .as_str()
         .expect("need")
         .to_owned();
+    assert!(need_in(&snapshot, &item).get("snoozed_until").is_none());
+    assert!(
+        snapshot["preferences"].get("snoozed").is_none(),
+        "snoozes are not preferences any more"
+    );
+    let request = json!({
+        "request_id": ulid::Ulid::generate().to_string(),
+        "item_id": item,
+        "until": "2026-01-01T01:00:00.000Z",
+    });
     let snoozed = host
-        .snooze_need(&json!({
-            "request_id": ulid::Ulid::generate().to_string(),
-            "item_id": item,
-            "until": "2026-01-01T01:00:00.000Z",
-        }))
+        .snooze_need(&request)
         .expect("no preferences revision is needed");
+    let event = snoozed["event_id"].as_str().expect("event id").to_owned();
+    // The event is in the Vault, written by this computer's operator.
+    let lines: Vec<String> = host
+        .event_lines()
+        .into_iter()
+        .filter(|line| line.contains("\"kind\":\"need.snoozed\""))
+        .collect();
+    assert_eq!(lines.len(), 1);
+    let line: Value = serde_json::from_str(&lines[0]).expect("json");
+    assert_eq!(line["id"], json!(event));
+    assert_eq!(line["body"]["need"], json!(item));
+    assert_eq!(line["body"]["until"], "2026-01-01T01:00:00.000Z");
+    assert_eq!(line["body"]["revision"], snapshot["needs"][0]["revision"]);
+    assert!(
+        line["writer"]
+            .as_str()
+            .expect("writer")
+            .ends_with("/operator")
+    );
+    // The state carries it on the row, in the list and in its project.
+    let after = fixture.snapshot(&host);
     assert_eq!(
-        snoozed["preferences"]["snoozed"][&item],
+        need_in(&after, &item)["snoozed_until"],
         "2026-01-01T01:00:00.000Z"
     );
+    let in_project = &after["state"]["projects"][fixture.project.as_str()]["needs_you"];
+    assert_eq!(in_project[0]["snoozed_until"], "2026-01-01T01:00:00.000Z");
+    assert!(after["preferences"].get("snoozed").is_none());
+    // The same request again is the same answer, and nothing is written.
+    assert_eq!(host.snooze_need(&request).expect("replay"), snoozed);
     let unknown = host
         .snooze_need(&json!({
             "request_id": ulid::Ulid::generate().to_string(),
@@ -1033,14 +1110,136 @@ fn snooze_need_patches_one_entry_and_only_for_a_waiting_item() {
         }))
         .expect_err("only an item waiting now can be snoozed");
     assert_eq!(unknown.code, "E_NOT_FOUND");
-    let restored = host
+    let too_long = host
         .snooze_need(&json!({
             "request_id": ulid::Ulid::generate().to_string(),
             "item_id": item,
-            "until": "2026-01-01T00:00:00.000Z",
+            "until": "2026-01-09T00:00:00.000Z",
         }))
-        .expect("restore");
-    assert!(restored["preferences"]["snoozed"].get(&item).is_none());
+        .expect_err("over seven days");
+    assert_eq!(too_long.code, "E_VALIDATION");
+    let count = |host: &Host| {
+        host.event_lines()
+            .iter()
+            .filter(|line| line.contains("\"kind\":\"need.snoozed\""))
+            .count()
+    };
+    assert_eq!(count(&host), 1, "a refusal and a replay write nothing");
+    host.snooze_need(&json!({
+        "request_id": ulid::Ulid::generate().to_string(),
+        "item_id": item,
+        "until": "2026-01-01T00:00:00.000Z",
+    }))
+    .expect("restore");
+    assert_eq!(count(&host), 2);
+    let restored = fixture.snapshot(&host);
+    assert!(need_in(&restored, &item).get("snoozed_until").is_none());
+}
+
+#[test]
+fn an_item_with_a_default_is_snoozed_until_fifteen_minutes_before_it() {
+    let mut with_default = card("easy", "med", false, "Wake is blocked.");
+    with_default.on_timeout = agendar_core::model::OnTimeout::ProceedAsAssumption {
+        after_s: agendar_core::model::Seconds::new(7_200).expect("seconds"),
+    };
+    let fixture = scratch(vec![
+        ("core/wake", with_default, true),
+        (
+            "core/hold",
+            card("easy", "med", false, "Hold is blocked."),
+            true,
+        ),
+    ]);
+    // The question was asked just now by the real clock.
+    let clock = ManualClock::new();
+    let real = agendar_core::vault::Clock::now(&agendar_core::vault::SystemClock);
+    clock.advance((real.millis() - clock.now().millis()) / 1_000);
+    let now = clock.now();
+    let (host, _ui, _sink) = fixture.host(clock);
+    let snapshot = fixture.snapshot(&host);
+    let item = format!("decide:{}", fixture.asks[0].0.as_str());
+    let plain = format!("decide:{}", fixture.asks[1].0.as_str());
+    let default_at = UtcTime::parse(
+        fixture.decision(&snapshot, &fixture.asks[0].0)["default_at"]
+            .as_str()
+            .expect("default_at"),
+    )
+    .expect("time");
+    let limit = default_at.add_seconds(-agendar_core::reduce::snooze::BEFORE_DEFAULT_S);
+    // The row says how long a snooze may hide it; a row with no default does not.
+    assert_eq!(need_in(&snapshot, &item)["snooze_limit"], json!(limit));
+    assert!(need_in(&snapshot, &plain).get("snooze_limit").is_none());
+
+    let snoozed = host
+        .snooze_need(&json!({
+            "request_id": ulid::Ulid::generate().to_string(),
+            "item_id": item,
+            "until": now.add_seconds(86_400),
+        }))
+        .expect("snooze");
+    assert_eq!(snoozed["snoozed_until"], json!(limit));
+    let after = fixture.snapshot(&host);
+    assert_eq!(need_in(&after, &item)["snoozed_until"], json!(limit));
+    let lines: Vec<Value> = host
+        .event_lines()
+        .iter()
+        .filter(|line| line.contains("\"kind\":\"need.snoozed\""))
+        .map(|line| serde_json::from_str(line).expect("json"))
+        .collect();
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["body"]["until"], json!(limit));
+}
+
+#[test]
+fn a_snooze_from_another_host_hides_the_item_and_silences_its_notice() {
+    let fixture = scratch(vec![(
+        "core/wake",
+        card("easy", "med", false, "Wake is blocked."),
+        true,
+    )]);
+    // The owner snoozes at another device before this one looks: the event
+    // arrives through the Vault, and nothing here is local.
+    let item = {
+        let mobile_data = fixture.data.with_file_name("mobile-data");
+        let now = UtcTime::parse("2026-01-01T00:00:00.000Z").expect("now");
+        agendar_core::runtime::HostIdentity::load_or_create(&mobile_data, now).expect("identity");
+        let mobile =
+            Service::open(&fixture.vault, &mobile_data).expect("the mobile client opens the Vault");
+        let fresh = mobile.refresh(now, false).expect("refresh");
+        let item = fresh.state.projects[&fixture.project].needs_you[0]
+            .id
+            .clone();
+        mobile
+            .snooze_need(&fresh, &item, now.add_seconds(3_600))
+            .expect("the mobile client snoozes");
+        item
+    };
+    let clock = ManualClock::new();
+    let (host, ui, sink) = fixture.host(clock.clone());
+    let snapshot = fixture.snapshot(&host);
+    assert_eq!(
+        need_in(&snapshot, &item)["snoozed_until"],
+        "2026-01-01T01:00:00.000Z"
+    );
+    let waiting = snapshot["needs"].as_array().expect("needs").len();
+    assert_eq!(
+        ui.attention.lock().expect("attention").last(),
+        Some(&(waiting - 1)),
+        "the glyph does not count it"
+    );
+    fixture.enable_notifications(&host, &snapshot);
+    fixture.snapshot(&host);
+    assert!(sink.shown().is_empty(), "a snoozed item is not announced");
+
+    // When its time has passed it counts and is announced again.
+    clock.advance(3_600);
+    let later = fixture.snapshot(&host);
+    assert!(need_in(&later, &item).get("snoozed_until").is_none());
+    assert_eq!(
+        ui.attention.lock().expect("attention").last(),
+        Some(&waiting)
+    );
+    assert_eq!(sink.shown().len(), 1);
 }
 
 #[test]
@@ -1069,52 +1268,58 @@ fn settings_sees_which_agent_kinds_reported_from_this_computer() {
 }
 
 #[test]
-fn a_snooze_is_stored_locally_and_a_restore_removes_it() {
+fn a_snooze_an_earlier_build_stored_locally_is_ignored_and_the_file_still_loads() {
     let fixture = scratch(vec![(
         "core/wake",
         card("easy", "med", false, "Wake is blocked."),
         true,
     )]);
-    let (host, _ui, _sink) = fixture.host(ManualClock::new());
+    let item = {
+        let (host, _ui, _sink) = fixture.host(ManualClock::new());
+        let snapshot = fixture.snapshot(&host);
+        // Any preferences write puts the file on disk.
+        fixture.enable_notifications(&host, &snapshot);
+        snapshot["needs"][0]["id"]
+            .as_str()
+            .expect("need")
+            .to_owned()
+    };
+    // The file as an earlier build left it: one local snooze still running.
+    let path = fixture.data.join("preferences.json");
+    let mut file: Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("preferences file"))
+            .expect("json");
+    assert_eq!(file["snoozed"], json!({}), "the key is still written");
+    file["snoozed"] = json!({item.clone(): "2026-01-01T06:00:00.000Z"});
+    std::fs::write(&path, serde_json::to_string(&file).expect("json")).expect("write");
+
+    let (host, ui, _sink) = fixture.host(ManualClock::new());
     let snapshot = fixture.snapshot(&host);
-    let item = snapshot["needs"][0]["id"]
-        .as_str()
-        .expect("need")
-        .to_owned();
-    let revision = snapshot["preferences"]["revision"]
-        .as_str()
-        .expect("revision")
-        .to_owned();
-    let snoozed = host
-        .set_preferences(&json!({
-            "request_id": ulid::Ulid::generate().to_string(),
-            "expected_revision": revision,
-            "snooze": {"item_id": item, "until": "2026-01-01T01:00:00.000Z"},
-        }))
-        .expect("snooze");
+    assert!(need_in(&snapshot, &item).get("snoozed_until").is_none());
+    assert!(snapshot["preferences"].get("snoozed").is_none());
     assert_eq!(
-        snoozed["preferences"]["snoozed"][&item],
-        "2026-01-01T01:00:00.000Z"
+        ui.attention.lock().expect("attention").last(),
+        Some(&snapshot["needs"].as_array().expect("needs").len()),
+        "the item counts: the local snooze lapsed"
     );
-    let restored = host
+    // `set_preferences` no longer takes a snooze, and the next write drops
+    // the old entry from the file.
+    let written = host
         .set_preferences(&json!({
             "request_id": ulid::Ulid::generate().to_string(),
-            "expected_revision": snoozed["preferences"]["revision"],
-            "snooze": {"item_id": item, "until": "2026-01-01T00:00:00.000Z"},
+            "expected_revision": snapshot["preferences"]["revision"],
+            "snooze": {"item_id": item, "until": "2026-01-01T01:00:00.000Z"},
+            "motion": false,
         }))
-        .expect("restore");
-    assert!(
-        restored["preferences"]["snoozed"].get(&item).is_none(),
-        "a time already passed ends the snooze and is dropped"
-    );
-    let too_long = host
-        .set_preferences(&json!({
-            "request_id": ulid::Ulid::generate().to_string(),
-            "expected_revision": restored["preferences"]["revision"],
-            "snooze": {"item_id": item, "until": "2026-01-09T00:00:00.000Z"},
-        }))
-        .expect_err("over seven days");
-    assert_eq!(too_long.code, "E_VALIDATION");
+        .expect("preferences");
+    assert!(written["preferences"].get("snoozed").is_none());
+    let after = fixture.snapshot(&host);
+    assert!(need_in(&after, &item).get("snoozed_until").is_none());
+    let file: Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("preferences file"))
+            .expect("json");
+    assert_eq!(file["snoozed"], json!({}));
+    assert_eq!(file["motion"], false);
 }
 
 #[test]
@@ -1620,6 +1825,7 @@ fn deliver_body(name: &str, evidence: Option<BlobRef>, demo: Option<BlobRef>) ->
             not_proven_yet: vec!["Independent check".to_owned()],
             faked_for_now: Vec::new(),
         },
+        replies: Vec::new(),
     }
 }
 
@@ -1647,7 +1853,7 @@ fn review_delivery_guards_the_rendered_revision_and_saves_a_rule_once() {
             &board.session,
             &board.node,
             &board.attempt,
-            &board.receipt,
+            Some(&board.receipt),
             None,
             body,
             None,
@@ -1742,7 +1948,473 @@ fn review_delivery_guards_the_rendered_revision_and_saves_a_rule_once() {
     let rules = project_value["rules"].as_array().expect("rules");
     assert_eq!(rules.len(), 1);
     assert_eq!(rules[0]["value"]["rule_id"], "check-bytes");
+    assert!(host.publish_pending(), "the publisher converges the write");
     assert!(!ui.changed.lock().expect("changed").is_empty());
+}
+
+#[test]
+fn review_delivery_accepts_and_sends_back_a_delivery_without_a_receipt() {
+    let fixture = scratch(vec![(
+        "core/wake",
+        card("easy", "med", false, "Wake is blocked."),
+        true,
+    )]);
+    let board = delivery_board(&fixture);
+    let body = Delivery {
+        criteria: Vec::new(),
+        ..deliver_body("Wake shipped", None, None)
+    };
+    let delivered = board
+        .service
+        .deliver(
+            &fixture.project,
+            &board.session,
+            &board.node,
+            &board.attempt,
+            None,
+            None,
+            body,
+            None,
+        )
+        .expect("deliver");
+    let delivery_id =
+        EventId::parse(delivered["event_id"].as_str().expect("delivery")).expect("id");
+    drop(board.service);
+
+    let (host, _ui, _sink) = fixture.host(ManualClock::new());
+    let project = host
+        .get_project(&json!({"project": "demo"}))
+        .expect("project");
+    let delivery = delivery_value(&project, &delivery_id);
+    assert!(delivery.get("receipt").is_none(), "{delivery}");
+    assert_eq!(delivery["review"].as_str(), Some("pending"));
+    let revision = delivery["revision"].as_str().expect("revision").to_owned();
+    host.review_delivery(&json!({
+        "request_id": ulid::Ulid::generate().to_string(),
+        "delivery_id": delivery_id,
+        "expected_delivery_revision": revision,
+        "verdict": "accept",
+    }))
+    .expect("accept");
+    let project = host
+        .get_project(&json!({"project": "demo"}))
+        .expect("project");
+    assert_eq!(
+        delivery_value(&project, &delivery_id)["review"].as_str(),
+        Some("accepted")
+    );
+    let revision = delivery_value(&project, &delivery_id)["revision"]
+        .as_str()
+        .expect("revision")
+        .to_owned();
+    let missing_demo = host.review_delivery(&json!({
+        "request_id": ulid::Ulid::generate().to_string(),
+        "delivery_id": delivery_id,
+        "expected_delivery_revision": revision,
+        "verdict": "send_back",
+        "reason": "Show the Windows run",
+        "comments": [{"anchor": {"kind": "transcript_line", "demo": 1, "line": 1}, "text": "x"}],
+    }))
+    .expect_err("no second demo");
+    assert_eq!(
+        missing_demo.field.as_deref(),
+        Some("/comments/0/anchor/demo")
+    );
+    host.review_delivery(&json!({
+        "request_id": ulid::Ulid::generate().to_string(),
+        "delivery_id": delivery_id,
+        "expected_delivery_revision": revision,
+        "verdict": "send_back",
+        "reason": "Show the Windows run",
+    }))
+    .expect("send back");
+    let project = host
+        .get_project(&json!({"project": "demo"}))
+        .expect("project");
+    assert_eq!(
+        delivery_value(&project, &delivery_id)["review"].as_str(),
+        Some("sent_back")
+    );
+}
+
+#[test]
+fn review_delivery_checks_anchored_comments_against_the_demos_and_quotes_the_blob() {
+    let fixture = scratch(vec![(
+        "core/wake",
+        card("easy", "med", false, "Wake is blocked."),
+        true,
+    )]);
+    let board = delivery_board(&fixture);
+    let excerpt = b"diff --git a/src/wake.rs b/src/wake.rs\n--- a/src/wake.rs\n+++ b/src/wake.rs\n@@ -838,2 +838,2 @@ fn wake()\n     let a = 1;\n-    let b = 2;\n+    let b = 3;\n";
+    let body = Delivery {
+        demos: vec![
+            Demo::Diff(agendar_core::model::DiffDemo {
+                blob: publish(&fixture, BlobExt::Txt, excerpt),
+                commit: "a".repeat(40),
+                files_total: 1,
+                hunks_total: 1,
+                added_total: 1,
+                removed_total: 1,
+                shown: vec![agendar_core::model::DiffShown {
+                    path: "src/wake.rs".to_owned(),
+                    hunk: 1,
+                    why: "The wake value".to_owned(),
+                }],
+                omitted: Vec::new(),
+            }),
+            Demo::CliTranscript(CliTranscriptDemo {
+                blob: publish(&fixture, BlobExt::Txt, b"$ wake\n\x1b[32mwoke\x1b[0m\n"),
+                check: None,
+            }),
+            Demo::Screenshot(ScreenshotDemo {
+                blob: publish(&fixture, BlobExt::Png, b"\x89PNG\r\n\x1a\nfake image bytes"),
+                alt: "Wake screenshot".to_owned(),
+                check: None,
+            }),
+        ],
+        ..deliver_body("Wake shipped", None, None)
+    };
+    let delivered = board
+        .service
+        .deliver(
+            &fixture.project,
+            &board.session,
+            &board.node,
+            &board.attempt,
+            Some(&board.receipt),
+            None,
+            body,
+            None,
+        )
+        .expect("deliver");
+    let delivery_id =
+        EventId::parse(delivered["event_id"].as_str().expect("delivery")).expect("id");
+    drop(board.service);
+
+    let (host, _ui, _sink) = fixture.host(ManualClock::new());
+    let project = host
+        .get_project(&json!({"project": "demo"}))
+        .expect("project");
+    let revision = delivery_value(&project, &delivery_id)["revision"]
+        .as_str()
+        .expect("revision")
+        .to_owned();
+    let before = host.event_lines().len();
+    let review = |comments: Value| {
+        host.review_delivery(&json!({
+            "request_id": ulid::Ulid::generate().to_string(),
+            "delivery_id": delivery_id,
+            "expected_delivery_revision": revision,
+            "verdict": "send_back",
+            "comments": comments,
+        }))
+    };
+    let diff = |side: &str, line: u32| json!({"anchor": {"kind": "diff_line", "demo": 0, "file": "src/wake.rs", "side": side, "line": line, "quote": "forged"}, "text": "Why 3?"});
+    let rejected = |comments: Value, field: &str| {
+        let error = review(comments).expect_err("rejected comment");
+        assert_eq!(error.code, "E_VALIDATION", "{error:?}");
+        assert_eq!(error.field.as_deref(), Some(field), "{error:?}");
+    };
+    // Wrong kind for the demo, a missing demo, lines not in the excerpt.
+    rejected(
+        json!([{"anchor": {"kind": "region", "demo": 0, "x": 0, "y": 0, "w": 10, "h": 10}, "text": "x"}]),
+        "/comments/0/anchor/kind",
+    );
+    rejected(
+        json!([{"anchor": {"kind": "transcript_line", "demo": 2, "line": 1, "quote": ""}, "text": "x"}]),
+        "/comments/0/anchor/kind",
+    );
+    rejected(
+        json!([{"anchor": {"kind": "region", "demo": 1, "x": 0, "y": 0, "w": 10, "h": 10}, "text": "x"}]),
+        "/comments/0/anchor/kind",
+    );
+    let mut other_file = diff("new", 839);
+    other_file["anchor"]["file"] = json!("src/other.rs");
+    rejected(json!([other_file]), "/comments/0/anchor/line");
+    rejected(json!([diff("new", 841)]), "/comments/0/anchor/line");
+    rejected(json!([diff("old", 841)]), "/comments/0/anchor/line");
+    rejected(
+        json!([{"anchor": {"kind": "transcript_line", "demo": 1, "line": 3, "quote": ""}, "text": "x"}]),
+        "/comments/0/anchor/line",
+    );
+    // An accept never carries comments.
+    let accept = host
+        .review_delivery(&json!({
+            "request_id": ulid::Ulid::generate().to_string(),
+            "delivery_id": delivery_id,
+            "expected_delivery_revision": revision,
+            "verdict": "accept",
+            "comments": [diff("new", 839)],
+        }))
+        .expect_err("accept with comments");
+    assert_eq!(accept.field.as_deref(), Some("/comments"));
+    assert_eq!(host.event_lines().len(), before, "nothing was written");
+
+    // All three kinds, no reason: quotes come from the blobs.
+    review(json!([
+        diff("new", 839),
+        diff("old", 839),
+        {"anchor": {"kind": "transcript_line", "demo": 1, "line": 2}, "text": "Say what woke"},
+        {"anchor": {"kind": "region", "demo": 2, "x": 100, "y": 50, "w": 300, "h": 150}, "text": "Clipped"},
+    ]))
+    .expect("send back with comments");
+    let event: Value = host
+        .event_lines()
+        .iter()
+        .map(|line| serde_json::from_str::<Value>(line).expect("json"))
+        .find(|event| event["kind"] == "review.result")
+        .expect("review event");
+    let comments = event["body"]["comments"].as_array().expect("comments");
+    assert_eq!(comments.len(), 4);
+    assert_eq!(comments[0]["anchor"]["quote"], "    let b = 3;");
+    assert_eq!(comments[1]["anchor"]["quote"], "    let b = 2;");
+    assert_eq!(comments[2]["anchor"]["quote"], "woke");
+    assert_eq!(comments[3]["anchor"]["w"], 300);
+    assert!(comments[3]["anchor"].get("quote").is_none());
+    assert!(event["body"].get("reason").is_none());
+}
+
+/// A delivery made for the fixture's answer, with a diff, a transcript and a
+/// screenshot.
+fn wake_delivery(fixture: &Scratch) -> EventId {
+    let board = delivery_board(fixture);
+    let excerpt = b"diff --git a/src/wake.rs b/src/wake.rs\n--- a/src/wake.rs\n+++ b/src/wake.rs\n@@ -838,2 +838,2 @@ fn wake()\n     let a = 1;\n-    let b = 2;\n+    let b = 3;\n";
+    let body = Delivery {
+        demos: vec![
+            Demo::Diff(agendar_core::model::DiffDemo {
+                blob: publish(fixture, BlobExt::Txt, excerpt),
+                commit: "a".repeat(40),
+                files_total: 1,
+                hunks_total: 1,
+                added_total: 1,
+                removed_total: 1,
+                shown: vec![agendar_core::model::DiffShown {
+                    path: "src/wake.rs".to_owned(),
+                    hunk: 1,
+                    why: "The wake value".to_owned(),
+                }],
+                omitted: Vec::new(),
+            }),
+            Demo::CliTranscript(CliTranscriptDemo {
+                blob: publish(fixture, BlobExt::Txt, b"$ wake\n\x1b[32mwoke\x1b[0m\n"),
+                check: None,
+            }),
+            Demo::Screenshot(ScreenshotDemo {
+                blob: publish(fixture, BlobExt::Png, b"\x89PNG\r\n\x1a\nfake image bytes"),
+                alt: "Wake screenshot".to_owned(),
+                check: None,
+            }),
+        ],
+        ..deliver_body("Wake shipped", None, None)
+    };
+    let delivered = board
+        .service
+        .deliver(
+            &fixture.project,
+            &board.session,
+            &board.node,
+            &board.attempt,
+            Some(&board.receipt),
+            None,
+            body,
+            None,
+        )
+        .expect("deliver");
+    EventId::parse(delivered["event_id"].as_str().expect("delivery")).expect("id")
+}
+
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("create dir");
+    for entry in std::fs::read_dir(from).expect("read dir") {
+        let entry = entry.expect("entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy file");
+        }
+    }
+}
+
+/// One `review.result` line with what names its writer and its moment (id,
+/// writer, sequence number, time) replaced by fixed text. Everything else,
+/// the order of the fields included, stays as the host wrote it.
+fn review_line_without_its_writer(lines: &[String]) -> String {
+    let reviews: Vec<&String> = lines
+        .iter()
+        .filter(|line| {
+            serde_json::from_str::<Value>(line).expect("json")["kind"] == "review.result"
+        })
+        .collect();
+    assert_eq!(reviews.len(), 1, "one review: {reviews:?}");
+    let raw = reviews[0];
+    let event: Value = serde_json::from_str(raw).expect("json");
+    let mut line = raw.clone();
+    for (field, token) in [("id", "<id>"), ("writer", "<writer>"), ("ts", "<ts>")] {
+        let value = event[field].as_str().expect("string field");
+        assert_eq!(line.matches(value).count(), 1, "{field} appears once");
+        line = line.replace(value, token);
+    }
+    let seq = format!("\"seq\":{}", event["seq"]);
+    assert_eq!(line.matches(&seq).count(), 1, "seq appears once");
+    line.replace(&seq, "\"seq\":0")
+}
+
+/// The Vault is shared by hosts on different versions, so a mobile client must
+/// write the event the desktop writes. The same delivery (two copies of one
+/// Vault) is reviewed here through this host's command and through the
+/// UniFFI facade, and the two lines are compared byte for byte.
+#[test]
+fn mobile_facade_writes_the_review_event_the_desktop_writes() {
+    use agendar_ffi::{CommentPlace, NewComment, Session, Verdict};
+
+    let diff = |old_side: bool| CommentPlace::DiffLine {
+        demo: 0,
+        file: "src/wake.rs".to_owned(),
+        old_side,
+        line: 839,
+        quote: "not what the file says".to_owned(),
+    };
+    let on = |place: CommentPlace, text: &str| NewComment {
+        place,
+        text: text.to_owned(),
+    };
+    let mobile_comments = || {
+        vec![
+            on(diff(false), "Why 3?"),
+            on(diff(true), "Was 2 wrong?"),
+            on(
+                CommentPlace::TranscriptLine {
+                    demo: 1,
+                    line: 2,
+                    quote: String::new(),
+                },
+                "Say what woke",
+            ),
+            on(
+                CommentPlace::Region {
+                    demo: 2,
+                    x: 100,
+                    y: 50,
+                    w: 300,
+                    h: 150,
+                },
+                "Clipped",
+            ),
+        ]
+    };
+    let desktop_comments = json!([
+        {"anchor": {"kind": "diff_line", "demo": 0, "file": "src/wake.rs", "side": "new", "line": 839, "quote": "forged"}, "text": "Why 3?"},
+        {"anchor": {"kind": "diff_line", "demo": 0, "file": "src/wake.rs", "side": "old", "line": 839}, "text": "Was 2 wrong?"},
+        {"anchor": {"kind": "transcript_line", "demo": 1, "line": 2}, "text": "Say what woke"},
+        {"anchor": {"kind": "region", "demo": 2, "x": 100, "y": 50, "w": 300, "h": 150}, "text": "Clipped"},
+    ]);
+    let cases: Vec<(&str, Value, Verdict)> = vec![
+        ("accept", json!({"verdict": "accept"}), Verdict::Accept),
+        (
+            "reason",
+            json!({"verdict": "send_back", "reason": "  Tighten the wake value.  "}),
+            Verdict::SendBack {
+                reason: Some("  Tighten the wake value.  ".to_owned()),
+                comments: Vec::new(),
+            },
+        ),
+        (
+            "comments",
+            json!({"verdict": "send_back", "comments": desktop_comments}),
+            Verdict::SendBack {
+                reason: None,
+                comments: mobile_comments(),
+            },
+        ),
+        (
+            "reason and comments",
+            json!({"verdict": "send_back", "reason": "Two things.", "comments": desktop_comments}),
+            Verdict::SendBack {
+                reason: Some("Two things.".to_owned()),
+                comments: mobile_comments(),
+            },
+        ),
+    ];
+    for (case, mut request, verdict) in cases {
+        let fixture = scratch(vec![(
+            "core/wake",
+            card("easy", "med", false, "Wake is blocked."),
+            true,
+        )]);
+        let delivery_id = wake_delivery(&fixture);
+        // The mobile client's Vault: the same bytes, before either host reviews.
+        let mobile_vault = fixture._root.path().join("mobile-vault");
+        copy_tree(&fixture.vault, &mobile_vault);
+
+        let (host, _ui, _sink) = fixture.host(ManualClock::new());
+        let project = host
+            .get_project(&json!({"project": "demo"}))
+            .expect("project");
+        let revision = delivery_value(&project, &delivery_id)["revision"]
+            .as_str()
+            .expect("revision")
+            .to_owned();
+        request["request_id"] = json!(ulid::Ulid::generate().to_string());
+        request["delivery_id"] = json!(delivery_id);
+        request["expected_delivery_revision"] = json!(revision);
+        host.review_delivery(&request).expect("the desktop reviews");
+        let desktop = review_line_without_its_writer(&host.event_lines());
+
+        let mobile = Session::open(
+            mobile_vault.display().to_string(),
+            fixture
+                ._root
+                .path()
+                .join("mobile-data")
+                .display()
+                .to_string(),
+        )
+        .expect("open");
+        mobile.refresh(2_000).expect("refresh");
+        let read = mobile
+            .delivery(delivery_id.as_str().to_owned())
+            .expect("delivery");
+        assert_eq!(
+            read.revision, revision,
+            "{case}: one revision on both hosts"
+        );
+        mobile
+            .review(delivery_id.as_str().to_owned(), read.revision, verdict)
+            .expect("the mobile client reviews");
+        let mobile_host = mobile.health().expect("health").host;
+        let written = std::fs::read_to_string(
+            mobile_vault
+                .join("projects/demo")
+                .join(mobile_host)
+                .join("operator.jsonl"),
+        )
+        .expect("the mobile client's operator file");
+        let lines: Vec<String> = written.lines().map(str::to_owned).collect();
+        let mobile = review_line_without_its_writer(&lines);
+
+        assert_eq!(mobile, desktop, "{case}");
+        // Not vacuous: the line still holds the review itself.
+        let event: Value = serde_json::from_str(&desktop).expect("json");
+        assert_eq!(event["refs"]["delivery"], json!(delivery_id), "{case}");
+        assert!(
+            !event["refs"]["causes"]
+                .as_array()
+                .expect("causes")
+                .is_empty()
+        );
+        if case.contains("comments") {
+            assert_eq!(
+                event["body"]["comments"][0]["anchor"]["quote"],
+                "    let b = 3;"
+            );
+            assert_eq!(
+                event["body"]["comments"][1]["anchor"]["quote"],
+                "    let b = 2;"
+            );
+            assert_eq!(event["body"]["comments"][2]["anchor"]["quote"], "woke");
+        }
+    }
 }
 
 #[test]
@@ -1784,7 +2456,7 @@ fn reports_are_source_text_and_media_is_referenced_and_expiring() {
             &board.session,
             &board.node,
             &board.attempt,
-            &board.receipt,
+            Some(&board.receipt),
             None,
             body,
             None,
@@ -1894,6 +2566,118 @@ fn option_images_on_an_open_question_are_served_as_media() {
     assert!(bytes.ends_with(b"option image bytes"));
 }
 
+/// The webview calls the media protocol on the GUI thread, so a request must
+/// return to its caller at once: the Vault read happens on a worker, even
+/// while a command holds the Host.
+#[test]
+fn a_media_request_returns_to_its_caller_before_the_vault_is_read() {
+    let fixture = scratch(vec![(
+        "core/wake",
+        card("easy", "med", false, "Wake is blocked."),
+        true,
+    )]);
+    let image = publish(
+        &fixture,
+        BlobExt::Png,
+        b"\x89PNG\r\n\x1a\noption image bytes",
+    );
+    let service = fixture.service();
+    let fresh = service
+        .refresh(
+            UtcTime::parse("2026-01-01T00:10:00.000Z").expect("time"),
+            false,
+        )
+        .expect("refresh");
+    let session = fresh.state.projects[&fixture.project]
+        .sessions
+        .keys()
+        .next()
+        .cloned()
+        .expect("session");
+    let mut pictured = card("easy", "med", false, "Pick the look.");
+    pictured.options[1].image = Some(image.clone());
+    service
+        .ask(
+            &fixture.project,
+            &session,
+            &NodePath::parse("core/wake").expect("node"),
+            pictured,
+            agendar_core::model::Mode::Ask,
+            None,
+        )
+        .expect("ask with an option image");
+    drop(service);
+
+    let (host, _ui, _sink) = fixture.host(ManualClock::new());
+    let media = host
+        .read_report(&json!({"project": "demo", "blob": image}))
+        .expect("option image");
+    let token = media["media_token"].as_str().expect("token").to_owned();
+
+    // A command that keeps the Host until the test lets it go: the hook runs
+    // right after its append, inside the command.
+    let (entered, has_entered) = std::sync::mpsc::channel::<()>();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let released = Mutex::new(released);
+    host.set_after_append(Some(Arc::new(move || {
+        let _ = entered.send(());
+        let _ = released.lock().expect("release").recv();
+    })));
+    let project = ProjectSlug::parse("demo").expect("project");
+    let absent = agendar_core::model::rule_revision(
+        &project,
+        &agendar_core::model::RuleId::parse("no-shell").expect("rule"),
+        None,
+    );
+    let writer = {
+        let host = Arc::clone(&host);
+        std::thread::spawn(move || {
+            host.set_rule(&json!({
+                "request_id": ulid::Ulid::generate().to_string(),
+                "project": "demo",
+                "expected_revision": absent,
+                "rule": {"rule_id": "no-shell", "text": "Use explicit argv.", "enabled": true},
+            }))
+            .expect("create rule");
+        })
+    };
+    let wait = std::time::Duration::from_secs(20);
+    has_entered
+        .recv_timeout(wait)
+        .expect("the command holds the Host");
+
+    let (reply, replied) = std::sync::mpsc::channel();
+    let (back, is_back) = std::sync::mpsc::channel::<()>();
+    let request = tauri::http::Request::builder()
+        .uri(format!("agendar-media://localhost/{token}"))
+        .body(Vec::new())
+        .expect("request");
+    let caller = {
+        let host = Arc::clone(&host);
+        std::thread::spawn(move || {
+            agendar_app::media::serve(host, request, move |response| {
+                let _ = reply.send(response);
+            });
+            let _ = back.send(());
+        })
+    };
+    is_back
+        .recv_timeout(wait)
+        .expect("the request returned to its caller while the Host was held");
+    assert!(
+        replied.try_recv().is_err(),
+        "the bytes wait for the Host; the caller does not"
+    );
+
+    release.send(()).expect("release the command");
+    writer.join().expect("writer");
+    caller.join().expect("caller");
+    let response = replied.recv_timeout(wait).expect("media response");
+    assert_eq!(response.status(), tauri::http::StatusCode::OK);
+    assert_eq!(response.headers()["Content-Type"], "image/png");
+    assert!(response.body().ends_with(b"option image bytes"));
+}
+
 #[test]
 fn an_approved_check_publishes_a_seen_observation() {
     let fixture = scratch(vec![(
@@ -1919,7 +2703,7 @@ fn an_approved_check_publishes_a_seen_observation() {
             &board.session,
             &board.node,
             &board.attempt,
-            &board.receipt,
+            Some(&board.receipt),
             None,
             body,
             None,
@@ -2126,7 +2910,7 @@ fn a_cli_proposed_check_is_projected_and_runs_only_after_approval() {
             &board.session,
             &board.node,
             &board.attempt,
-            &board.receipt,
+            Some(&board.receipt),
             None,
             body,
             None,
@@ -2432,6 +3216,61 @@ fn agenda_and_policy_commands_guard_their_revisions() {
     }
 }
 
+#[test]
+fn the_owner_drops_steps_and_the_project_says_who_dropped_them() {
+    let fixture = scratch(vec![(
+        "core/wake",
+        card("easy", "med", false, "Wake is blocked."),
+        false,
+    )]);
+    let (host, _ui, _sink) = fixture.host(ManualClock::new());
+
+    let unknown = host
+        .drop_steps(&json!({
+            "request_id": ulid::Ulid::generate().to_string(),
+            "project": "demo",
+            "nodes": ["core/wake", "core/nowhere"],
+        }))
+        .expect_err("one unknown node refuses the list");
+    assert_eq!(unknown.code, "E_NOT_FOUND");
+    let project = host
+        .get_project(&json!({"project": "demo"}))
+        .expect("project");
+    assert_ne!(
+        project["project"]["features"]["core/wake"]["progress"],
+        "dropped"
+    );
+
+    let request = json!({
+        "request_id": ulid::Ulid::generate().to_string(),
+        "project": "demo",
+        "nodes": ["core/wake"],
+        "note": "Not needed any more",
+    });
+    let dropped = host.drop_steps(&request).expect("drop");
+    let ids = dropped["event_ids"].as_array().expect("event ids");
+    assert_eq!(ids.len(), 1);
+    // The same request replays its result; it does not write twice.
+    assert_eq!(host.drop_steps(&request).expect("replay"), dropped);
+    let project = host
+        .get_project(&json!({"project": "demo"}))
+        .expect("project");
+    let feature = &project["project"]["features"]["core/wake"];
+    assert_eq!(feature["progress"], "dropped");
+    assert_eq!(feature["owner_drop"]["event"], ids[0]);
+    assert_eq!(feature["owner_drop"]["note"], "Not needed any more");
+
+    let again = host
+        .drop_steps(&json!({
+            "request_id": ulid::Ulid::generate().to_string(),
+            "project": "demo",
+            "nodes": ["core/wake"],
+        }))
+        .expect_err("already dropped");
+    assert_eq!(again.code, "E_VALIDATION");
+    assert_eq!(again.field.as_deref(), Some("/nodes/0"));
+}
+
 // ---------------------------------------------------------------------------
 // Live pulses, change batches and the unblock transition
 // ---------------------------------------------------------------------------
@@ -2599,6 +3438,12 @@ fn an_unblock_is_emitted_once_for_the_answer_and_once_for_the_ack() {
     let label = prepared["label"].as_str().expect("label").to_owned();
     let answered = fixture.answer(&host, &token, &label).expect("answer");
     let answer_id = answered["event_id"].as_str().expect("event id").to_owned();
+    assert_eq!(
+        answered["released"],
+        json!(["core/wake"]),
+        "the reply carries the released set before any publication"
+    );
+    assert!(host.publish_pending(), "the publisher converges the write");
 
     let unblocks = ui.unblock.lock().expect("unblock").clone();
     assert_eq!(unblocks.len(), 1, "one answered unblock");
@@ -2706,6 +3551,7 @@ fn an_answer_publication_reports_a_foreign_pulse_that_arrived_before_it() {
     );
     clock.advance(1);
     fixture.answer(&host, &token, &label).expect("answer");
+    assert!(host.publish_pending(), "the publisher converges the write");
 
     // The answer's own publication carries it, tagged as synced.
     let published = ui.changed.lock().expect("changed").last().cloned();
@@ -2742,8 +3588,67 @@ fn the_tray_attention_count_follows_needs_you() {
     let token = prepared["token"].as_str().expect("token").to_owned();
     let label = prepared["label"].as_str().expect("label").to_owned();
     fixture.answer(&host, &token, &label).expect("answer");
+    assert!(host.publish_pending(), "the publisher converges the write");
     // Answering clears it, so the tray returns to its idle glyph.
     assert_eq!(ui.attention.lock().expect("attention").last(), Some(&0));
+}
+
+#[test]
+fn the_menu_bar_glyph_is_hollow_without_a_project_on_the_board() {
+    // Before setup there is no Vault, so no project.
+    let root = tempfile::tempdir().expect("root");
+    let ui = Arc::new(FakeUi::default());
+    let host = Host::new(
+        root.path(),
+        ManualClock::new(),
+        ui.clone(),
+        FakeSink::available(),
+    )
+    .expect("host");
+    host.watch_tick("time");
+    assert_eq!(ui.projects.lock().expect("projects").last(), Some(&0));
+
+    let fixture = scratch(vec![]);
+    let (host, ui, _sink) = fixture.host(ManualClock::new());
+    fixture.snapshot(&host);
+    assert_eq!(ui.projects.lock().expect("projects").last(), Some(&1));
+
+    // An archived project leaves the board, and the glyph empties again.
+    let service = fixture.service();
+    let (pid, process_start) =
+        agendar_core::runtime::sessions::process_identity(std::process::id())
+            .map(|start| (std::process::id(), start))
+            .expect("test process identity");
+    let session = register_session(
+        &service,
+        SessionRegistration {
+            project: fixture.project.clone(),
+            harness: Harness::Generic,
+            harness_session_id: "archive-test".to_owned(),
+            pid,
+            process_start,
+            repo_root: fixture.data.clone(),
+        },
+    )
+    .expect("register session");
+    service
+        .declare_project(
+            &fixture.project,
+            &session,
+            agendar_core::model::ProjectDeclared {
+                agent: None,
+                title: None,
+                brief: None,
+                goal: None,
+                glyph: None,
+                archived: Some(true),
+                icon: None,
+            },
+            None,
+        )
+        .expect("archive project");
+    host.watch_tick("sync");
+    assert_eq!(ui.projects.lock().expect("projects").last(), Some(&0));
 }
 
 #[test]
@@ -3372,4 +4277,1041 @@ fn the_language_preference_is_saved_and_validated() {
         }))
         .expect_err("unknown language");
     assert_eq!(refused.code, "E_VALIDATION");
+}
+
+// ---------------------------------------------------------------------------
+// Update detection
+// ---------------------------------------------------------------------------
+
+struct ReleaseFixture {
+    calls: AtomicUsize,
+}
+
+impl agendar_core::update::Fetcher for ReleaseFixture {
+    fn fetch(
+        &self,
+        _url: &str,
+        _etag: Option<&str>,
+    ) -> agendar_core::Result<agendar_core::update::Fetched> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(agendar_core::update::Fetched::Body {
+            bytes: include_bytes!(
+                "../../../crates/agendar-core/tests/fixtures/github-release-latest.json"
+            )
+            .to_vec(),
+            etag: Some("\"e1\"".to_owned()),
+        })
+    }
+}
+
+#[test]
+fn the_snapshot_carries_the_cached_update_status_and_the_switch_stops_requests() {
+    let fixture = scratch(vec![(
+        "core/wake",
+        card("easy", "med", false, "Wake is blocked."),
+        true,
+    )]);
+    let (host, ui, _sink) = fixture.host(ManualClock::new());
+    let before = fixture.snapshot(&host);
+    assert_eq!(before["update"]["enabled"], true);
+    assert_eq!(before["update"]["latest"], Value::Null);
+    assert_eq!(before["update"]["current"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(before["preferences"]["update_check"], true);
+
+    let fetcher = ReleaseFixture {
+        calls: AtomicUsize::new(0),
+    };
+    let checked = host
+        .check_updates_with(&fetcher, agendar_core::update::LATEST_RELEASE_URL)
+        .expect("check");
+    assert_eq!(checked["update"]["latest"], "0.2.0");
+    {
+        // The sidebar learns a check started at once, then its result.
+        let events = ui.updates.lock().expect("updates");
+        assert_eq!(events.len(), 2, "start and finish");
+        assert_eq!(events[0]["v"], 1);
+        assert_eq!(events[0]["phase"], "started");
+        assert_eq!(events[0]["update"]["checking"], true);
+        assert_eq!(events[0]["update"]["latest"], Value::Null);
+        assert_eq!(events[1]["phase"], "finished");
+        assert_eq!(events[1]["update"]["checking"], false);
+        assert_eq!(events[1]["update"]["latest"], "0.2.0");
+    }
+    assert_eq!(
+        checked["update"]["checked_at"], "2026-01-01T00:00:00.000Z",
+        "the host clock stamps the check"
+    );
+    let after = fixture.snapshot(&host);
+    assert_eq!(after["update"]["latest"], "0.2.0");
+    // Tests build the dev channel: never an update prompt.
+    assert_eq!(after["update"]["channel"], "dev");
+    assert_eq!(after["update"]["available"], false);
+    assert!(fixture.data.join("update-check.json").is_file());
+
+    let off = host
+        .set_preferences(&json!({
+            "request_id": ulid::Ulid::generate().to_string(),
+            "expected_revision": after["preferences"]["revision"],
+            "update_check": false,
+        }))
+        .expect("turn off");
+    assert_eq!(off["preferences"]["update_check"], false);
+    assert_ne!(
+        off["preferences"]["revision"], after["preferences"]["revision"],
+        "the switch changes the revision"
+    );
+    let refused = host
+        .check_updates_with(&fetcher, agendar_core::update::LATEST_RELEASE_URL)
+        .expect_err("checks are off");
+    assert_eq!(refused.code, "E_POLICY");
+    host.background_update_check();
+    assert_eq!(
+        fetcher.calls.load(Ordering::SeqCst),
+        1,
+        "no request while off"
+    );
+    assert!(!Preferences::load(&fixture.data).expect("load").update_check);
+    assert_eq!(fixture.snapshot(&host)["update"]["enabled"], false);
+}
+
+// ---------------------------------------------------------------------------
+// Replies never wait for the post-write refresh
+// ---------------------------------------------------------------------------
+
+/// Takes this Vault's ingest lock right after a command's durable append, the
+/// way an `agendar` CLI process or a build could, and keeps it until released.
+struct IngestHolder {
+    path: PathBuf,
+    held: Arc<Mutex<Option<std::fs::File>>>,
+}
+
+impl IngestHolder {
+    fn new(fixture: &Scratch) -> Self {
+        let vault = agendar_core::vault::Vault::open(&fixture.vault).expect("vault");
+        let path = agendar_core::runtime::LocalPaths::new(&fixture.data)
+            .expect("local paths")
+            .ensure_layout(vault.root(), vault.id())
+            .expect("layout")
+            .locks
+            .join("ingest.lock");
+        Self {
+            path,
+            held: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn hold(&self) {
+        let mut slot = self.held.lock().expect("holder");
+        if slot.is_none() {
+            *slot =
+                Some(agendar_core::runtime::acquire_lock(&self.path).expect("take ingest lock"));
+        }
+    }
+
+    /// Arm the host so the lock is taken right after the next append.
+    fn arm(&self, host: &Host) {
+        let path = self.path.clone();
+        let held = Arc::clone(&self.held);
+        host.set_after_append(Some(Arc::new(move || {
+            let mut slot = held.lock().expect("holder");
+            if slot.is_none() {
+                *slot = Some(agendar_core::runtime::acquire_lock(&path).expect("take ingest lock"));
+            }
+        })));
+    }
+
+    fn holding(&self) -> bool {
+        self.held.lock().expect("holder").is_some()
+    }
+
+    fn release(&self) {
+        self.held.lock().expect("holder").take();
+    }
+}
+
+/// `core/wake` (started, answered) with `core/after` downstream of it, and one
+/// pending delivery of `core/wake` against its receipt.
+fn downstream_delivery() -> (Scratch, EventId) {
+    let fixture = scratch(vec![(
+        "core/wake",
+        card("easy", "med", false, "Wake is blocked."),
+        true,
+    )]);
+    let board = delivery_board(&fixture);
+    board
+        .service
+        .declare_feature(
+            &fixture.project,
+            &board.session,
+            NodePath::parse("core/after").expect("node"),
+            agendar_core::model::PlanFeature {
+                agent: None,
+                title: Some("Feature core/after".to_owned()),
+                depends_on: Some(vec![board.node.clone()]),
+                slice: Some("core/after".to_owned()),
+                demo_kind: Some(agendar_core::model::DemoKind::CliTranscript),
+                milestone: None,
+                deadline: None,
+                priority: None,
+                paused: None,
+                handoff: None,
+            },
+            None,
+        )
+        .expect("declare downstream feature");
+    let delivered = board
+        .service
+        .deliver(
+            &fixture.project,
+            &board.session,
+            &board.node,
+            &board.attempt,
+            Some(&board.receipt),
+            None,
+            deliver_body("Wake delivery", None, None),
+            None,
+        )
+        .expect("deliver");
+    // The work is done; only the human review still holds `core/after`.
+    let evidence = publish(&fixture, BlobExt::Txt, b"agent evidence\n");
+    board
+        .service
+        .progress_finished(
+            &fixture.project,
+            &board.session,
+            &board.node,
+            &board.attempt,
+            agendar_core::model::WorkStatus::Done,
+            vec![CriterionResult {
+                criterion: agendar_core::model::CriterionId::parse("continues").expect("criterion"),
+                status: agendar_core::model::CheckResult::Passed,
+                claim: Claim::AgentSays,
+                evidence: Some(evidence),
+                observation: None,
+            }],
+            None,
+            None,
+        )
+        .expect("finish core/wake");
+    let delivery_id =
+        EventId::parse(delivered["event_id"].as_str().expect("delivery")).expect("id");
+    (fixture, delivery_id)
+}
+
+#[test]
+fn a_publisher_waiting_behind_a_successful_tick_does_not_publish_again() {
+    let fixture = scratch(vec![(
+        "core/wake",
+        card("easy", "med", false, "Wake is blocked."),
+        true,
+    )]);
+    let (host, ui, _sink) = fixture.host(ManualClock::new());
+    let snapshot = fixture.snapshot(&host);
+    let (ask, _) = fixture.asks[0].clone();
+    let rev = revision(&snapshot, "demo", &ask);
+    let prepared = fixture.prepare(&host, &ask, "adapters", &rev);
+    fixture
+        .answer(
+            &host,
+            prepared["token"].as_str().expect("token"),
+            prepared["label"].as_str().expect("label"),
+        )
+        .expect("answer leaves a write due");
+    let published_before = ui.changed.lock().expect("changed").len();
+
+    // The watcher owns tick_gate but has not consumed the due flag yet.
+    let (tick_entered_tx, tick_entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let tick_entered_tx = Mutex::new(Some(tick_entered_tx));
+    let release_rx = Mutex::new(Some(release_rx));
+    host.set_before_tick(Some(Arc::new(move || {
+        if let Some(tx) = tick_entered_tx.lock().expect("entered").take() {
+            tx.send(()).expect("entered notification");
+        }
+        if let Some(rx) = release_rx.lock().expect("release").take() {
+            rx.recv().expect("release watcher");
+        }
+    })));
+    let watcher = {
+        let host = Arc::clone(&host);
+        std::thread::spawn(move || host.watch_tick("sync"))
+    };
+    tick_entered_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("watcher owns the gate");
+
+    // The publisher sees the write due, then waits for the watcher's gate.
+    let (publisher_entered_tx, publisher_entered_rx) = std::sync::mpsc::channel();
+    let publisher_entered_tx = Mutex::new(Some(publisher_entered_tx));
+    host.set_before_publish(Some(Arc::new(move || {
+        if let Some(tx) = publisher_entered_tx.lock().expect("publisher").take() {
+            tx.send(()).expect("publisher notification");
+        }
+    })));
+    let publisher = {
+        let host = Arc::clone(&host);
+        std::thread::spawn(move || host.publish_pending())
+    };
+    publisher_entered_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("publisher saw the due write");
+    release_tx.send(()).expect("release watcher");
+    watcher.join().expect("watcher joins");
+    assert!(publisher.join().expect("publisher joins"));
+    host.set_before_publish(None);
+    host.set_before_tick(None);
+
+    assert_eq!(
+        ui.changed.lock().expect("changed").len(),
+        published_before + 1,
+        "the successful watcher already published the durable write"
+    );
+    assert!(host.publish_pending(), "nothing remains due");
+}
+
+#[test]
+fn unchanged_ui_reads_and_ticks_do_not_need_the_ingest_lock() {
+    let fixture = scratch(vec![(
+        "core/wake",
+        card("easy", "med", false, "Wake is blocked."),
+        true,
+    )]);
+    let clock = ManualClock::new();
+    let (host, ui, _sink) = fixture.host(Arc::clone(&clock));
+    let before = fixture.snapshot(&host);
+    let generation = before["generation"].as_u64().expect("generation");
+    let holder = IngestHolder::new(&fixture);
+    holder.hold();
+    clock.advance(60);
+
+    let after = fixture.snapshot(&host);
+    assert_eq!(after["generation"].as_u64(), Some(generation));
+    host.get_project(&json!({"project": "demo"}))
+        .expect("project read uses the unchanged committed read");
+    host.search(&json!({"text": "answers"}))
+        .expect("search uses the unchanged committed read");
+    let published_before = ui.changed.lock().expect("changed").len();
+    let unblocks_before = ui.unblock.lock().expect("unblock").len();
+    host.watch_tick("sync");
+
+    let changed = ui.changed.lock().expect("changed");
+    assert_eq!(changed.len(), published_before + 1);
+    let tick = changed.last().expect("unchanged publication");
+    assert_eq!(tick["generation"].as_u64(), Some(generation));
+    assert_eq!(tick["as_of"], "2026-01-01T00:01:00.000Z");
+    assert_eq!(tick["pulses"], json!([]));
+    assert_eq!(tick["batch"], "sync");
+    assert_eq!(ui.unblock.lock().expect("unblock").len(), unblocks_before);
+    holder.release();
+}
+
+#[test]
+fn an_accept_uses_the_committed_projection_while_the_index_is_busy() {
+    let (fixture, delivery_id) = downstream_delivery();
+    let (host, _ui, _sink) = fixture.host(ManualClock::new());
+    let project = host
+        .get_project(&json!({"project": "demo"}))
+        .expect("project");
+    let revision = delivery_value(&project, &delivery_id)["revision"]
+        .as_str()
+        .expect("revision")
+        .to_owned();
+    fixture.snapshot(&host);
+    let before = host.event_lines().len();
+
+    let holder = IngestHolder::new(&fixture);
+    holder.hold();
+    let started = std::time::Instant::now();
+    let accepted = host
+        .review_delivery(&json!({
+            "request_id": ulid::Ulid::generate().to_string(),
+            "delivery_id": delivery_id,
+            "expected_delivery_revision": revision,
+            "verdict": "accept",
+        }))
+        .expect("the unchanged committed projection admits the review");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "a busy index must not spend the normal five-second wait first"
+    );
+    assert_eq!(accepted["released"], json!(["core/after"]));
+    assert_eq!(host.event_lines().len(), before + 1);
+    holder.release();
+}
+
+#[test]
+fn a_busy_index_never_uses_a_cached_projection_after_the_vault_changes() {
+    let (fixture, delivery_id) = downstream_delivery();
+    let (host, _ui, _sink) = fixture.host(ManualClock::new());
+    let project = host
+        .get_project(&json!({"project": "demo"}))
+        .expect("project");
+    let revision = delivery_value(&project, &delivery_id)["revision"]
+        .as_str()
+        .expect("revision")
+        .to_owned();
+    fixture.snapshot(&host);
+
+    // A foreign accept changes the review frontier after the host's cached
+    // read. The old rendered revision must never be admitted from that cache.
+    fixture
+        .service()
+        .review_delivery(
+            &fixture.project,
+            &NodePath::parse("core/wake").expect("node"),
+            &delivery_id,
+            agendar_core::model::ReviewVerdict::Accept,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("foreign review");
+    let before = host.event_lines().len();
+    let request = json!({
+        "request_id": ulid::Ulid::generate().to_string(),
+        "delivery_id": delivery_id,
+        "expected_delivery_revision": revision,
+        "verdict": "accept",
+    });
+
+    let holder = IngestHolder::new(&fixture);
+    holder.hold();
+    let error = host
+        .review_delivery(&request)
+        .expect_err("a changed Vault is not the cached read");
+    assert_eq!(error.code, "E_BUSY");
+    assert_eq!(host.event_lines().len(), before, "no stale write");
+    holder.release();
+
+    let error = host
+        .review_delivery(&request)
+        .expect_err("the refreshed frontier is stale");
+    assert_eq!(error.code, "E_STALE_ANSWER");
+    assert_eq!(host.event_lines().len(), before, "still no stale write");
+}
+
+#[test]
+fn an_accept_replies_at_once_while_another_process_holds_the_index_lock() {
+    let (fixture, delivery_id) = downstream_delivery();
+    let (host, ui, _sink) = fixture.host(ManualClock::new());
+    let project = host
+        .get_project(&json!({"project": "demo"}))
+        .expect("project");
+    let revision = delivery_value(&project, &delivery_id)["revision"]
+        .as_str()
+        .expect("revision")
+        .to_owned();
+    fixture.snapshot(&host);
+    let before = host.event_lines().len();
+    let published_before = ui.changed.lock().expect("changed").len();
+
+    let holder = IngestHolder::new(&fixture);
+    holder.arm(&host);
+    let request = json!({
+        "request_id": ulid::Ulid::generate().to_string(),
+        "delivery_id": delivery_id,
+        "expected_delivery_revision": revision,
+        "verdict": "accept",
+    });
+    let started = std::time::Instant::now();
+    let accepted = host.review_delivery(&request).expect("accept replies");
+    let took = started.elapsed();
+    eprintln!("review_delivery with the ingest lock held: {took:?}");
+    assert!(holder.holding(), "the lock was held during the reply");
+    assert!(
+        took < std::time::Duration::from_secs(1),
+        "the reply never waits for the index: {took:?}"
+    );
+    let event_id = accepted["event_id"].as_str().expect("event id").to_owned();
+    assert_eq!(
+        accepted["released"],
+        json!(["core/after"]),
+        "the reply carries the downstream feature the accept releases"
+    );
+    assert_eq!(host.event_lines().len(), before + 1);
+
+    // The post-write refresh cannot run while the lock is held: it fails
+    // quietly and stays due, and nothing was published yet.
+    assert!(!host.publish_pending(), "the refresh cannot get the lock");
+    assert_eq!(ui.changed.lock().expect("changed").len(), published_before);
+
+    // A retry of the same request returns the same review and writes nothing.
+    let started = std::time::Instant::now();
+    let retried = host.review_delivery(&request).expect("retry");
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    assert_eq!(retried["event_id"], event_id);
+    assert_eq!(retried, accepted);
+    assert_eq!(host.event_lines().len(), before + 1, "no second review");
+
+    // Once the other process lets go, the publication catches up.
+    holder.release();
+    assert!(host.publish_pending(), "the refresh converges");
+    assert_eq!(
+        ui.changed.lock().expect("changed").len(),
+        published_before + 1
+    );
+    let snapshot = fixture.snapshot(&host);
+    assert!(
+        snapshot["needs"]
+            .as_array()
+            .expect("needs")
+            .iter()
+            .all(|need| need["source"].as_str() != Some(delivery_id.as_str())),
+        "the accepted delivery left the review queue"
+    );
+    assert_eq!(
+        snapshot["state"]["projects"]["demo"]["deliveries"][delivery_id.as_str()]["review"],
+        "accepted"
+    );
+    assert!(host.publish_pending(), "nothing is left due");
+}
+
+#[test]
+fn an_answer_replies_at_once_while_another_process_holds_the_index_lock() {
+    let fixture = scratch(vec![(
+        "core/wake",
+        card("easy", "med", false, "Wake is blocked."),
+        true,
+    )]);
+    let (host, ui, _sink) = fixture.host(ManualClock::new());
+    let snapshot = fixture.snapshot(&host);
+    let (ask, _) = fixture.asks[0].clone();
+    let rev = revision(&snapshot, "demo", &ask);
+    let prepared = fixture.prepare(&host, &ask, "adapters", &rev);
+    let token = prepared["token"].as_str().expect("token").to_owned();
+    let label = prepared["label"].as_str().expect("label").to_owned();
+
+    let holder = IngestHolder::new(&fixture);
+    holder.arm(&host);
+    let request = json!({
+        "request_id": ulid::Ulid::generate().to_string(),
+        "token": token,
+        "echo_label": label,
+    });
+    let started = std::time::Instant::now();
+    let answered = host
+        .answer_decision("main", &request)
+        .expect("answer replies");
+    let took = started.elapsed();
+    eprintln!("answer_decision with the ingest lock held: {took:?}");
+    assert!(holder.holding(), "the lock was held during the reply");
+    assert!(
+        took < std::time::Duration::from_secs(1),
+        "the reply never waits for the index: {took:?}"
+    );
+    let event_id = answered["event_id"].as_str().expect("event id").to_owned();
+    assert_eq!(answered["receipt"]["id"], event_id);
+    assert_eq!(answered["receipt"]["ask"], ask.as_str());
+    assert_eq!(answered["receipt"]["chose"]["label"], label);
+    assert_eq!(answered["released"], json!(["core/wake"]));
+    assert_eq!(fixture.answer_count(&host), 1);
+
+    assert!(!host.publish_pending(), "the refresh cannot get the lock");
+    assert!(ui.unblock.lock().expect("unblock").is_empty());
+
+    let retried = host.answer_decision("main", &request).expect("retry");
+    assert_eq!(retried, answered, "the same answer, not a second one");
+    assert_eq!(fixture.answer_count(&host), 1);
+
+    // The unblock moment still arrives, with the same released set, once the
+    // publication can run.
+    holder.release();
+    assert!(host.publish_pending(), "the refresh converges");
+    let unblocks = ui.unblock.lock().expect("unblock").clone();
+    assert_eq!(unblocks.len(), 1);
+    assert_eq!(unblocks[0]["phase"], "answered");
+    assert_eq!(unblocks[0]["answer_id"], event_id);
+    assert_eq!(unblocks[0]["released"], answered["released"]);
+    let after = fixture.snapshot(&host);
+    assert_eq!(
+        fixture.decision(&after, &ask)["effective_receipt"],
+        event_id.as_str()
+    );
+}
+
+#[test]
+fn a_stray_vault_file_degrades_local_health_and_is_named() {
+    let fixture = scratch(vec![]);
+    let (host, _ui, _sink) = fixture.host(ManualClock::new());
+    let snapshot = fixture.snapshot(&host);
+    assert_eq!(snapshot["local"]["health"], "healthy");
+    assert_eq!(snapshot["local"]["diagnostics"], json!([]));
+
+    let host_dir = std::fs::read_dir(fixture.vault.join("projects/demo"))
+        .expect("project folder")
+        .map(|entry| entry.expect("entry").path())
+        .find(|path| path.is_dir())
+        .expect("host folder");
+    std::fs::write(host_dir.join("operator (1).jsonl"), b"{}\n").expect("stray file");
+    let snapshot = fixture.snapshot(&host);
+    assert_eq!(snapshot["local"]["health"], "degraded");
+    let diagnostics = snapshot["local"]["diagnostics"]
+        .as_array()
+        .expect("diagnostics");
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0]["code"], "source_stray");
+    assert_eq!(diagnostics[0]["retryable"], false);
+    assert!(
+        diagnostics[0]["path"]
+            .as_str()
+            .expect("path")
+            .ends_with("/operator (1).jsonl")
+    );
+}
+
+#[test]
+fn storage_usage_is_the_prune_listing_without_the_file_list() {
+    let fixture = scratch(vec![(
+        "core/wake",
+        card("easy", "med", false, "Wake is blocked."),
+        true,
+    )]);
+    let transcript = publish(&fixture, BlobExt::Txt, b"transcript\n");
+    let evidence = publish(&fixture, BlobExt::Txt, b"aggregate: passed\n");
+    publish(&fixture, BlobExt::Txt, b"not attached to anything\n");
+    let board = delivery_board(&fixture);
+    board
+        .service
+        .deliver(
+            &fixture.project,
+            &board.session,
+            &board.node,
+            &board.attempt,
+            Some(&board.receipt),
+            None,
+            deliver_body("Usage", Some(evidence), Some(transcript)),
+            None,
+        )
+        .expect("deliver");
+
+    let clock = ManualClock::new();
+    let (host, _ui, _sink) = fixture.host(Arc::clone(&clock));
+    let before = host.event_lines();
+    let usage = host.get_storage_usage().expect("usage");
+    assert_eq!(host.event_lines(), before, "a read writes no event");
+
+    // The CLI prints this same value (`agendar prune`), plus `blobs`.
+    let fresh = board
+        .service
+        .refresh(
+            UtcTime::parse(usage["evaluated_at"].as_str().expect("evaluated_at")).expect("time"),
+            false,
+        )
+        .expect("refresh");
+    let mut listing = json!(board.service.storage_usage(&fresh, None).expect("listing"));
+    let project = &mut listing["projects"][0];
+    assert_eq!(project["blobs"].as_array().expect("blobs").len(), 3);
+    project.as_object_mut().expect("project").remove("blobs");
+    assert_eq!(usage, listing);
+
+    let project = &usage["projects"][0];
+    assert_eq!(project["project"], "demo");
+    assert_eq!(
+        project["attachments"],
+        json!({"count": 3, "bytes": 54, "local_bytes": 54})
+    );
+    assert_eq!(
+        project["unreferenced"],
+        json!({"count": 1, "bytes": 25, "local_bytes": 25})
+    );
+    assert_eq!(project["reclaimable"]["bytes"], 0);
+    assert!(project.get("blobs").is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Upload mark
+// ---------------------------------------------------------------------------
+
+/// The sync folder's answer for every file, and which files were asked about.
+struct FakeUploads {
+    flag: Mutex<agendar_app::uploads::UploadFlag>,
+    asked: Mutex<Vec<PathBuf>>,
+}
+
+impl FakeUploads {
+    fn new(flag: agendar_app::uploads::UploadFlag) -> Arc<Self> {
+        Arc::new(Self {
+            flag: Mutex::new(flag),
+            asked: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn set(&self, flag: agendar_app::uploads::UploadFlag) {
+        *self.flag.lock().expect("flag") = flag;
+    }
+
+    fn asked(&self) -> Vec<PathBuf> {
+        self.asked.lock().expect("asked").clone()
+    }
+}
+
+impl agendar_app::uploads::UploadReader for FakeUploads {
+    fn supported(&self) -> bool {
+        true
+    }
+
+    fn read(&self, file: &std::path::Path) -> agendar_app::uploads::UploadFlag {
+        self.asked.lock().expect("asked").push(file.to_path_buf());
+        *self.flag.lock().expect("flag")
+    }
+}
+
+#[test]
+fn an_answer_on_this_computer_is_marked_until_the_folder_says_it_is_uploaded() {
+    use agendar_app::uploads::UploadFlag;
+    use std::time::{Duration, Instant};
+
+    let fixture = scratch(vec![(
+        "core/wake",
+        card("easy", "med", false, "Wake is blocked."),
+        true,
+    )]);
+    let clock = ManualClock::new();
+    let (host, ui, _sink) = fixture.host(clock.clone());
+    let reader = FakeUploads::new(UploadFlag::Uploaded);
+    host.set_upload_reader(reader.clone());
+    let files = Arc::new(CountedFiles::default());
+    host.set_upload_files(files.clone());
+    let start = Instant::now();
+    let at = |seconds: u64| start + Duration::from_secs(seconds);
+
+    // Launch: the files written just before it are looked at, and are uploaded.
+    host.uploads_tick_at(at(0));
+    host.uploads_tick_at(at(2));
+    let launch_reads = reader.asked().len();
+    assert!(launch_reads > 0);
+    host.uploads_tick_at(at(60));
+    assert_eq!(reader.asked().len(), launch_reads, "nothing waits: no read");
+    assert!(ui.uploads.lock().expect("uploads").is_empty());
+    let snapshot = fixture.snapshot(&host);
+    assert!(snapshot["local"].get("upload").is_none());
+
+    // The owner answers here; the folder has not uploaded it.
+    let (ask, _) = fixture.asks[0].clone();
+    let rev = revision(&snapshot, "demo", &ask);
+    let prepared = fixture.prepare(&host, &ask, "adapters", &rev);
+    fixture
+        .answer(
+            &host,
+            prepared["token"].as_str().expect("token"),
+            prepared["label"].as_str().expect("label"),
+        )
+        .expect("answer");
+    reader.set(UploadFlag::Waiting);
+    assert_eq!(files.calls(), (1, 0, 0));
+    host.uploads_tick_at(at(70));
+    // The app's own commit lists this host's files itself, with no watcher
+    // and no signal naming the file.
+    assert_eq!(files.calls(), (2, 0, 0));
+    // Not uploaded, but for less than 15 s: an answer does not flash the line.
+    assert!(ui.uploads.lock().expect("uploads").is_empty());
+    assert!(fixture.snapshot(&host)["local"].get("upload").is_none());
+    let asked_once = reader.asked().len();
+    clock.advance(16);
+    host.uploads_tick_at(at(71));
+    assert_eq!(reader.asked().len(), asked_once, "time alone, no read");
+    {
+        let events = ui.uploads.lock().expect("uploads");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["v"], 1);
+        assert_eq!(events[0]["upload"]["state"], "waiting");
+    }
+    let local = fixture.snapshot(&host)["local"].clone();
+    assert_eq!(local["upload"]["state"], "waiting");
+    assert!(local["upload"]["since"].is_string());
+    // Only the operator's file changed, so only it is asked about, and it is
+    // this host's own.
+    let own = host
+        .current_vault_root()
+        .expect("vault root")
+        .join("projects/demo")
+        .join(local["host"].as_str().expect("host"));
+    let asked = reader.asked();
+    assert_eq!(asked.len(), launch_reads + 1);
+    assert_eq!(asked.last(), Some(&own.join("operator.jsonl")));
+    assert!(asked.iter().all(|path| path.starts_with(&own)));
+
+    // Two minutes on it is still here: the stronger line.
+    clock.advance(130);
+    host.uploads_tick_at(at(200));
+    assert_eq!(
+        ui.uploads.lock().expect("uploads").last().expect("event")["upload"]["state"],
+        "late"
+    );
+    assert_eq!(fixture.snapshot(&host)["local"]["upload"]["state"], "late");
+
+    // Uploaded: the line goes and the reads stop.
+    reader.set(UploadFlag::Uploaded);
+    host.uploads_tick_at(at(230));
+    assert_eq!(
+        ui.uploads.lock().expect("uploads").last().expect("event")["upload"],
+        Value::Null
+    );
+    assert!(fixture.snapshot(&host)["local"].get("upload").is_none());
+    let reads = reader.asked().len();
+    host.uploads_tick_at(at(900));
+    assert_eq!(reader.asked().len(), reads);
+}
+
+#[test]
+fn a_vault_outside_icloud_shows_no_upload_line() {
+    use agendar_app::uploads::{NoReader, UploadFlag};
+
+    let fixture = scratch(vec![(
+        "core/wake",
+        card("easy", "med", false, "Wake is blocked."),
+        true,
+    )]);
+    let (host, ui, _sink) = fixture.host(ManualClock::new());
+    // The folder is not a synced one: every flag is unknown.
+    let reader = FakeUploads::new(UploadFlag::Unknown);
+    host.set_upload_reader(reader.clone());
+    let start = std::time::Instant::now();
+    host.uploads_tick_at(start);
+    host.uploads_tick_at(start + std::time::Duration::from_secs(600));
+    assert!(ui.uploads.lock().expect("uploads").is_empty());
+    assert!(fixture.snapshot(&host)["local"].get("upload").is_none());
+    let reads = reader.asked().len();
+    host.uploads_tick_at(start + std::time::Duration::from_secs(1200));
+    assert_eq!(
+        reader.asked().len(),
+        reads,
+        "unknown files are not asked again"
+    );
+
+    // Windows and Linux: nothing is listed or read at all.
+    host.set_upload_reader(Arc::new(NoReader));
+    assert!(!host.uploads_supported());
+    host.uploads_tick_at(start + std::time::Duration::from_secs(1300));
+    assert!(ui.uploads.lock().expect("uploads").is_empty());
+}
+
+/// The real folder, counting what is asked of it.
+#[derive(Default)]
+struct CountedFiles {
+    all: Mutex<usize>,
+    project: Mutex<usize>,
+    one: Mutex<Vec<PathBuf>>,
+}
+
+impl CountedFiles {
+    /// Full listings, one-project listings, single stats.
+    fn calls(&self) -> (usize, usize, usize) {
+        (
+            *self.all.lock().expect("all"),
+            *self.project.lock().expect("project"),
+            self.one.lock().expect("one").len(),
+        )
+    }
+}
+
+impl agendar_app::uploads::OwnFiles for CountedFiles {
+    fn all(
+        &self,
+        root: &std::path::Path,
+        host: &agendar_core::model::HostId,
+        wall: agendar_core::model::UtcTime,
+    ) -> Vec<agendar_app::uploads::OwnFile> {
+        *self.all.lock().expect("all") += 1;
+        agendar_app::uploads::Disk.all(root, host, wall)
+    }
+
+    fn project(
+        &self,
+        root: &std::path::Path,
+        project: &str,
+        host: &agendar_core::model::HostId,
+        wall: agendar_core::model::UtcTime,
+    ) -> Vec<agendar_app::uploads::OwnFile> {
+        *self.project.lock().expect("project") += 1;
+        agendar_app::uploads::Disk.project(root, project, host, wall)
+    }
+
+    fn one(
+        &self,
+        file: &std::path::Path,
+        wall: agendar_core::model::UtcTime,
+    ) -> Option<agendar_app::uploads::OwnFile> {
+        self.one.lock().expect("one").push(file.to_path_buf());
+        agendar_app::uploads::Disk.one(file, wall)
+    }
+}
+
+const ANOTHER_HOST: &str = "h-00000000000000000000000005";
+
+fn named(paths: &[&PathBuf]) -> agendar_core::runtime::Changes {
+    agendar_core::runtime::Changes {
+        paths: paths.iter().map(|path| (*path).clone()).collect(),
+        unclear: false,
+    }
+}
+
+fn write_blob(folder: &std::path::Path, name: &str) -> PathBuf {
+    let blobs = folder.join("blobs");
+    std::fs::create_dir_all(&blobs).expect("blobs");
+    let file = blobs.join(name);
+    std::fs::write(&file, b"image").expect("blob");
+    file
+}
+
+#[test]
+fn an_attachment_written_here_is_marked_like_a_writer_file_and_another_hosts_never() {
+    use agendar_app::uploads::UploadFlag;
+    use std::time::{Duration, Instant};
+
+    let fixture = scratch(vec![(
+        "core/wake",
+        card("easy", "med", false, "Wake is blocked."),
+        true,
+    )]);
+    let clock = ManualClock::new();
+    let (host, ui, _sink) = fixture.host(clock.clone());
+    let reader = FakeUploads::new(UploadFlag::Uploaded);
+    host.set_upload_reader(reader.clone());
+    let files = Arc::new(CountedFiles::default());
+    host.set_upload_files(files.clone());
+    let start = Instant::now();
+    let at = |seconds: u64| start + Duration::from_secs(seconds);
+    host.uploads_tick_at(at(0));
+    host.uploads_tick_at(at(2));
+    assert_eq!(files.calls(), (1, 0, 0), "one listing at launch");
+    let launch_reads = reader.asked().len();
+
+    let project = host
+        .current_vault_root()
+        .expect("vault root")
+        .join("projects/demo");
+    let own = project.join(
+        fixture.snapshot(&host)["local"]["host"]
+            .as_str()
+            .expect("host"),
+    );
+
+    // Another host's attachment arrives: nothing is looked at, nothing read.
+    let theirs = write_blob(&project.join(ANOTHER_HOST), "bb.png");
+    reader.set(UploadFlag::Waiting);
+    host.watch_changed(&named(&[&theirs]));
+    host.uploads_tick_at(at(10));
+    assert_eq!(files.calls(), (1, 0, 0));
+    assert_eq!(reader.asked().len(), launch_reads);
+
+    // A delivery on this computer puts an attachment in the Vault.
+    let mine = write_blob(&own, "aa.png");
+    host.watch_changed(&named(&[&mine]));
+    host.uploads_tick_at(at(20));
+    assert_eq!(files.calls(), (1, 0, 1), "one stat of the named file");
+    assert_eq!(reader.asked().last(), Some(&mine));
+    // Not uploaded, but for less than 15 s: no line.
+    assert!(ui.uploads.lock().expect("uploads").is_empty());
+    clock.advance(16);
+    host.uploads_tick_at(at(21));
+    {
+        let events = ui.uploads.lock().expect("uploads");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["upload"]["state"], "waiting");
+    }
+    assert_eq!(
+        fixture.snapshot(&host)["local"]["upload"]["state"],
+        "waiting"
+    );
+
+    // Two minutes on: the late line, by the writer files' rule.
+    clock.advance(130);
+    host.uploads_tick_at(at(150));
+    assert_eq!(
+        ui.uploads.lock().expect("uploads").last().expect("event")["upload"]["state"],
+        "late"
+    );
+
+    reader.set(UploadFlag::Uploaded);
+    host.uploads_tick_at(at(180));
+    assert_eq!(
+        ui.uploads.lock().expect("uploads").last().expect("event")["upload"],
+        Value::Null
+    );
+    // Only this host's files were ever asked about.
+    assert!(reader.asked().iter().all(|path| path.starts_with(&own)));
+    assert_eq!(files.calls(), (1, 0, 1));
+}
+
+#[test]
+fn a_signal_about_another_host_costs_nothing_and_the_safety_listing_finds_a_missed_write() {
+    use agendar_app::uploads::UploadFlag;
+    use std::time::{Duration, Instant};
+
+    let fixture = scratch(vec![(
+        "core/wake",
+        card("easy", "med", false, "Wake is blocked."),
+        true,
+    )]);
+    let clock = ManualClock::new();
+    let (host, ui, _sink) = fixture.host(clock.clone());
+    let reader = FakeUploads::new(UploadFlag::Uploaded);
+    host.set_upload_reader(reader.clone());
+    let files = Arc::new(CountedFiles::default());
+    host.set_upload_files(files.clone());
+    let start = Instant::now();
+    let at = |seconds: u64| start + Duration::from_secs(seconds);
+    host.uploads_tick_at(at(0));
+    host.uploads_tick_at(at(2));
+    assert_eq!(files.calls(), (1, 0, 0));
+    let reads = reader.asked().len();
+
+    let project = host
+        .current_vault_root()
+        .expect("vault root")
+        .join("projects/demo");
+    let own = project.join(
+        fixture.snapshot(&host)["local"]["host"]
+            .as_str()
+            .expect("host"),
+    );
+    let other = project.join(ANOTHER_HOST);
+
+    // Another host's writer file and attachment changed, again and again.
+    for second in 3..8 {
+        host.watch_changed(&named(&[
+            &other.join("agent.jsonl"),
+            &other.join("blobs/bb.png"),
+            &other,
+            &project,
+        ]));
+        host.uploads_tick_at(at(second));
+    }
+    // A signal with no detail (a refresh by the clock) is no reason either.
+    host.watch_tick("sync");
+    host.watch_tick("time");
+    host.uploads_tick_at(at(40));
+    assert_eq!(files.calls(), (1, 0, 0), "no listing, no stat");
+    assert_eq!(reader.asked().len(), reads);
+
+    // This host's folder itself is named: that one project is listed.
+    host.watch_changed(&named(&[&own]));
+    host.uploads_tick_at(at(41));
+    assert_eq!(files.calls(), (1, 1, 0));
+
+    // A write no signal named.
+    let missed = write_blob(&own, "cc.png");
+    reader.set(UploadFlag::Waiting);
+    host.watch_tick("time");
+    host.uploads_tick_at(at(299));
+    assert_eq!(files.calls(), (1, 1, 0), "not within five minutes");
+    // Five minutes are over, but no refresh is running: still no listing.
+    host.uploads_tick_at(at(301));
+    assert_eq!(files.calls(), (1, 1, 0));
+    host.watch_tick("time");
+    host.uploads_tick_at(at(302));
+    assert_eq!(files.calls(), (2, 1, 0), "the safety net lists once");
+    assert_eq!(reader.asked().last(), Some(&missed));
+    clock.advance(16);
+    host.uploads_tick_at(at(303));
+    assert_eq!(
+        ui.uploads.lock().expect("uploads").last().expect("event")["upload"]["state"],
+        "waiting"
+    );
+    // And not again before five more minutes.
+    host.watch_tick("time");
+    host.uploads_tick_at(at(600));
+    assert_eq!(files.calls(), (2, 1, 0));
 }

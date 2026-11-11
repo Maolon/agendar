@@ -5,12 +5,13 @@
 //! plan; lost-session and repeated-failure rescues come from the runtime and
 //! evidence projections that own their facts.
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::model::Msg;
 use crate::model::ids::{EventId, Mode, NodePath, SessionId, UtcTime};
 use crate::model::state::{
-    DecisionLifecycle, Gate, Liveness, NeedsKind, NeedsYouItem, Progress, ProjectState,
+    DecisionLifecycle, Gate, Lease, Liveness, NeedsKind, NeedsYouItem, Progress, ProjectState,
     ReceiptSource, ReviewStatus,
 };
 use crate::reduce::graph::{RejectedEdge, ancestors, descendants};
@@ -35,6 +36,10 @@ pub struct RescueInputs<'a> {
     pub start_conflicts: &'a [(NodePath, EventId, UtcTime)],
     pub lost_sessions: &'a [LostSession],
     pub event_ts: &'a BTreeMap<EventId, UtcTime>,
+    /// Attempts whose fold status is dropped.
+    pub dropped_attempts: &'a BTreeSet<EventId>,
+    /// When each closed step closed (`reduce::moot`).
+    pub closed_steps: &'a BTreeMap<NodePath, UtcTime>,
     pub as_of: UtcTime,
 }
 
@@ -158,6 +163,8 @@ fn runnable(
             .session
             .as_ref()
             .is_none_or(|owner| owner != session);
+    let takeover = free_for(session, feature);
+    let granted = granted_to(session, feature).is_some();
     if feature.gate == Gate::AwaitingUpstream {
         return false;
     }
@@ -175,8 +182,22 @@ fn runnable(
     {
         return false;
     }
+    // A free step (its claim ended) is open to any agent without a hand-off,
+    // but never past a question on it: that is the owner's hold, not the
+    // agent's claim.
+    if (takeover || granted)
+        && project.decisions.values().any(|decision| {
+            &decision.node == node
+                && decision.lifecycle == DecisionLifecycle::Open
+                && decision.mode == Mode::Ask
+        })
+    {
+        return false;
+    }
     if feature.progress == Progress::Doing
         && !replacement
+        && !takeover
+        && !granted
         && feature.session.as_ref() != Some(session)
     {
         return false;
@@ -188,6 +209,54 @@ fn runnable(
         return false;
     }
     true
+}
+
+/// Whether `session` may take over `feature` without a hand-off: another
+/// session's attempt is in progress and its claim is free (the session was
+/// lost, or no word came for a day after its ETA). A held or stalled claim,
+/// and a step the owner holds (in review, paused, handed off: no claim), are
+/// never taken this way. The start still cites the attempt it replaces.
+pub fn free_for(session: &SessionId, feature: &crate::model::state::FeatureState) -> bool {
+    feature.progress == Progress::Doing
+        && !feature.handoff_pending
+        && !feature.paused
+        && feature.phase != Some(crate::model::state::Phase::InReview)
+        && feature
+            .session
+            .as_ref()
+            .is_some_and(|owner| owner != session)
+        && feature
+            .claim
+            .as_ref()
+            .is_some_and(|claim| claim.state == Lease::Free)
+}
+
+/// The owner's answer that lets `session` continue `feature` while another
+/// session's attempt on it is in progress: the session asked on the step and
+/// the owner's current answer chose the `takeover` option. It passes the
+/// other session's claim and nothing else: as for a free step, a pause, an
+/// old hand-off and a delivery in review are the owner's, and a finished or
+/// dropped step is not in progress. (`runnable` also keeps an open question
+/// and an unresolved upstream in its way.)
+pub fn granted_to<'a>(
+    session: &SessionId,
+    feature: &'a crate::model::state::FeatureState,
+) -> Option<&'a crate::model::state::TakeoverGrant> {
+    if feature.progress != Progress::Doing
+        || feature.handoff_pending
+        || feature.paused
+        || feature.phase == Some(crate::model::state::Phase::InReview)
+        || feature
+            .session
+            .as_ref()
+            .is_none_or(|owner| owner == session)
+    {
+        return None;
+    }
+    feature
+        .takeover_grants
+        .iter()
+        .find(|grant| &grant.session == session)
 }
 
 /// Lexically sorted runnable nodes for one session.
@@ -202,12 +271,64 @@ pub fn runnable_nodes(session: &SessionId, project: &ProjectState) -> Vec<NodePa
     nodes
 }
 
+/// Steps `session` may start only by applying answers it has not applied
+/// yet, with those answers: `progress started --applies <answer>` admits them
+/// (the start cites the answer, which is what applying it means). This is how
+/// a step the owner handed off after its question was answered, or a free
+/// step in that state, reaches the next agent: whoever continues applies the
+/// answer. Sorted by node.
+pub fn runnable_applying(
+    session: &SessionId,
+    project: &ProjectState,
+) -> Vec<(NodePath, Vec<EventId>)> {
+    project
+        .features
+        .keys()
+        .filter(|node| runnable_except_receipts(session, node, project))
+        .filter_map(|node| {
+            let unapplied = unapplied_receipts(project, session, node);
+            (!unapplied.is_empty()).then(|| (node.clone(), unapplied))
+        })
+        .collect()
+}
+
+/// Row id prefix of the step a lost session was on.
+pub const LOST_ROW: &str = "rescue:lost:";
+/// Row id prefix of a step of a lost session other than the one it was on.
+pub const LOST_STEP_ROW: &str = "rescue:lost-step:";
+/// Row id prefix of a claim that expired by silence.
+pub const SILENT_ROW: &str = "rescue:silent:";
+
+/// A row the board raised by correcting itself: a free step, open to any
+/// agent. It is information, not a request: it stays addressable (the owner
+/// may still pause it) but is never counted
+/// in the active Needs-you list and never announced.
+pub fn is_correction_row(item: &NeedsYouItem) -> bool {
+    item.kind == NeedsKind::Rescue
+        && (item.id.starts_with(LOST_ROW)
+            || item.id.starts_with(LOST_STEP_ROW)
+            || item.id.starts_with(SILENT_ROW))
+}
+
+/// A question on a step closed a day ago: folded "On closed steps".
+pub fn is_folded(item: &NeedsYouItem) -> bool {
+    item.closed_step
+        .as_ref()
+        .is_some_and(|closed| closed.folded)
+}
+
+/// A row in the active Needs-you list: everything but information rows and
+/// folded questions.
+pub fn is_active_need(item: &NeedsYouItem) -> bool {
+    !is_correction_row(item) && !is_folded(item)
+}
+
 /// Workers classification: decide rows are actionable with stalled agents; every
 /// rescue row whose evidence exists is actionable.
 pub fn notification_eligible(item: &NeedsYouItem) -> bool {
     match item.kind {
-        NeedsKind::Decide => item.stalled_agents > 0,
-        NeedsKind::Rescue => true,
+        NeedsKind::Decide => item.stalled_agents > 0 && !is_folded(item),
+        NeedsKind::Rescue => !is_correction_row(item),
         NeedsKind::Confirm | NeedsKind::Review => false,
     }
 }
@@ -223,46 +344,77 @@ pub fn age_label(minutes: u64) -> String {
     }
 }
 
-fn unblocks_for(project: &ProjectState, node: &NodePath) -> Vec<NodePath> {
-    let adjacency = adjacency(project);
-    descendants(&adjacency, node)
-        .into_iter()
-        .filter(|candidate| {
-            project
-                .features
-                .get(candidate)
-                .is_some_and(|feature| feature.progress != Progress::Verified)
-        })
-        .collect()
+/// Per-project view for stalled-agent and unblocks accounting.
+///
+/// Built once per projection pass: the accepted adjacency, the sessions that
+/// can be stalled (not lost, focused on a non-terminal feature) with the
+/// upstreams of their focus, and each such session's "nothing runnable" fact,
+/// computed at most once and only when a row actually gates that session.
+struct Stalls<'a> {
+    project: &'a ProjectState,
+    adjacency: BTreeMap<NodePath, BTreeSet<NodePath>>,
+    candidates: Vec<(&'a SessionId, &'a NodePath, BTreeSet<NodePath>)>,
+    idle: Vec<OnceCell<bool>>,
 }
 
-/// Sessions stalled on one attention row.
-fn stalled_on(project: &ProjectState, node: &NodePath) -> Vec<SessionId> {
-    let adjacency = adjacency(project);
-    let mut sessions = Vec::new();
-    for (session, session_state) in &project.sessions {
-        if session_state.liveness == Liveness::Lost {
-            continue;
+impl<'a> Stalls<'a> {
+    fn new(project: &'a ProjectState) -> Self {
+        let adjacency = adjacency(project);
+        let mut candidates = Vec::new();
+        for (session, session_state) in &project.sessions {
+            if session_state.liveness == Liveness::Lost {
+                continue;
+            }
+            let Some(focus) = &session_state.current_node else {
+                continue;
+            };
+            let Some(feature) = project.features.get(focus) else {
+                continue;
+            };
+            if feature.progress.is_terminal() {
+                continue;
+            }
+            let upstreams = ancestors(&adjacency, focus).into_iter().collect();
+            candidates.push((session, focus, upstreams));
         }
-        let Some(focus) = &session_state.current_node else {
-            continue;
-        };
-        let Some(feature) = project.features.get(focus) else {
-            continue;
-        };
-        if feature.progress.is_terminal() {
-            continue;
+        let idle = candidates.iter().map(|_| OnceCell::new()).collect();
+        Self {
+            project,
+            adjacency,
+            candidates,
+            idle,
         }
-        let gated_by_row = focus == node || ancestors(&adjacency, focus).contains(node);
-        if !gated_by_row {
-            continue;
-        }
-        if !runnable_nodes(session, project).is_empty() {
-            continue;
-        }
-        sessions.push(session.clone());
     }
-    sessions
+
+    fn unblocks_for(&self, node: &NodePath) -> Vec<NodePath> {
+        descendants(&self.adjacency, node)
+            .into_iter()
+            .filter(|candidate| {
+                self.project
+                    .features
+                    .get(candidate)
+                    .is_some_and(|feature| feature.progress != Progress::Verified)
+            })
+            .collect()
+    }
+
+    /// Sessions stalled on one attention row.
+    fn stalled_on(&self, node: &NodePath) -> Vec<SessionId> {
+        let mut sessions = Vec::new();
+        for (index, (session, focus, upstreams)) in self.candidates.iter().enumerate() {
+            let gated_by_row = *focus == node || upstreams.contains(node);
+            if !gated_by_row {
+                continue;
+            }
+            let idle =
+                *self.idle[index].get_or_init(|| runnable_nodes(session, self.project).is_empty());
+            if !idle {
+                continue;
+            }
+            sessions.push((*session).clone());
+        }
+        sessions
+    }
 }
 
 fn stack_score(stalled: u32, waiting_minutes: u64, weight_x2: u8) -> u64 {
@@ -285,6 +437,7 @@ fn waiting_minutes(since: UtcTime, as_of: UtcTime) -> u64 {
 /// every row; the ordering is age-based.
 pub fn build_needs(project: &ProjectState, inputs: &RescueInputs<'_>) -> Vec<NeedsYouItem> {
     let mut rows: Vec<NeedsYouItem> = Vec::new();
+    let stalls = Stalls::new(project);
 
     for (ask, decision) in &project.decisions {
         if decision.lifecycle != DecisionLifecycle::Open || decision.mode != Mode::Ask {
@@ -292,7 +445,7 @@ pub fn build_needs(project: &ProjectState, inputs: &RescueInputs<'_>) -> Vec<Nee
         }
         let (risk, external, _) = risk_scan(&decision.card);
         let weight = weight_x2(risk, external);
-        let stalled = stalled_on(project, &decision.node);
+        let stalled = stalls.stalled_on(&decision.node);
         let since = inputs.event_ts.get(ask).copied().unwrap_or(inputs.as_of);
         let minutes = waiting_minutes(since, inputs.as_of);
         let (reason, reason_msg) = reason_text(stalled.len() as u32, minutes);
@@ -311,7 +464,13 @@ pub fn build_needs(project: &ProjectState, inputs: &RescueInputs<'_>) -> Vec<Nee
             score_x2: stack_score(stalled.len() as u32, minutes, weight),
             reason,
             reason_msg: Some(reason_msg),
-            unblocks: unblocks_for(project, &decision.node),
+            unblocks: stalls.unblocks_for(&decision.node),
+            closed_step: crate::reduce::moot::closed_step(
+                decision,
+                inputs.closed_steps,
+                inputs.as_of,
+            ),
+            snoozed_until: None,
         });
     }
 
@@ -345,7 +504,7 @@ pub fn build_needs(project: &ProjectState, inputs: &RescueInputs<'_>) -> Vec<Nee
         }
         let (risk, external, _) = risk_scan(&decision.card);
         let weight = weight_x2(risk, external);
-        let stalled = stalled_on(project, &decision.node);
+        let stalled = stalls.stalled_on(&decision.node);
         let minutes = waiting_minutes(assumed_at, inputs.as_of);
         let (reason, reason_msg) = if stalled.is_empty() {
             if built == 0 {
@@ -377,7 +536,9 @@ pub fn build_needs(project: &ProjectState, inputs: &RescueInputs<'_>) -> Vec<Nee
             score_x2: stack_score(stalled.len() as u32, minutes, weight),
             reason,
             reason_msg: Some(reason_msg),
-            unblocks: unblocks_for(project, &decision.node),
+            unblocks: stalls.unblocks_for(&decision.node),
+            closed_step: None,
+            snoozed_until: None,
         });
     }
 
@@ -388,7 +549,7 @@ pub fn build_needs(project: &ProjectState, inputs: &RescueInputs<'_>) -> Vec<Nee
             .copied()
             .unwrap_or(inputs.as_of);
         let weight = 2_u8;
-        let stalled = stalled_on(project, &edge.downstream);
+        let stalled = stalls.stalled_on(&edge.downstream);
         let minutes = waiting_minutes(source_ts, inputs.as_of);
         let (reason, reason_msg) = reason_text(stalled.len() as u32, minutes);
         rows.push(NeedsYouItem {
@@ -419,52 +580,97 @@ pub fn build_needs(project: &ProjectState, inputs: &RescueInputs<'_>) -> Vec<Nee
             score_x2: stack_score(stalled.len() as u32, minutes, weight),
             reason,
             reason_msg: Some(reason_msg),
-            unblocks: unblocks_for(project, &edge.downstream),
+            unblocks: stalls.unblocks_for(&edge.downstream),
+            closed_step: None,
+            snoozed_until: None,
         });
     }
 
-    for lost in inputs.lost_sessions {
-        let Some(node) = &lost.node else {
-            // A node-less idle loss has no actionable rescue.
+    // Every claim that ended gets an information row: each step of a lost
+    // session (the one it was on keeps its first row id) and each claim that
+    // expired by silence. Any agent may pick the step up; the row lets the
+    // owner pause it, and asks nothing.
+    for (node, feature) in &project.features {
+        let Some(claim) = feature
+            .claim
+            .as_ref()
+            .filter(|claim| claim.state == Lease::Free)
+        else {
             continue;
         };
-        let Some(feature) = project.features.get(node) else {
-            continue;
-        };
-        if feature.liveness != Liveness::Lost
-            || feature.progress.is_terminal()
+        if feature.progress.is_terminal()
             || feature.handoff_pending
             || feature.handoff_consumed_by.is_some()
             || feature.paused
-            || feature.session.as_ref() != Some(&lost.session)
         {
             continue;
         }
+        let Some(session) = &feature.session else {
+            continue;
+        };
+        let lost = inputs
+            .lost_sessions
+            .iter()
+            .find(|lost| &lost.session == session && feature.liveness == Liveness::Lost);
+        let (id, source) = match lost {
+            Some(lost) if lost.node.as_ref() == Some(node) => (
+                format!("rescue:lost:{}", lost.lost_event.as_str()),
+                lost.lost_event.clone(),
+            ),
+            Some(lost) => (
+                format!(
+                    "{LOST_STEP_ROW}{}:{}",
+                    lost.lost_event.as_str(),
+                    node.as_str()
+                ),
+                lost.lost_event.clone(),
+            ),
+            None => {
+                let Some(attempt) = &feature.attempt else {
+                    continue;
+                };
+                (format!("{SILENT_ROW}{}", attempt.as_str()), attempt.clone())
+            }
+        };
         let weight = 2_u8;
-        let stalled = stalled_on(project, node);
-        let minutes = waiting_minutes(lost.since, inputs.as_of);
+        let stalled = stalls.stalled_on(node);
+        let minutes = waiting_minutes(claim.since, inputs.as_of);
+        let quiet = waiting_minutes(claim.last_word, inputs.as_of);
+        let (reason, reason_msg) = if lost.is_some() {
+            (
+                format!("Agent stopped · {}", age_label(minutes)),
+                Msg::new("need.reason.stopped").minutes("age", minutes),
+            )
+        } else {
+            (
+                format!("No word for {}", age_label(quiet)),
+                Msg::new("need.reason.silent").minutes("age", quiet),
+            )
+        };
         rows.push(NeedsYouItem {
-            id: format!("rescue:lost:{}", lost.lost_event.as_str()),
+            id,
             kind: NeedsKind::Rescue,
             project: project.summary.slug.clone(),
             node: Some(node.clone()),
-            source: lost.lost_event.clone(),
-            question: format!("Hand {} to the next session?", node.as_str()),
-            question_msg: Some(Msg::new("need.q.handoff").text("node", node.as_str())),
-            since: lost.since,
+            source,
+            question: format!("{}: abandoned · open to any agent", node.as_str()),
+            question_msg: Some(Msg::new("need.q.abandoned").text("node", node.as_str())),
+            since: claim.since,
             stalled_agents: stalled.len() as u32,
             waiting_minutes: minutes,
             weight_x2: weight,
             score_x2: stack_score(stalled.len() as u32, minutes, weight),
-            reason: format!("Agent stopped · {}", age_label(minutes)),
-            reason_msg: Some(Msg::new("need.reason.stopped").minutes("age", minutes)),
-            unblocks: unblocks_for(project, node),
+            reason,
+            reason_msg: Some(reason_msg),
+            unblocks: stalls.unblocks_for(node),
+            closed_step: None,
+            snoozed_until: None,
         });
     }
 
     for (node, attempt, since) in inputs.start_conflicts {
         let weight = 2_u8;
-        let stalled = stalled_on(project, node);
+        let stalled = stalls.stalled_on(node);
         let minutes = waiting_minutes(*since, inputs.as_of);
         let (reason, reason_msg) = reason_text(stalled.len() as u32, minutes);
         rows.push(NeedsYouItem {
@@ -482,7 +688,9 @@ pub fn build_needs(project: &ProjectState, inputs: &RescueInputs<'_>) -> Vec<Nee
             score_x2: stack_score(stalled.len() as u32, minutes, weight),
             reason,
             reason_msg: Some(reason_msg),
-            unblocks: unblocks_for(project, node),
+            unblocks: stalls.unblocks_for(node),
+            closed_step: None,
+            snoozed_until: None,
         });
     }
 
@@ -493,8 +701,12 @@ pub fn build_needs(project: &ProjectState, inputs: &RescueInputs<'_>) -> Vec<Nee
         if delivery.superseded_by.is_some() || delivery.review != ReviewStatus::Pending {
             continue;
         }
+        // The agent dropped the attempt that delivered it: nothing to review.
+        if inputs.dropped_attempts.contains(&delivery.attempt) {
+            continue;
+        }
         let weight = 2_u8;
-        let stalled = stalled_on(project, &delivery.node);
+        let stalled = stalls.stalled_on(&delivery.node);
         let since = inputs
             .event_ts
             .get(&delivery.id)
@@ -515,8 +727,20 @@ pub fn build_needs(project: &ProjectState, inputs: &RescueInputs<'_>) -> Vec<Nee
             project: project.summary.slug.clone(),
             node: Some(delivery.node.clone()),
             source: delivery.id.clone(),
-            question: format!("Review {}: does it do what you asked?", delivery.name),
-            question_msg: Some(Msg::new("need.q.review").text("name", delivery.name.clone())),
+            // Only a delivery that answers a decision was asked for.
+            question: if delivery.receipt.is_some() {
+                format!("Review {}: does it do what you asked?", delivery.name)
+            } else {
+                format!("Review {}", delivery.name)
+            },
+            question_msg: Some(
+                Msg::new(if delivery.receipt.is_some() {
+                    "need.q.review"
+                } else {
+                    "need.q.review_ready"
+                })
+                .text("name", delivery.name.clone()),
+            ),
             since,
             stalled_agents: stalled.len() as u32,
             waiting_minutes: minutes,
@@ -524,7 +748,9 @@ pub fn build_needs(project: &ProjectState, inputs: &RescueInputs<'_>) -> Vec<Nee
             score_x2: stack_score(stalled.len() as u32, minutes, weight),
             reason,
             reason_msg: Some(reason_msg),
-            unblocks: unblocks_for(project, &delivery.node),
+            unblocks: stalls.unblocks_for(&delivery.node),
+            closed_step: None,
+            snoozed_until: None,
         });
     }
 
@@ -558,10 +784,11 @@ impl crate::model::state::DecisionState {
 
 /// Distinct non-lost sessions stalled across all rows, for fleet-level counts.
 pub fn fleet_stalled(rows: &[NeedsYouItem], project: &ProjectState) -> u32 {
+    let stalls = Stalls::new(project);
     let mut sessions: BTreeSet<SessionId> = BTreeSet::new();
     for row in rows {
         if let Some(node) = &row.node {
-            sessions.extend(stalled_on(project, node));
+            sessions.extend(stalls.stalled_on(node));
         }
     }
     sessions.len() as u32
@@ -572,10 +799,11 @@ pub fn stalled_by_row(
     rows: &[NeedsYouItem],
     project: &ProjectState,
 ) -> BTreeMap<EventId, Vec<SessionId>> {
+    let stalls = Stalls::new(project);
     let mut map = BTreeMap::new();
     for row in rows {
         if let Some(node) = &row.node {
-            map.insert(row.source.clone(), stalled_on(project, node));
+            map.insert(row.source.clone(), stalls.stalled_on(node));
         }
     }
     map

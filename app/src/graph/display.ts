@@ -10,6 +10,7 @@
  * shows one line.
  */
 
+import { correctionReason } from "../state/claim";
 import { tx } from "../i18n";
 import type { FeatureState, GraphNode } from "../api/types";
 import type { IconName } from "../components/Icon";
@@ -25,6 +26,8 @@ export interface NodeDisplay {
   you: boolean;
   assumed: boolean;
   title: string;
+  /** Why the board corrected this step's status, when it did. */
+  corrected?: string;
 }
 
 /** Decision states that still wait for a human answer. */
@@ -116,7 +119,12 @@ export function nodeDisplay(node: GraphNode, feature: FeatureState | undefined):
   // A session ending only stops unfinished work; finished steps keep their state.
   const finished =
     feature.progress === "done" || feature.progress === "verified" || feature.progress === "dropped";
-  const stopped = feature.liveness === "lost" && !finished;
+  // The core's claim decides: a step whose claim ended is stopped, a quiet
+  // agent inside its ETA is still at work. Without a claim, liveness does.
+  const claim = feature.claim;
+  const stopped = !finished && (claim ? claim.state === "free" : feature.liveness === "lost");
+  const quiet = claim ? claim.state === "stalled" : feature.liveness === "quiet";
+  const corrected = feature.correction ? correctionReason(feature.correction) : undefined;
   const tainted = feature.basis === "tainted";
   const eta = etaText(feature);
   const gate =
@@ -131,7 +139,7 @@ export function nodeDisplay(node: GraphNode, feature: FeatureState | undefined):
   if (stopped) {
     dot = "stopped";
     icon = "alert-triangle";
-    sub = tx("rs.stopped");
+    sub = feature.correction?.rule === "silent" ? tx("dash.agent.abandoned_plain") : tx("rs.stopped");
   } else if (tainted) {
     dot = "tainted";
     icon = "refresh-cw";
@@ -141,17 +149,25 @@ export function nodeDisplay(node: GraphNode, feature: FeatureState | undefined):
     icon = "check";
     sub = tx("ov.verified_cap");
   } else if (feature.progress === "done") {
-    dot = "review";
-    icon = "package";
-    sub = tx("gd.review");
+    // A review still pending shows on the delivery's own node.
+    dot = "done";
+    icon = "check";
+    sub = tx("gd.done");
   } else if (feature.progress === "dropped") {
     dot = "dropped";
     icon = "x";
-    sub = tx("progress.dropped");
+    sub = feature.owner_drop ? tx("plan.dropped_by_you") : tx("progress.dropped");
+  } else if (feature.phase === "in_review") {
+    dot = "review";
+    icon = "package";
+    sub = tx("gd.review");
+  } else if (feature.phase === "sent_back") {
+    dot = "doing";
+    sub = tx("dl.rev.sent_back");
   } else if (
     feature.progress === "doing" &&
     feature.gate === "open" &&
-    feature.liveness === "quiet" &&
+    quiet &&
     !feature.paused
   ) {
     // The agent has said nothing for over 15 minutes.
@@ -177,6 +193,7 @@ export function nodeDisplay(node: GraphNode, feature: FeatureState | undefined):
     `basis ${feature.basis}`,
     `liveness ${feature.liveness}`,
     eta ? eta : "",
+    corrected ?? "",
   ]
     .filter(Boolean)
     .join(" · ");
@@ -189,15 +206,22 @@ export function nodeDisplay(node: GraphNode, feature: FeatureState | undefined):
     you: false,
     assumed,
     title,
+    ...(corrected ? { corrected } : {}),
   };
 }
 
 
-/** Whether the ambient radar may run on this node (motion still needs its gate). */
+/**
+ * Whether the ambient radar may run on this node (motion still needs its
+ * gate). A step delivered and waiting for the owner's review is not moving:
+ * the same rule as Moving now (`state/moving.ts`) and the core's
+ * `reduce::motion`.
+ */
 export function isRadarCandidate(feature: FeatureState | undefined): boolean {
   if (!feature) return false;
   return (
     feature.progress === "doing" &&
+    feature.phase !== "in_review" &&
     feature.gate === "open" &&
     feature.basis !== "tainted" &&
     feature.liveness === "live" &&

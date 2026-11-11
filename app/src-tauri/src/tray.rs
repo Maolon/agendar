@@ -6,7 +6,7 @@
 //! slowly fills itself in; when something needs you, it turns amber and pulses.
 //! The frames are drawn here (44×36 px, 22×18 pt @2x) so the animation needs no
 //! extra assets. With Motion off the glyph holds still: the amber step stays,
-//! steady.
+//! steady. With no project on the board all four steps are hollow.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -24,17 +24,29 @@ pub const TRAY_ID: &str = "agendar-tray";
 const IDLE: &[u8] = include_bytes!("../icons/tray-idle.png");
 #[cfg(target_os = "macos")]
 const NEEDS: &[u8] = include_bytes!("../icons/tray-needs.png");
+#[cfg(target_os = "macos")]
+const EMPTY: &[u8] = include_bytes!("../icons/tray-empty.png");
 #[cfg(not(target_os = "macos"))]
 const IDLE: &[u8] = include_bytes!("../icons/tray-idle-color.png");
 #[cfg(not(target_os = "macos"))]
 const NEEDS: &[u8] = include_bytes!("../icons/tray-needs-color.png");
+#[cfg(not(target_os = "macos"))]
+const EMPTY: &[u8] = include_bytes!("../icons/tray-empty-color.png");
 
 /// Whether the glyphs are template images on this platform.
 pub const TEMPLATE: bool = cfg!(target_os = "macos");
 
-/// The glyph for the current attention state.
-pub fn icon(needs: usize) -> Option<Image<'static>> {
-    Image::from_bytes(if needs > 0 { NEEDS } else { IDLE }).ok()
+/// The glyph for the current attention state: amber while something needs
+/// you, hollow while no project is on the board.
+pub fn icon(needs: usize, projects: usize) -> Option<Image<'static>> {
+    let bytes = if needs > 0 {
+        NEEDS
+    } else if projects == 0 {
+        EMPTY
+    } else {
+        IDLE
+    };
+    Image::from_bytes(bytes).ok()
 }
 
 /// Hover text for the tray icon.
@@ -79,19 +91,21 @@ pub fn title(working: usize) -> Option<String> {
     (working > 0).then(|| working.to_string())
 }
 
-/// The latest attention counts, read by the animator.
-static COUNTS: Mutex<(usize, usize)> = Mutex::new((0, 0));
+/// The latest attention counts (needs, working, projects), read by the
+/// animator. `None` until the host has looked, which keeps the idle glyph the
+/// tray starts with.
+static COUNTS: Mutex<Option<(usize, usize, usize)>> = Mutex::new(None);
 
 /// Switch the tray title and tooltip, and the glyph where it does not animate.
 /// Call on the main thread.
-pub fn apply<R: Runtime>(app: &AppHandle<R>, needs: usize, working: usize) {
-    *COUNTS.lock().unwrap_or_else(|poison| poison.into_inner()) = (needs, working);
+pub fn apply<R: Runtime>(app: &AppHandle<R>, needs: usize, working: usize, projects: usize) {
+    *COUNTS.lock().unwrap_or_else(|poison| poison.into_inner()) = Some((needs, working, projects));
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
         return;
     };
     // macOS frames come from the animator; elsewhere the static tile switches.
     if !cfg!(target_os = "macos")
-        && let Some(image) = icon(needs)
+        && let Some(image) = icon(needs, projects)
     {
         let _ = tray.set_icon(Some(image));
         let _ = tray.set_icon_as_template(TEMPLATE);
@@ -115,6 +129,8 @@ pub const PULSE_FRAME_MS: u64 = 300;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Glyph {
     Idle,
+    /// No project on the board: every step hollow.
+    Empty,
     /// The current step filling itself in.
     Working(u8),
     /// The amber current step at one pulse phase.
@@ -122,7 +138,13 @@ pub enum Glyph {
 }
 
 /// The frame to show `elapsed_ms` into the animation.
-pub fn glyph(needs: usize, working: usize, motion: bool, elapsed_ms: u64) -> Glyph {
+pub fn glyph(
+    needs: usize,
+    working: usize,
+    projects: usize,
+    motion: bool,
+    elapsed_ms: u64,
+) -> Glyph {
     if needs > 0 {
         if !motion {
             return Glyph::Needs(0);
@@ -134,13 +156,16 @@ pub fn glyph(needs: usize, working: usize, motion: bool, elapsed_ms: u64) -> Gly
         let frame = (elapsed_ms / WORK_FRAME_MS) % u64::from(WORK_FRAMES);
         return Glyph::Working(u8::try_from(frame).unwrap_or(0));
     }
+    if projects == 0 {
+        return Glyph::Empty;
+    }
     Glyph::Idle
 }
 
 /// How often the animator should look again for this frame.
 pub fn next_check(glyph: Glyph) -> Duration {
     match glyph {
-        Glyph::Idle => Duration::from_millis(500),
+        Glyph::Idle | Glyph::Empty => Duration::from_millis(500),
         Glyph::Working(_) => Duration::from_millis(WORK_FRAME_MS / 2),
         Glyph::Needs(_) => Duration::from_millis(PULSE_FRAME_MS / 2),
     }
@@ -165,7 +190,7 @@ const AMBER: [u8; 3] = [0xE8, 0x8E, 0x14];
 pub fn render(glyph: Glyph, dark: bool) -> (Vec<u8>, bool) {
     // How far the current step is filled, 0..=1 of its width.
     let fill = match glyph {
-        Glyph::Idle => 0.0,
+        Glyph::Idle | Glyph::Empty => 0.0,
         Glyph::Needs(_) => 1.0,
         // Fill over the first two thirds of the cycle, then hold full.
         Glyph::Working(frame) => {
@@ -201,6 +226,7 @@ pub fn render(glyph: Glyph, dark: bool) -> (Vec<u8>, bool) {
                 let solid = (0.5 - distance).clamp(0.0, 1.0);
                 let ring = ring(distance, OUTLINE);
                 match cell {
+                    _ if glyph == Glyph::Empty => ink_cover = ink_cover.max(ring),
                     0 | 1 => ink_cover = ink_cover.max(solid),
                     CURRENT if matches!(glyph, Glyph::Needs(_)) => amber_cover = solid,
                     CURRENT => {
@@ -250,9 +276,11 @@ pub fn spawn_animator(app: AppHandle, motion: impl Fn() -> bool + Send + 'static
         let mut dark = true;
         let mut theme_checked: Option<std::time::Instant> = None;
         loop {
-            let (needs, working) = *COUNTS.lock().unwrap_or_else(|poison| poison.into_inner());
+            let counts = *COUNTS.lock().unwrap_or_else(|poison| poison.into_inner());
             let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap_or(0);
-            let frame = glyph(needs, working, motion(), elapsed);
+            let frame = counts.map_or(Glyph::Idle, |(needs, working, projects)| {
+                glyph(needs, working, projects, motion(), elapsed)
+            });
             if matches!(frame, Glyph::Needs(_))
                 && theme_checked.is_none_or(|at| at.elapsed() >= Duration::from_secs(1))
             {
@@ -284,9 +312,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn both_glyphs_decode() {
+    fn every_glyph_decodes() {
         assert!(Image::from_bytes(IDLE).is_ok());
         assert!(Image::from_bytes(NEEDS).is_ok());
+        assert!(Image::from_bytes(EMPTY).is_ok());
     }
 
     #[test]
@@ -312,28 +341,34 @@ mod tests {
 
     #[test]
     fn the_frame_follows_attention_work_and_motion() {
-        assert_eq!(glyph(0, 0, true, 5_000), Glyph::Idle);
-        assert_eq!(glyph(0, 2, true, 0), Glyph::Working(0));
-        assert_eq!(glyph(0, 2, true, WORK_FRAME_MS * 3), Glyph::Working(3));
+        assert_eq!(glyph(0, 0, 1, true, 5_000), Glyph::Idle);
+        assert_eq!(glyph(0, 2, 2, true, 0), Glyph::Working(0));
+        assert_eq!(glyph(0, 2, 2, true, WORK_FRAME_MS * 3), Glyph::Working(3));
         assert_eq!(
-            glyph(0, 2, true, WORK_FRAME_MS * u64::from(WORK_FRAMES)),
+            glyph(0, 2, 2, true, WORK_FRAME_MS * u64::from(WORK_FRAMES)),
             Glyph::Working(0),
             "the sweep loops"
         );
         assert_eq!(
-            glyph(0, 2, false, 9_999),
+            glyph(0, 2, 2, false, 9_999),
             Glyph::Idle,
             "Motion off holds still"
         );
         assert_eq!(
-            glyph(1, 2, true, PULSE_FRAME_MS * 2),
+            glyph(1, 2, 2, true, PULSE_FRAME_MS * 2),
             Glyph::Needs(2),
             "needs wins"
         );
         assert_eq!(
-            glyph(1, 0, false, 9_999),
+            glyph(1, 0, 1, false, 9_999),
             Glyph::Needs(0),
             "a steady amber step"
+        );
+        assert_eq!(glyph(0, 0, 0, true, 5_000), Glyph::Empty, "no project");
+        assert_eq!(
+            glyph(1, 0, 0, true, 0),
+            Glyph::Needs(0),
+            "an item still needs you"
         );
     }
 
@@ -373,6 +408,16 @@ mod tests {
         let (held, _) = render(Glyph::Working(WORK_FRAMES - 1), true);
         assert_eq!(alpha_at(&held, 29, 18), 255, "then holds full");
         assert_eq!(alpha_at(&held, 38, 18), 0, "the planned step never fills");
+    }
+
+    #[test]
+    fn with_no_project_every_step_is_hollow() {
+        let (empty, template) = render(Glyph::Empty, true);
+        assert!(template);
+        for (outline, middle) in [(2, 5), (13, 16), (24, 27), (35, 38)] {
+            assert_eq!(alpha_at(&empty, outline, 18), 255, "outlined at {outline}");
+            assert_eq!(alpha_at(&empty, middle, 18), 0, "hollow at {middle}");
+        }
     }
 
     #[test]

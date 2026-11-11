@@ -9,93 +9,13 @@ use serde_json::{Value, json};
 use agendar_core::error::{AgendarError, ErrorCode, Result};
 use agendar_core::model::{
     DecisionState, FeatureState, NeedsYouItem, ProjectSlug, ProjectState, Sha256, State, UtcTime,
-    canonical_json,
 };
 use agendar_core::reduce::activity::ActivityItem;
 use agendar_core::reduce::stats::ProjectStats;
 
-/// Lowercase SHA256 of compact canonical JSON.
-pub fn revision(value: Value) -> Sha256 {
-    Sha256::from_bytes(canonical_json(&value).as_bytes())
-}
-
-/// Prepare-token decision revision: card, policy and effective receipt.
-pub fn decision_revision(
-    project: &ProjectSlug,
-    decision: &DecisionState,
-    policy: &Sha256,
-) -> Sha256 {
-    let receipt = decision.effective_receipt.as_ref().map_or_else(
-        || Value::String("absent".to_owned()),
-        |id| Value::String(id.as_str().to_owned()),
-    );
-    let card = serde_json::to_value(&decision.card).unwrap_or(Value::Null);
-    revision(json!([
-        "decision",
-        project.as_str(),
-        decision.id.as_str(),
-        card,
-        policy,
-        receipt
-    ]))
-}
-
-/// A rescue/attention revision for the row the frontend displays.
-pub fn need_revision(
-    need: &NeedsYouItem,
-    decision: Option<&DecisionState>,
-    policy: &Sha256,
-) -> Sha256 {
-    match decision {
-        Some(decision) => decision_revision(&need.project, decision, policy),
-        None => revision(json!([
-            "need",
-            need.project.as_str(),
-            need.id,
-            need.kind.as_str(),
-            need.source.as_str(),
-            need.node.as_ref().map(|node| node.as_str()),
-        ])),
-    }
-}
-
-/// Delivery revision: identity, receipt binding, every projected Seen result and
-/// the current review frontier. A new observation or review changes this token.
-pub fn delivery_revision(
-    project: &ProjectSlug,
-    delivery: &agendar_core::model::DeliveryState,
-    current_receipt: Option<&agendar_core::model::EventId>,
-) -> Sha256 {
-    let criteria: Vec<Value> = delivery
-        .criteria
-        .iter()
-        .map(|criterion| {
-            json!({
-                "criterion": criterion.criterion.id,
-                "agent": criterion.agent_result,
-                "seen": criterion.seen_result,
-                "observation": criterion.observation,
-                "history": criterion.observation_history,
-                "frontier": criterion.observation_frontier,
-                "conflict": criterion.conflict,
-            })
-        })
-        .collect();
-    revision(json!([
-        "delivery",
-        project.as_str(),
-        delivery.id.as_str(),
-        delivery.node.as_str(),
-        delivery.attempt.as_str(),
-        delivery.receipt.as_str(),
-        current_receipt.map(|id| id.as_str()),
-        delivery.superseded_by.as_ref().map(|id| id.as_str()),
-        delivery.review,
-        delivery.review_history,
-        delivery.review_frontier,
-        criteria,
-    ]))
-}
+/// The revisions answers, rescues and reviews are bound to are shared with
+/// every host.
+pub use agendar_core::guard::{decision_revision, delivery_revision, need_revision, revision};
 
 fn graph_revision(project: &ProjectSlug, feature: &FeatureState) -> Sha256 {
     let source = feature.field_sources.get("depends_on");
@@ -132,17 +52,22 @@ fn decision_value(
     }
 }
 
+/// The row's revision, and for a row with a default time `snooze_limit`: the
+/// latest time a snooze may hide it (the core's rule).
 fn need_value(
     need: &NeedsYouItem,
     decision: Option<&DecisionState>,
-    policy: &Sha256,
+    project: &ProjectState,
     value: &mut Value,
 ) {
     if let Value::Object(object) = value {
         object.insert(
             "revision".to_owned(),
-            json!(need_revision(need, decision, policy)),
+            json!(need_revision(need, decision, &project.policy.revision)),
         );
+        if let Some(limit) = agendar_core::reduce::snooze::limit_in(project, need) {
+            object.insert("snooze_limit".to_owned(), json!(limit));
+        }
     }
 }
 
@@ -172,11 +97,7 @@ pub fn project_value(project: &ProjectState) -> Result<Value> {
     }
     let mut deliveries = serde_json::Map::new();
     for (id, delivery) in &project.deliveries {
-        let current_receipt = project
-            .receipts
-            .get(&delivery.receipt)
-            .and_then(|receipt| project.decisions.get(&receipt.ask))
-            .and_then(|decision| decision.effective_receipt.as_ref());
+        let current_receipt = agendar_core::guard::current_receipt(project, delivery);
         let mut item = serde_json::to_value(delivery).unwrap_or(Value::Null);
         if let Value::Object(object) = &mut item {
             object.insert(
@@ -190,7 +111,7 @@ pub fn project_value(project: &ProjectState) -> Result<Value> {
     for need in &project.needs_you {
         let decision = project.decisions.get(&need.source);
         let mut item = serde_json::to_value(need).unwrap_or(Value::Null);
-        need_value(need, decision, &policy, &mut item);
+        need_value(need, decision, project, &mut item);
         needs.push(item);
     }
     if let Value::Object(object) = &mut value {
@@ -345,14 +266,13 @@ pub fn state_value(state: &State) -> Result<Value> {
 pub fn all_needs(state: &State) -> Vec<Value> {
     let mut rows: Vec<(&NeedsYouItem, Value)> = Vec::new();
     for project in state.projects.values() {
-        let policy = project.policy.revision.clone();
         for need in &project.needs_you {
             let decision = project.decisions.get(&need.source);
             let mut value = match serde_json::to_value(need) {
                 Ok(value) => value,
                 Err(_) => continue,
             };
-            need_value(need, decision, &policy, &mut value);
+            need_value(need, decision, project, &mut value);
             rows.push((need, value));
         }
     }

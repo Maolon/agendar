@@ -9,9 +9,11 @@
 //! This module only declares its siblings and re-exports the public API:
 //! `paths` owns the Vault root, manifest and contained paths, `writer` owns the
 //! append/seal protocol and its clocks, `reader` owns complete-line reads and
-//! `blobs` owns verified create-only publication.
+//! `blobs` owns verified create-only publication. `listing` only reads file
+//! names and sizes for the usage report.
 
 pub mod blobs;
+pub mod listing;
 pub mod paths;
 pub mod reader;
 pub mod writer;
@@ -28,7 +30,8 @@ pub use paths::{
 };
 pub use reader::{LineRecord, MAX_BATCH_BYTES, MAX_LINE_BYTES, TailBatch, read_complete_lines};
 pub use writer::{
-    AppendResult, Clock, EventDraft, IdSource, SEGMENT_SEAL_THRESHOLD, SealReason, SystemClock,
-    UlidIdSource, WriterKey, append_event, append_event_reserved, recover_writer, seal_writer,
-    segment_would_seal, writer_journal_path, writer_lock_path,
+    AppendResult, Clock, EventDraft, Following, IdSource, SEGMENT_SEAL_THRESHOLD, SealReason,
+    SystemClock, UlidIdSource, WriterKey, append_event, append_event_reserved,
+    append_events_reserved, recover_writer, seal_writer, segment_would_seal, segment_write_calls,
+    writer_journal_path, writer_lock_path,
 };

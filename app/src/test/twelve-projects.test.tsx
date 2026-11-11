@@ -25,7 +25,6 @@ describe("twelve-project fixture", () => {
       <Sidebar
         snapshot={snapshot}
         selection={null}
-        filter=""
         quietOpen={false}
         onSelect={vi.fn()}
         onToggleQuiet={vi.fn()}
@@ -37,15 +36,16 @@ describe("twelve-project fixture", () => {
     await userEvent.click(screen.getByRole("button", { name: "4 more quiet" }));
   });
 
-  it("opens the fixture app with its twelve projects and the brief visuals", async () => {
+  it("opens the fixture app with its twelve projects and every home section", async () => {
     const client = createClient(createFixtureTransport(), "fixture");
     const store = new SnapshotStore(client);
     render(<App client={client} store={store} surface="main" />);
 
     await screen.findByRole("heading", { name: /Since you last looked/ });
     expect(document.querySelectorAll("[data-row^='project:']")).toHaveLength(8);
-    expect(screen.getAllByTestId("brief-budget-dots").length).toBeGreaterThan(0);
-    expect(screen.getByTestId("brief-ring")).toBeInTheDocument();
+    for (const id of ["needs", "moving", "stalled", "done", "next"]) {
+      expect(document.querySelector(`[data-dash="${id}"]`)).not.toBeNull();
+    }
 
     const collapse = screen.getByRole("button", { name: "4 more quiet" });
     await userEvent.click(collapse);

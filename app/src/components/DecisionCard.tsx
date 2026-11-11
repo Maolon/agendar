@@ -1,4 +1,5 @@
 import { tx, type MessageKey } from "../i18n";
+import { shortcut } from "../state/shortcut";
 import { useState, type CSSProperties, type ReactNode } from "react";
 import { formatEtaFinish, formatRemaining, OWN_ANSWER_MAX, OWN_OPTION, ownOption } from "../api/format";
 import type {
@@ -7,6 +8,7 @@ import type {
   Listening,
   Mode,
   ProjectSlug,
+  ReportState,
   UtcTime,
 } from "../api/types";
 import { Countdown } from "./Countdown";
@@ -16,7 +18,7 @@ import { NeedSnooze } from "./NeedSnooze";
 import { OptionCard } from "./OptionCard";
 import { ImageCompare, OptionPicture } from "./OptionImages";
 import { ProjectAvatar } from "./ProjectAvatar";
-import { ReportLink } from "./Reports";
+import { AttachedReport } from "./Reports";
 import { Receipt } from "./Receipt";
 
 export interface PrimaryAction {
@@ -65,6 +67,8 @@ interface DecisionCardProps {
   receiptSaved: boolean;
   /** Reachable feature labels from the graph, in reading order. */
   unblockLabels: string[];
+  /** The published report whose document the card links, for its title and summary. */
+  reportInfo?: ReportState | undefined;
   /** Assumption strip for this decision, when the agent proceeded early. */
   assumption?: ReactNode;
   onSeeGraph?: () => void;
@@ -91,9 +95,10 @@ function bots(count: number) {
 }
 
 /**
- * Decision anatomy: breadcrumb, question, strip, unblocks,
- * grounded ETA trade-off, already-checked facts, option cards, receipt preview
- * and the guarded primary action. The primary label is the chosen option, never
+ * Decision anatomy: breadcrumb, question, strip, the linked report, option
+ * cards with your own answer as one more choice, the recommendation, quiet
+ * context rows (unblocks, ETA trade-off, already-checked facts), receipt
+ * preview and the guarded primary action. The primary label is the chosen option, never
  * "Answer".
  */
 export function DecisionCard({
@@ -117,6 +122,7 @@ export function DecisionCard({
   receiptTag,
   receiptSaved,
   unblockLabels,
+  reportInfo,
   assumption,
   onSeeGraph,
   primary,
@@ -180,8 +186,9 @@ export function DecisionCard({
           chosenLabel={card.options.find((option) => option.id === card.recommended.option)?.label}
         />
       </div>
-      {/* The choices come right after the question so they show at any window
-          height; the context that explains them follows. */}
+      {/* A linked report is the reason behind the question: it is read before
+          the choices. Everything else that explains them follows. */}
+      {card.report ? <AttachedReport project={project} blob={card.report} info={reportInfo} /> : null}
       <div
         className="opts"
         style={{ "--opt-cols": String(columns) } as CSSProperties}
@@ -255,34 +262,6 @@ export function DecisionCard({
           onClose={() => setViewing(null)}
         />
       ) : null}
-      {card.report ? (
-        <div className="card-report">
-          <span>{tx("dc.report")}</span>
-          <ReportLink project={project} blob={card.report} label={tx("dc.open_browser")} />
-        </div>
-      ) : null}
-      {assumption}
-      {unblockLabels.length ? (
-        <div className="unblocks">
-          <Icon name="git-branch" />
-          <span>
-            {tx("dc.unblocks")} <b>{unblockLabels[0]}</b>
-            {unblockLabels.length > 1 ? tx("dc.then", { rest: unblockLabels.slice(1).join(tx("dc.and")) }) : ""}
-          </span>
-          {onSeeGraph ? (
-            <button type="button" className="link" onClick={onSeeGraph}>
-              {tx("dc.see_graph")}
-            </button>
-          ) : null}
-        </div>
-      ) : null}
-      {etaLine ? (
-        <div className="eta">
-          <Icon name="clock" />
-          <span>{etaLine}</span>
-        </div>
-      ) : null}
-      <Facts facts={card.already_checked} />
       <div className="recommendation">
         <Icon name="star" />
         <span>
@@ -291,6 +270,32 @@ export function DecisionCard({
           {tx("dc.confidence", { level: tx(`dc.level.${card.recommended.confidence}`) })} — {card.recommended.because}
         </span>
       </div>
+      {assumption}
+      {unblockLabels.length || etaLine || card.already_checked.length ? (
+        <div className="dc-details">
+          {unblockLabels.length ? (
+            <div className="unblocks">
+              <Icon name="git-branch" />
+              <span>
+                {tx("dc.unblocks")} <b>{unblockLabels[0]}</b>
+                {unblockLabels.length > 1 ? tx("dc.then", { rest: unblockLabels.slice(1).join(tx("dc.and")) }) : ""}
+              </span>
+              {onSeeGraph ? (
+                <button type="button" className="link" onClick={onSeeGraph}>
+                  {tx("dc.see_graph")}
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+          {etaLine ? (
+            <div className="eta">
+              <Icon name="clock" />
+              <span>{etaLine}</span>
+            </div>
+          ) : null}
+          <Facts facts={card.already_checked} />
+        </div>
+      ) : null}
       {selectedOption ? (
         <Receipt
           preview={{
@@ -341,7 +346,7 @@ export function DecisionCard({
           >
             {pending ? tx("dc.saving") : primary.label}
             {primary.kbd && !pending ? (
-              <kbd>{primary.kbd === "enter" ? "↵" : "⌘↵"}</kbd>
+              <kbd>{shortcut(primary.kbd === "enter" ? "enter" : "mod+enter")}</kbd>
             ) : null}
           </button>
         </div>

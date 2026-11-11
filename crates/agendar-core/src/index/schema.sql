@@ -10,7 +10,7 @@ CREATE TABLE meta (
   value TEXT NOT NULL
 ) STRICT;
 -- meta keys: vault_id, schema_version, reducer_version, event_set_digest,
--- generation (decimal), evaluated_at (UTC), last_scan_at (UTC).
+-- source_digest, generation (decimal), evaluated_at (UTC), last_scan_at (UTC).
 
 CREATE TABLE source_files (
   path TEXT PRIMARY KEY,                    -- Vault-relative, slash separated

@@ -157,6 +157,11 @@ export function Decision({
         receiptTag={answer.confirm ? tx("dv.prepared") : tx("dv.preview")}
         receiptSaved={false}
         unblockLabels={unblockLabels}
+        reportInfo={
+          card.report
+            ? project.reports?.find((report) => report.report.sha256 === card.report?.sha256)
+            : undefined
+        }
         assumption={
           <Assumptions
             project={project}

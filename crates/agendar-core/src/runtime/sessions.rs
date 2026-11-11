@@ -8,10 +8,10 @@
 //! stale whole journal, so two concurrent registrations cannot lose each other.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_os = "ios"))]
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
 use crate::error::{AgendarError, ErrorCode, Result};
@@ -47,10 +47,55 @@ pub struct OperationRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reserved_event: Option<EventId>,
     pub draft: EventDraft,
+    /// The events the command writes after `draft`, in order, each with the
+    /// ID reserved for it. Absent for a command that writes one event, so
+    /// such a record keeps the shape every version reads.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub following: Vec<ReservedFollower>,
     pub status: OperationStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
     pub updated_at: UtcTime,
+}
+
+/// One later event of a reserved operation: its reserved ID and its draft as
+/// first built, so a retry writes or finds exactly that event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReservedFollower {
+    pub reserved_event: EventId,
+    pub draft: EventDraft,
+}
+
+/// One request-id journal entry. A record this version cannot read (a newer
+/// Agendar on the same computer wrote fields it does not know) stays as it was
+/// written: the file keeps its shape for every version, the newer one still
+/// finds its record, and this one refuses only a retry of that request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum OperationEntry {
+    Known(Box<OperationRecord>),
+    Foreign(serde_json::Value),
+}
+
+impl OperationEntry {
+    /// Committed time, for pruning; a foreign record answers from its raw fields.
+    fn committed_at(&self) -> Option<UtcTime> {
+        match self {
+            Self::Known(record) => {
+                (record.status == OperationStatus::Committed).then_some(record.updated_at)
+            }
+            Self::Foreign(value) => {
+                if value.get("status").and_then(serde_json::Value::as_str) != Some("committed") {
+                    return None;
+                }
+                value
+                    .get("updated_at")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|text| UtcTime::parse(text).ok())
+            }
+        }
+    }
 }
 
 /// One local harness session registration.
@@ -137,6 +182,12 @@ pub struct DeliveryAttempt {
     /// steward `delivered` event so a restart never re-enqueues the same packet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queued: Option<crate::adapters::QueuedOutcome>,
+    /// What wrote the packet to the agent: a hook event (`PostToolUse`,
+    /// `UserPromptSubmit`, `SessionStart`, `Stop`, `rewake`) or a command
+    /// (`inbox`, `wait`). A trace for incidents only: a sighting is not an
+    /// ack, and nothing decides on this field. Absent in older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
 
 /// A local wait lease. It annotates "waiting now" for this host only and never
@@ -161,7 +212,7 @@ pub struct RuntimeState {
     pub delivery_obligations: BTreeMap<String, serde_json::Value>,
     pub delivery_attempts: BTreeMap<String, DeliveryAttempt>,
     pub wait_leases: BTreeMap<String, WaitLease>,
-    pub operations: BTreeMap<String, OperationRecord>,
+    pub operations: BTreeMap<String, OperationEntry>,
 }
 
 impl Default for RuntimeState {
@@ -232,6 +283,55 @@ impl RuntimeState {
             .map(|(id, session)| (id.clone(), session))
     }
 
+    /// The live registration of one harness session of one process. When
+    /// several match (a conversation was bound to an older session after a
+    /// newer one was minted for the same id), the newest (re)registration wins.
+    pub fn live_session(
+        &self,
+        project: &ProjectSlug,
+        harness: Harness,
+        harness_session_id: &str,
+        pid: u32,
+        process_start: u64,
+    ) -> Option<SessionId> {
+        self.sessions
+            .iter()
+            .filter(|(_, session)| {
+                session.matches_identity(project, harness, harness_session_id, pid, process_start)
+            })
+            .max_by(|left, right| {
+                (left.1.registered_at.canonical(), left.0.as_str())
+                    .cmp(&(right.1.registered_at.canonical(), right.0.as_str()))
+            })
+            .map(|(id, _)| id.clone())
+    }
+
+    /// The live sessions one harness process registered, oldest
+    /// (re)registration first.
+    pub fn process_sessions(
+        &self,
+        harness: Harness,
+        pid: u32,
+        process_start: u64,
+    ) -> Vec<SessionId> {
+        let mut found: Vec<(&SessionId, &LocalSession)> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| {
+                session.harness == harness
+                    && session.pid == pid
+                    && session.process_start == process_start
+                    && !session.lost
+                    && !session.sealed
+            })
+            .collect();
+        found.sort_by(|left, right| {
+            (left.1.registered_at.canonical(), left.0.as_str())
+                .cmp(&(right.1.registered_at.canonical(), right.0.as_str()))
+        });
+        found.into_iter().map(|(id, _)| id.clone()).collect()
+    }
+
     /// A registered, unsealed session.
     pub fn registered(&self, session: &SessionId) -> Option<&LocalSession> {
         self.sessions
@@ -254,8 +354,7 @@ impl RuntimeState {
         let mut committed: Vec<(String, UtcTime)> = self
             .operations
             .iter()
-            .filter(|(_, record)| record.status == OperationStatus::Committed)
-            .map(|(key, record)| (key.clone(), record.updated_at))
+            .filter_map(|(key, entry)| entry.committed_at().map(|at| (key.clone(), at)))
             .collect();
         committed.sort_by(|left, right| right.1.cmp(&left.1));
         let mut removed = std::collections::BTreeSet::new();
@@ -317,11 +416,21 @@ pub fn new_event_id() -> Result<EventId> {
 ///
 /// `sysinfo` reports start time as seconds since boot; adding the boot time
 /// turns it into a value comparable across processes and restarts.
+///
+/// iOS has no process table an app may read (and a mobile client hosts no
+/// agent sessions), so there every process is unobservable.
+#[cfg(not(target_os = "ios"))]
 pub fn process_identity(pid: u32) -> Option<u64> {
     let mut system = System::new();
     system.refresh_processes(ProcessesToUpdate::All, true);
     let process = system.process(Pid::from_u32(pid))?;
     Some(System::boot_time().saturating_add(process.start_time()))
+}
+
+/// See the desktop variant: no process is observable on iOS.
+#[cfg(target_os = "ios")]
+pub fn process_identity(_pid: u32) -> Option<u64> {
+    None
 }
 
 /// Parent pid and executable/name basename of one process.
@@ -332,6 +441,7 @@ pub fn process_parent(pid: u32) -> Option<(u32, String)> {
 /// Like [`process_parent`], plus the script a runtime (`node`, `bun`, `deno`)
 /// runs, from the parent's second argument: npm-installed agents show up as
 /// `node …/cli.js` on every platform.
+#[cfg(not(target_os = "ios"))]
 fn process_parent_with_script(pid: u32) -> Option<(u32, String, Option<String>)> {
     let mut system = System::new();
     system.refresh_processes(ProcessesToUpdate::All, true);
@@ -340,7 +450,7 @@ fn process_parent_with_script(pid: u32) -> Option<(u32, String, Option<String>)>
     let parent_process = system.process(parent)?;
     let name = parent_process
         .exe()
-        .and_then(Path::file_name)
+        .and_then(std::path::Path::file_name)
         .map(|name| name.to_string_lossy().into_owned())
         .or_else(|| Some(parent_process.name().to_string_lossy().into_owned()))?;
     let script = parent_process
@@ -348,6 +458,12 @@ fn process_parent_with_script(pid: u32) -> Option<(u32, String, Option<String>)>
         .get(1)
         .map(|argument| argument.to_string_lossy().replace('\\', "/"));
     Some((parent.as_u32(), name, script))
+}
+
+/// No process ancestry is observable on iOS.
+#[cfg(target_os = "ios")]
+fn process_parent_with_script(_pid: u32) -> Option<(u32, String, Option<String>)> {
+    None
 }
 
 /// What identifies one harness's process: executable names (without `.exe`)
@@ -463,5 +579,71 @@ mod harness_process_tests {
                 "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js"
             )
         ));
+    }
+}
+
+#[cfg(test)]
+mod operation_tests {
+    use super::*;
+
+    #[test]
+    fn a_foreign_operation_round_trips_unchanged_and_ages_out_like_any_other() {
+        let foreign = serde_json::json!({
+            "command": "report",
+            "status": "committed",
+            "updated_at": "2026-01-01T00:00:00.000Z",
+            "from_the_future": true
+        });
+        let fresh = serde_json::json!({
+            "command": "report",
+            "status": "committed",
+            "updated_at": "2026-03-01T00:00:00.000Z",
+            "from_the_future": true
+        });
+        let mut runtime = RuntimeState::default();
+        runtime
+            .operations
+            .insert("s/old".to_owned(), OperationEntry::Foreign(foreign.clone()));
+        runtime
+            .operations
+            .insert("s/new".to_owned(), OperationEntry::Foreign(fresh.clone()));
+
+        let text = serde_json::to_string(&runtime).expect("serialize");
+        let back: RuntimeState = serde_json::from_str(&text).expect("parse");
+        assert_eq!(back.operations["s/old"], OperationEntry::Foreign(foreign));
+
+        let mut pruned = back;
+        pruned.prune(UtcTime::parse("2026-03-02T00:00:00.000Z").expect("now"));
+        assert!(
+            !pruned.operations.contains_key("s/old"),
+            "older than a week"
+        );
+        assert_eq!(pruned.operations["s/new"], OperationEntry::Foreign(fresh));
+    }
+}
+
+#[cfg(test)]
+mod delivery_attempt_tests {
+    use super::*;
+
+    #[test]
+    fn an_attempt_written_before_the_via_field_still_loads_and_is_rewritten_unchanged() {
+        let packet = Sha256::from_bytes(b"packet");
+        let old = serde_json::json!({
+            "packet": packet,
+            "session": "00000000000000000000000101",
+            "outcome": "accepted",
+            "delivered_at": "2026-11-10T17:22:25.877Z",
+        });
+        let attempt: DeliveryAttempt = serde_json::from_value(old.clone()).expect("old attempt");
+        assert_eq!(attempt.via, None);
+        assert_eq!(serde_json::to_value(&attempt).expect("json"), old);
+
+        let mut traced = attempt;
+        traced.via = Some("PostToolUse".to_owned());
+        let value = serde_json::to_value(&traced).expect("json");
+        assert_eq!(value["via"], "PostToolUse");
+        let back: DeliveryAttempt = serde_json::from_value(value).expect("traced attempt");
+        assert_eq!(back, traced);
     }
 }

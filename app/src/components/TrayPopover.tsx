@@ -1,4 +1,5 @@
 import { needQuestion } from "../i18n/msg";
+import { shortcut } from "../state/shortcut";
 import { tx } from "../i18n";
 import { useRef, useState } from "react";
 import { errorCode, isApiError } from "../api/client";
@@ -15,13 +16,17 @@ import type {
 } from "../api/types";
 import { useKeyboard } from "../hooks/useKeyboard";
 import { POPOVER_GLASS, useGlassRegions, useWindowActive } from "../hooks/useWindowChrome";
-import { agentsLine, etaText, idleAgents, workingAgents } from "../state/project";
+import { agentCounts, agentsLine, etaText, totalAgents, workingAgents } from "../state/project";
+import { isMoving as stepMoving, isStalled as stepStalled } from "../state/moving";
 import { Icon, type IconName } from "./Icon";
 import { NeedDismiss, NeedSnooze } from "./NeedSnooze";
 import { AppLogo } from "./BrandMark";
+import { updateAvailable } from "./FootStatus";
+import { useEnvironment } from "../state/motion";
 import { ProjectAvatar } from "./ProjectAvatar";
 import { PresenceRows } from "./PresenceRows";
 import { ProjectTrack } from "./Sidebar";
+import { isActiveNeed } from "../state/claim";
 
 const KIND_ICON: Record<NeedsYouItem["kind"], IconName> = {
   decide: "git-branch",
@@ -61,9 +66,20 @@ function localClock(ts: string): string {
 
 const PROGRESS_ROWS = 4;
 
-/** Something happens in this project now: a question for you, or an agent on a step. */
+/** The project needs the owner: a question for you, or an agent waiting on your answer. */
+function needsOwner(project: ProjectState): boolean {
+  return project.summary.needs_count > 0 || agentCounts(project).waiting > 0;
+}
+
+/** Something happens in this project now: it needs you, or an agent is on a moving step. */
 function isMoving(project: ProjectState): boolean {
-  return project.summary.needs_count > 0 || workingAgents(project) > 0;
+  return needsOwner(project) || workingAgents(project) > 0;
+}
+
+/** Connected agents that move nothing and ask nothing: stalled on their step, or idle. */
+function restingAgents(project: ProjectState): number {
+  const counts = agentCounts(project);
+  return counts.stalled + counts.idle;
 }
 
 function projectTitle(snapshot: Snapshot, slug: string): string {
@@ -84,22 +100,22 @@ function TrayProgress({
   rows?: number;
 }) {
   const projects = Object.values(snapshot.state.projects).filter((project) => !project.summary.archived);
-  const doing = (project: ProjectState) =>
-    Object.values(project.features).filter(
-      (feature) => feature.progress === "doing" && feature.liveness === "live",
-    );
+  // The step the row names is one Now lists under Moving now.
+  const doing = (project: ProjectState) => Object.values(project.features).filter(stepMoving);
   const moving = projects
     .filter(isMoving)
     .sort(
       (a, b) =>
         b.summary.needs_count - a.summary.needs_count ||
+        Number(needsOwner(b)) - Number(needsOwner(a)) ||
         workingAgents(b) - workingAgents(a) ||
         a.summary.title.localeCompare(b.summary.title),
     );
-  // Then projects whose agent is connected but on no step: their open steps
-  // are waiting for someone, which is worth seeing next to the progress.
+  // Then projects whose agent is connected but moving no step (idle, or its
+  // step stalled): their open steps are waiting for someone, which is worth
+  // seeing next to the progress.
   const idle = projects
-    .filter((project) => !isMoving(project) && idleAgents(project) > 0)
+    .filter((project) => !isMoving(project) && restingAgents(project) > 0)
     .sort((a, b) => a.summary.title.localeCompare(b.summary.title));
   const shown = [...moving, ...idle].slice(0, rows);
   const more = projects.length - shown.length;
@@ -113,13 +129,23 @@ function TrayProgress({
         ).length;
         const current = doing(project)[0];
         const open = features.length - finished;
+        // A connected agent whose step stalled is not idle: the row names the step.
+        const counts = agentCounts(project);
+        const stuck =
+          !current && counts.stalled > 0
+            ? features.find((feature) => stepStalled(feature) && feature.liveness === "live")
+            : undefined;
         const line = current
           ? [current.title, etaText(current)].filter(Boolean).join(" · ")
           : project.summary.needs_count
             ? tx("tray.waiting", { n: project.summary.needs_count })
-            : open === 1
-              ? tx("tray.idle.one")
-              : tx("tray.idle.other", { n: open });
+            : counts.waiting > 0
+              ? (agentsLine({ working: 0, stalled: 0, waiting: counts.waiting, idle: 0 }) ?? "")
+              : stuck
+                ? `${stuck.title} · ${tx("dash.sec.stalled")}`
+                : open === 1
+                  ? tx("tray.idle.one")
+                  : tx("tray.idle.other", { n: open });
         return (
           <button
             key={project.summary.slug}
@@ -181,11 +207,22 @@ export function TrayPopover({
   // snapshot drops them, so the next question moves up for its own approve.
   const [approved, setApproved] = useState<ReadonlySet<string>>(() => new Set());
   const anchor = snapshot.state.evaluated_at;
-  const snoozed = snapshot.preferences.snoozed;
+  const latest = updateAvailable(snapshot) ? snapshot.update!.latest! : null;
+  const { reduced } = useEnvironment();
+  const animate = !reduced && snapshot.preferences.motion !== false;
+  function openAbout(): void {
+    void client
+      .showMain({ view: "about" })
+      .catch(() => undefined)
+      .finally(() => {
+        void client.hidePopover().catch(() => undefined);
+      });
+  }
   const active = snapshot.needs.filter((need) => {
+    if (!isActiveNeed(need)) return false;
     if (approved.has(need.source)) return false;
     if (snapshot.preferences.dismissed?.includes(need.id)) return false;
-    const until = snoozed[need.id];
+    const until = need.snoozed_until;
     return !until || Date.parse(until) <= Date.parse(anchor);
   });
   const eligible = active.filter((need) => {
@@ -284,17 +321,17 @@ export function TrayPopover({
   });
 
   const projects = Object.values(snapshot.state.projects).filter((project) => !project.summary.archived);
-  const working = projects.reduce((total, project) => total + workingAgents(project), 0);
-  const idle = projects.reduce((total, project) => total + idleAgents(project), 0);
+  const agents = totalAgents(projects);
+  const working = agents.working;
   const status = [
-    agentsLine(working, idle) ?? tx("agents.none"),
+    agentsLine(agents) ?? tx("agents.none"),
     active.length
       ? active.length === 1
         ? tx("tray.needs.one")
         : tx("tray.needs.other", { n: active.length })
       : tx("tray.nothing"),
   ].join(" · ");
-  const hasProgress = projects.some((project) => isMoving(project) || idleAgents(project) > 0);
+  const hasProgress = projects.some((project) => isMoving(project) || restingAgents(project) > 0);
 
   return (
     <div
@@ -379,7 +416,7 @@ export function TrayPopover({
                       disabled={!canMutate || pending}
                     >
                       {pending ? tx("tray.saving") : tx("tray.approve")}
-                      <kbd>↵</kbd>
+                      <kbd>{shortcut("enter")}</kbd>
                     </button>
                   </div>
                 </div>
@@ -417,9 +454,23 @@ export function TrayPopover({
         )}
       </div>
       <footer className="pop-foot">
-        <span className="faint" title={tx("tray.as_of", { ts: anchor })}>
-          {pending ? tx("tray.saving") : tx("tray.updated", { t: localClock(anchor) })}
-        </span>
+        {latest && !pending ? (
+          // A newer release replaces the "Updated" time, as in the sidebar;
+          // it opens Settings › About in the main window.
+          <button
+            type="button"
+            className={animate ? "foot-face foot-pill pop-update foot-in" : "foot-face foot-pill pop-update"}
+            title={`${tx("update.available", { version: latest })} · ${tx("tray.updated", { t: localClock(anchor) })}`}
+            onClick={openAbout}
+          >
+            <Icon name="package" />
+            <span className="foot-text">{tx("update.tag", { version: latest })}</span>
+          </button>
+        ) : (
+          <span className="faint" title={tx("tray.as_of", { ts: anchor })}>
+            {pending ? tx("tray.saving") : tx("tray.updated", { t: localClock(anchor) })}
+          </span>
+        )}
         <button type="button" className="btn" onClick={() => onOpen(null)}>
           {tx("tray.open_app")}
         </button>

@@ -10,7 +10,7 @@ import { liveAssumptions } from "../state/assumptions";
 import { useProjectGraphs } from "../state/graph";
 import type { UnblockPlay } from "../state/ui";
 import { Assumptions } from "../components/Assumptions";
-import { EvidenceCard } from "../components/EvidenceCard";
+import { EvidenceCards } from "../components/EvidenceCard";
 import { ArchiveToggle, FeatureEditor, GoalEditor } from "../components/Agenda";
 import { graphNodeElementId } from "../components/Graph";
 import { ActivityFeed } from "../components/ActivityFeed";
@@ -18,14 +18,20 @@ import { ReportCards } from "../components/Reports";
 import { Fold } from "../components/Fold";
 import { NowCards } from "../components/NowCards";
 import { useSnooze } from "../state/snooze";
+import { isActiveNeed, isInfoNeed } from "../state/claim";
 import { PlanMap } from "../components/PlanMap";
+import { planOutline } from "../graph/lanes";
+import { DemoGapNote } from "../components/DemoGapNote";
 import { ProjectOverview } from "../components/ProjectOverview";
+import { Corrections } from "../components/Corrections";
 import { ProjectStatsRow } from "../components/ProjectStatsRow";
 import { Icon } from "../components/Icon";
 import { PolicyPanel } from "../components/PolicyPanel";
 import { ProjectAvatar } from "../components/ProjectAvatar";
-import { calibrationLine, etaClaims, gateLabel, planSteps, PROGRESS_LABEL } from "../state/project";
+import { calibrationLine, etaClaims, gateLabel, planSteps, PROGRESS_LABEL, reviewWaiting, waitsForReview } from "../state/project";
 import { formatDeadline } from "../state/agenda";
+import { droppedLabel } from "../state/drop";
+import { StepDrop } from "../components/StepDrop";
 
 export interface ProjectProps {
   project: ProjectState;
@@ -93,8 +99,9 @@ export function Project({
   const summary = project.summary;
   const features = Object.values(project.features);
   const steps = planSteps(project.features);
+  const waiting = reviewWaiting(project);
   const review = features
-    .filter((feature) => feature.progress === "done")
+    .filter((feature) => waitsForReview(feature, waiting))
     .sort((a, b) => a.title.localeCompare(b.title));
   const decisions = Object.values(project.decisions);
   const deliveries = Object.values(project.deliveries).filter(
@@ -103,6 +110,8 @@ export function Project({
   const sessions = Object.values(project.sessions);
   const graphs = useProjectGraphs(client, [summary.slug], anchor);
   const graph = graphs[summary.slug];
+  // Until the graph answers, the plan shows its lanes from the snapshot.
+  const planGraph = useMemo(() => graph ?? planOutline(project.features), [graph, project.features]);
   const assumptions = liveAssumptions(project, anchor);
   const selectedFeature =
     selectedNode && selectedNode.startsWith("feature:")
@@ -177,6 +186,14 @@ export function Project({
 
       <ProjectStatsRow stats={project.stats} />
       <ProjectOverview project={project} motion={motion} />
+      <DemoGapNote project={project} />
+      <Corrections
+        project={project}
+        anchor={anchor}
+        canMutate={canMutate}
+        onOpenNeed={onOpenNeed}
+        onRefresh={onRefresh}
+      />
 
       {assumptions.length ? (
         <div className="sec">
@@ -196,10 +213,10 @@ export function Project({
           project={project}
           {...(presence?.length ? { observed: presence } : {})}
           anchor={anchor}
-          needs={project.needs_you.filter((need) => !snooze?.dismissed(need.id))}
-          handoffs={Object.fromEntries(
+          needs={project.needs_you.filter((need) => isActiveNeed(need) && !snooze?.dismissed(need.id))}
+          stoppedRows={Object.fromEntries(
             project.needs_you
-              .filter((need) => need.kind === "rescue" && need.node && snooze?.dismissed(need.id))
+              .filter((need) => need.kind === "rescue" && need.node && (isInfoNeed(need) || snooze?.dismissed(need.id)))
               .map((need) => [need.node as string, need.id]),
           )}
           selected={selectedNode ?? null}
@@ -223,23 +240,12 @@ export function Project({
         <div className="sec-h">
           <h3>{tx("proj.activity")}</h3>
         </div>
-        {deliveries.length ? (
-          <div className="evs">
-            {deliveries.map((delivery) => {
-              const need = project.needs_you.find(
-                (item) => item.kind === "review" && item.source === delivery.id,
-              );
-              return (
-                <EvidenceCard
-                  key={delivery.id}
-                  project={summary.slug}
-                  delivery={delivery}
-                  {...(need && onOpenNeed ? { onOpen: () => onOpenNeed(need.id) } : {})}
-                />
-              );
-            })}
-          </div>
-        ) : null}
+        <EvidenceCards
+          project={summary.slug}
+          deliveries={deliveries}
+          needs={project.needs_you}
+          {...(onOpenNeed ? { onOpenNeed } : {})}
+        />
         <ActivityFeed
           project={summary.slug}
           items={project.activity}
@@ -258,9 +264,7 @@ export function Project({
             ) : null}
           </span>
         </div>
-        {graph === undefined ? (
-          <div className="muted-note">Loading the plan…</div>
-        ) : graph === null ? (
+        {graph === null ? (
           <>
             <div className="muted-note">The dependency graph is not available right now.</div>
             <ol className="steps">
@@ -284,29 +288,39 @@ export function Project({
                       </span>
                       <span className="smeta" title={claims.title}>
                         {feature.paused ? tx("proj.paused_pre") : ""}
-                        {PROGRESS_LABEL[feature.progress]} · {gateLabel(feature.gate)}
+                        {feature.progress === "dropped" ? droppedLabel(feature) : PROGRESS_LABEL[feature.progress]} ·{" "}
+                        {gateLabel(feature.gate)}
                         {feature.deadline ? tx("proj.due", { d: formatDeadline(feature.deadline) }) : ""}
                         {claims.text ? ` · ${claims.text}` : ""} · priority {feature.priority}
                       </span>
                     </span>
-                    <FeatureEditor
-                      key={`${summary.slug}:${feature.node}:${feature.field_revisions.title ?? ""}:${
-                        feature.field_revisions.deadline ?? ""
-                      }:${feature.field_revisions.priority ?? ""}`}
-                      project={project}
-                      feature={feature}
-                      canMutate={canMutate}
-                      {...(edited[`feature:${feature.node}`]
-                        ? { edited: edited[`feature:${feature.node}`]! }
-                        : {})}
-                      onEdited={(fields, event) =>
-                        setEdited((current) => ({
-                          ...current,
-                          [`feature:${feature.node}`]: { fields, event },
-                        }))
-                      }
-                      {...(onRefresh ? { onRefresh } : {})}
-                    />
+                    <span className="step-acts">
+                      <FeatureEditor
+                        key={`${summary.slug}:${feature.node}:${feature.field_revisions.title ?? ""}:${
+                          feature.field_revisions.deadline ?? ""
+                        }:${feature.field_revisions.priority ?? ""}`}
+                        project={project}
+                        feature={feature}
+                        canMutate={canMutate}
+                        {...(edited[`feature:${feature.node}`]
+                          ? { edited: edited[`feature:${feature.node}`]! }
+                          : {})}
+                        onEdited={(fields, event) =>
+                          setEdited((current) => ({
+                            ...current,
+                            [`feature:${feature.node}`]: { fields, event },
+                          }))
+                        }
+                        {...(onRefresh ? { onRefresh } : {})}
+                      />
+                      <StepDrop
+                        key={`drop:${summary.slug}:${feature.node}`}
+                        project={project}
+                        feature={feature}
+                        canMutate={canMutate}
+                        onRefresh={onRefresh}
+                      />
+                    </span>
                   </li>
                 );
               })}
@@ -314,7 +328,8 @@ export function Project({
           </>
         ) : (
           <PlanMap
-            graph={graph}
+            graph={planGraph}
+            outline={!graph}
             project={project}
             selected={selectedNode ?? null}
             onSelect={selectNode}
@@ -324,6 +339,8 @@ export function Project({
             pulseToken={pulseToken}
             play={graphPlay}
             onPlayed={onUnblockPlayed}
+            canMutate={canMutate}
+            onRefresh={onRefresh}
           />
         )}
         {graph && selectedFeature ? (
@@ -332,6 +349,9 @@ export function Project({
               {selectedFeature.title}
               <span className="node">{selectedFeature.node}</span>
             </span>
+            {selectedFeature.progress === "dropped" ? (
+              <span className="gd-dropped">{droppedLabel(selectedFeature)}</span>
+            ) : null}
             <FeatureEditor
               key={`${summary.slug}:${selectedFeature.node}:${selectedFeature.field_revisions.title ?? ""}:${
                 selectedFeature.field_revisions.deadline ?? ""
@@ -349,6 +369,13 @@ export function Project({
                 }))
               }
               {...(onRefresh ? { onRefresh } : {})}
+            />
+            <StepDrop
+              key={`drop:${summary.slug}:${selectedFeature.node}`}
+              project={project}
+              feature={selectedFeature}
+              canMutate={canMutate}
+              onRefresh={onRefresh}
             />
           </div>
         ) : null}

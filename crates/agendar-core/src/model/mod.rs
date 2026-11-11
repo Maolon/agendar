@@ -14,4 +14,7 @@ pub use event::*;
 pub use ids::*;
 pub use msg::{Msg, MsgArg};
 pub use state::*;
-pub use validate::{parse_event, validate_card_input};
+pub use validate::{
+    MAX_REVIEW_COMMENTS, MAX_REVIEW_QUOTE, parse_event, validate_card_input,
+    validate_review_comment,
+};

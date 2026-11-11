@@ -287,27 +287,21 @@ fn hook_project_override_wins_over_the_repository_link() {
     let linked = agendar_core::service::shell_quote("linked");
     let explicit = agendar_core::service::shell_quote(&env.project);
 
-    // 1. No repository link at all: the cwd cannot resolve the project, and the
-    // shim still prints the `project link` recovery hint on stderr without
-    // emitting harness JSON.
+    // 1. No repository link at all: hooks run in every repository on the
+    // machine, so in one that is not linked the shim says nothing and succeeds.
     let unlinked = env.root.path().join("unlinked");
     fs::create_dir_all(&unlinked).expect("unlinked dir");
     let output = hook_start_in(&env, &unlinked, None, None, "harness-unlinked");
     assert_eq!(
         output.status.code(),
-        Some(3),
-        "an unlinked cwd is a context error: {}",
+        Some(0),
+        "an unlinked cwd is not an error"
+    );
+    assert!(
+        output.stdout.is_empty() && output.stderr.is_empty(),
+        "the shim is silent in an unlinked repository: {} {}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        output.stdout.is_empty(),
-        "a failed shim writes no harness JSON: {}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("project link"),
-        "the unlinked error still shows the recovery hint: {stderr}"
     );
 
     // 2. The explicit project resolves the same unlinked cwd.
@@ -420,26 +414,18 @@ fn post_tool_use_is_silent_until_an_unseen_packet_exists() {
 }
 
 #[test]
-fn stop_blocks_for_runnable_work_and_exits_when_stop_hook_active() {
+fn stop_passes_planned_work_nobody_holds() {
     let mut env = CliEnv::new("demo");
     env.init();
     let (session, _) = start(&env, "harness-a");
     declare_board(&env, &session);
 
-    let output = run_hook(&env, "stop", "harness-a", Some(false), None);
-    let value = single_json(&output);
-    assert_eq!(value["decision"], "block");
-    let reason = value["reason"].as_str().expect("reason");
-    assert!(
-        reason.contains("Work remains: core/wake"),
-        "reason={reason}"
-    );
-    assert!(reason.contains("--session"), "reason carries the prefix");
-
-    // The Stop that follows a block must not loop.
+    // A planned step nobody holds is not this session's debt: `settle` lists
+    // it, the Stop does not hold for it.
+    assert_no_stdout(&run_hook(&env, "stop", "harness-a", Some(false), None));
     assert_no_stdout(&run_hook(&env, "stop", "harness-a", Some(true), None));
 
-    // Finish the only runnable feature: nothing remains and no stdout is written.
+    // Started and finished: still nothing held, no stdout is written.
     let started = expect_success(
         &env.run_as(
             &session,
@@ -1537,4 +1523,244 @@ fn an_empty_agent_config_is_bound_like_a_missing_one() {
     expect_install(&install_mcp(&env, "agy", true));
     let written: Value = serde_json::from_slice(&fs::read(&agy).expect("read")).expect("json");
     assert_eq!(written["mcpServers"]["agendar"]["args"][2], "agy");
+}
+
+#[test]
+fn a_sent_back_delivery_reaches_the_agents_context_once_with_the_reason() {
+    let mut env = CliEnv::new("demo");
+    env.init();
+    let (session, _) = start(&env, "harness-a");
+    declare_board(&env, &session);
+    let started = expect_success(
+        &env.run_as(
+            &session,
+            &[
+                "progress",
+                "started",
+                "--node",
+                "core/wake",
+                "--eta",
+                "10m..20m",
+            ],
+        ),
+        "progress",
+    );
+    let attempt = started["data"]["attempt"]
+        .as_str()
+        .expect("attempt")
+        .to_owned();
+    let ask = ask_as(&env, &session);
+    let answer = env.answer(&ask, "adapters");
+    // The answer itself is injected first; that is not what this test is about.
+    single_json(&run_hook(&env, "post-tool-use", "harness-a", None, None));
+
+    let demo = env.repo.join("demo.txt");
+    fs::write(&demo, b"demo transcript\n").expect("demo");
+    let input = write_json(
+        &env,
+        "delivery.json",
+        &json!({
+            "name": "Wake delivery",
+            "demos": [{"kind": "cli_transcript", "body": {"file": demo, "ext": "txt"}}],
+            "criteria": [{"criterion": "continues", "status": "passed", "claim": "agent_says"}],
+            "disclosure": {"proven": ["Agent ran it"], "not_proven": [], "faked": []}
+        }),
+    );
+    let delivered = expect_success(
+        &env.run_as(
+            &session,
+            &[
+                "deliver",
+                "--node",
+                "core/wake",
+                "--attempt",
+                &attempt,
+                "--receipt",
+                &answer,
+                "--json",
+                &input,
+            ],
+        ),
+        "deliver",
+    );
+    let delivery = agendar_core::model::EventId::parse(
+        delivered["data"]["event_id"].as_str().expect("delivery"),
+    )
+    .expect("delivery id");
+    env.service()
+        .review_delivery(
+            &agendar_core::model::ProjectSlug::parse("demo").expect("project"),
+            &agendar_core::model::NodePath::parse("core/wake").expect("node"),
+            &delivery,
+            agendar_core::model::ReviewVerdict::SendBack,
+            Some("The transcript stops before the result".to_owned()),
+            None,
+            {
+                use agendar_core::model::{DiffSide, ReviewAnchor, ReviewComment};
+                vec![
+                    ReviewComment {
+                        anchor: ReviewAnchor::DiffLine {
+                            demo: 0,
+                            file: "crates/x.rs".to_owned(),
+                            side: DiffSide::New,
+                            line: 840,
+                            quote: "  let wake = 1;".to_owned(),
+                        },
+                        text: "Name the constant".to_owned(),
+                    },
+                    ReviewComment {
+                        anchor: ReviewAnchor::TranscriptLine {
+                            demo: 1,
+                            line: 12,
+                            quote: "waiting…".to_owned(),
+                        },
+                        text: "Never finishes".to_owned(),
+                    },
+                    ReviewComment {
+                        anchor: ReviewAnchor::Region {
+                            demo: 0,
+                            x: 100,
+                            y: 50,
+                            w: 300,
+                            h: 150,
+                        },
+                        text: "Clipped".to_owned(),
+                    },
+                ]
+            },
+            vec![agendar_core::model::EventId::parse(&answer).expect("answer")],
+        )
+        .expect("send back");
+
+    let value = single_json(&run_hook(&env, "post-tool-use", "harness-a", None, None));
+    let context = value["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .expect("context");
+    assert!(
+        context.contains(
+            "review on core/wake: the human sent your delivery back: The transcript stops before the result"
+        ),
+        "{context}"
+    );
+    assert!(context.contains("deliver again"), "{context}");
+    let redeliver = format!(
+        "\n  Redeliver with --supersedes {} and replies to the reason and to comments by number in \"replies\"",
+        delivery.as_str()
+    );
+    for line in [
+        "\n  1. crates/x.rs:840 (new) «let wake = 1;»: Name the constant",
+        "\n  2. demo 2 transcript, line 12 «waiting…»: Never finishes",
+        "\n  3. demo 1 screenshot, area x 10–40% y 5–20%: Clipped",
+        redeliver.as_str(),
+    ] {
+        assert!(context.contains(line), "missing {line:?} in {context}");
+    }
+    // Shown once: the next tool call has nothing new.
+    assert_no_stdout(&run_hook(&env, "post-tool-use", "harness-a", None, None));
+    // If that one text was lost, the send-back is not: it has no ack, so a
+    // prompt does not repeat it, but the Stop of every turn holds for it
+    // until the rework starts, whatever was recorded as shown.
+    expect_success(&env.run_as(&session, &["ack", &answer]), "ack");
+    assert_no_stdout(&run_hook(
+        &env,
+        "user-prompt-submit",
+        "harness-a",
+        None,
+        None,
+    ));
+    for _ in 0..2 {
+        let held = single_json(&run_hook(
+            &env,
+            "stop",
+            "harness-a",
+            Some(false),
+            Some(2000),
+        ));
+        assert_eq!(held["decision"], "block");
+        let reason = held["reason"].as_str().expect("reason");
+        assert!(
+            reason.contains("The transcript stops before the result"),
+            "{reason}"
+        );
+    }
+}
+
+#[test]
+fn stop_passes_a_step_with_a_future_eta_or_in_review_and_holds_once_past_its_eta() {
+    let mut env = CliEnv::new("demo");
+    env.init();
+    let (session, _) = start(&env, "harness-a");
+    declare_board(&env, &session);
+    // Held inside its ETA: nothing owed, the turn may end.
+    let started = expect_success(
+        &env.run_as(
+            &session,
+            &[
+                "progress",
+                "started",
+                "--node",
+                "core/wake",
+                "--eta",
+                "1s..2s",
+            ],
+        ),
+        "progress",
+    );
+    let attempt = started["data"]["attempt"].as_str().unwrap().to_owned();
+    assert_no_stdout(&run_hook(
+        &env,
+        "stop",
+        "harness-a",
+        Some(false),
+        Some(2000),
+    ));
+    // Past its ETA with no word: held once, with the way out.
+    std::thread::sleep(Duration::from_millis(3600));
+    let held = single_json(&run_hook(
+        &env,
+        "stop",
+        "harness-a",
+        Some(false),
+        Some(2000),
+    ));
+    assert_eq!(held["decision"], "block");
+    let reason = held["reason"].as_str().expect("reason");
+    assert!(reason.contains("core/wake is"), "reason={reason}");
+    assert!(reason.contains("settle"), "reason={reason}");
+    assert_no_stdout(&run_hook(&env, "stop", "harness-a", Some(true), Some(2000)));
+    // Delivered: in review, the owner holds it; Stop passes though the ETA
+    // is long gone.
+    let demo = env.repo.join("demo.txt");
+    fs::write(&demo, b"demo transcript\n").expect("demo");
+    let delivery = write_json(
+        &env,
+        "delivery.json",
+        &json!({
+            "name": "Wake",
+            "demos": [{"kind": "cli_transcript", "body": {"file": demo.to_string_lossy(), "ext": "txt"}}],
+            "disclosure": {"proven": [], "not_proven": [], "faked": []}
+        }),
+    );
+    expect_success(
+        &env.run_as(
+            &session,
+            &[
+                "deliver",
+                "--node",
+                "core/wake",
+                "--attempt",
+                &attempt,
+                "--json",
+                &delivery,
+            ],
+        ),
+        "deliver",
+    );
+    assert_no_stdout(&run_hook(
+        &env,
+        "stop",
+        "harness-a",
+        Some(false),
+        Some(2000),
+    ));
 }

@@ -31,8 +31,7 @@ use crate::vault::{
 /// How long a Claude Code session whose process exited stays resumable before
 /// it is lost, counted from its last report. `claude --resume` keeps the
 /// conversation id, so a restart within this window gets its session and its
-/// steps back; a crash still reaches the human as a hand-off item afterwards.
-/// Chosen by the user on 2026-11-07 ("Wait 15 minutes").
+/// steps back; a crash leaves the steps free, as an information row for the human.
 pub const CLAUDE_RESUME_GRACE_S: i64 = 15 * 60;
 
 /// One session registration request from `init` or a harness hook.
@@ -112,16 +111,15 @@ pub fn register_session(service: &Service, registration: SessionRegistration) ->
     }
 
     let (session_id, needs_pulse) = update_runtime(service.local(), service.vault(), |runtime| {
-        if let Some((id, _)) = runtime.sessions.iter().find(|(_, session)| {
-            session.matches_identity(
-                &registration.project,
-                registration.harness,
-                &registration.harness_session_id,
-                registration.pid,
-                registration.process_start,
-            )
-        }) {
-            return Ok((id.clone(), !runtime.sessions[id].started));
+        if let Some(id) = runtime.live_session(
+            &registration.project,
+            registration.harness,
+            &registration.harness_session_id,
+            registration.pid,
+            registration.process_start,
+        ) {
+            let started = runtime.sessions[&id].started;
+            return Ok((id, !started));
         }
         // A Codex thread is one durable session across the processes of its
         // turns: each `codex exec` turn is a new process with the same thread
@@ -264,6 +262,89 @@ pub fn register_session(service: &Service, registration: SessionRegistration) ->
     }
     continue_lost_predecessor(service, &registration, &session_id)?;
     Ok(session_id)
+}
+
+/// A Claude Code conversation that got a new harness session id inside the
+/// same process (`/clear`, a compaction) continues its Agendar session.
+///
+/// The rule: among the live (not lost, not sealed) Claude Code registrations
+/// of `project` whose recorded process identity is exactly `(pid,
+/// process_start)`, the newest (re)registration takes `harness_session_id`.
+/// The process identity comes from the caller's own process ancestry, never
+/// from hook stdin, and one Claude Code process runs one conversation at a
+/// time; another agent runs in another process, so its registration can never
+/// match. Returns `None` when this process registered nothing here.
+pub fn continue_process_session(
+    service: &Service,
+    project: &ProjectSlug,
+    harness_session_id: &str,
+    pid: u32,
+    process_start: u64,
+) -> Result<Option<SessionId>> {
+    if process_identity(pid) != Some(process_start) {
+        return Ok(None);
+    }
+    let (found, _) = update_runtime(service.local(), service.vault(), |runtime| {
+        let found = runtime
+            .process_sessions(Harness::ClaudeCode, pid, process_start)
+            .into_iter()
+            .rfind(|id| &runtime.sessions[id].project == project);
+        if let Some(id) = &found {
+            let record = runtime.sessions.get_mut(id).expect("found above");
+            record.harness_session_id = harness_session_id.to_owned();
+            record.registered_at = SystemClock.now();
+            record.resumable = false;
+        }
+        Ok(found)
+    })?;
+    Ok(found)
+}
+
+/// `init --session X --harness-session NEW`: bind the harness session of
+/// `registration` to the existing Agendar session `session` instead of
+/// minting one.
+///
+/// The rule: `session` must be registered on this host, not lost or sealed,
+/// for the same project and harness, and its recorded process must be either
+/// the registering process itself or gone (exited, or its pid reused). A
+/// session whose recorded process is still running elsewhere is never
+/// rebound, so two live processes never come to share one session this way.
+/// `Ok(Err(why))` says why the session was not bound; the caller then
+/// registers normally.
+pub fn bind_session(
+    service: &Service,
+    session: &SessionId,
+    registration: &SessionRegistration,
+) -> Result<std::result::Result<(), &'static str>> {
+    if process_identity(registration.pid) != Some(registration.process_start) {
+        return Ok(Err("the harness process was not found"));
+    }
+    let (outcome, _) = update_runtime(service.local(), service.vault(), |runtime| {
+        let Some(record) = runtime.sessions.get_mut(session) else {
+            return Ok(Err("it is not registered on this computer"));
+        };
+        if record.lost || record.sealed {
+            return Ok(Err("it has ended"));
+        }
+        if record.project != registration.project {
+            return Ok(Err("it belongs to another project"));
+        }
+        if record.harness != registration.harness {
+            return Ok(Err("it belongs to another harness"));
+        }
+        let same_process =
+            record.pid == registration.pid && record.process_start == registration.process_start;
+        if !same_process && process_identity(record.pid) == Some(record.process_start) {
+            return Ok(Err("another running process holds it"));
+        }
+        record.harness_session_id = registration.harness_session_id.clone();
+        record.pid = registration.pid;
+        record.process_start = registration.process_start;
+        record.registered_at = SystemClock.now();
+        record.resumable = false;
+        Ok(Ok(()))
+    })?;
+    Ok(outcome)
 }
 
 /// A new session of an agent conversation that was lost on this computer
@@ -569,7 +650,8 @@ fn last_reports_by_session(service: &Service, now: UtcTime) -> BTreeMap<SessionI
         .unwrap_or_default()
 }
 
-/// Route every eligible unapplied answer to one local session.
+/// Route every eligible unapplied answer, and every review verdict, to one
+/// local session.
 ///
 /// Pull harnesses only become readable through `inbox`; the steward never
 /// claims a delivery they did not acknowledge. Codex is enqueued by durable
@@ -631,6 +713,32 @@ fn deliver_pending(service: &Service) -> Result<(u32, Vec<QueuedReport>)> {
                     &decision.applied_sessions,
                     &session_id,
                     &session,
+                    now,
+                    &mut delivered,
+                    &mut queued_reports,
+                )?;
+            }
+        }
+        // A review verdict rides the same queue to the session holding the
+        // step, once per packet and thread, like an answer.
+        for (session_id, session) in runtime.sessions.iter().filter(|(_, session)| {
+            session.project == project && session.harness == Harness::Codex && addressable(session)
+        }) {
+            let Ok((packets, _, _)) = service.inbox(&project, session_id, None, true) else {
+                continue;
+            };
+            for packet in packets
+                .iter()
+                .filter(|packet| packet.kind == PacketKind::Review)
+            {
+                deliver_one(
+                    service,
+                    &runtime,
+                    &project,
+                    packet,
+                    &[],
+                    session_id,
+                    session,
                     now,
                     &mut delivered,
                     &mut queued_reports,
@@ -789,6 +897,7 @@ fn persist_uncertain(
                 event: None,
                 reserved: None,
                 queued: None,
+                via: None,
             },
         );
         Ok(())

@@ -152,6 +152,8 @@ impl CliEnv {
 
     /// Run init and register a generic harness session using this test process.
     pub fn init(&mut self) {
+        // A fresh registration: `init --session X` would keep session X.
+        self.session.clear();
         let harness_session = format!("harness-{}", ulid::Ulid::generate());
         let pid = std::process::id().to_string();
         let repo = self.repo.to_string_lossy().into_owned();

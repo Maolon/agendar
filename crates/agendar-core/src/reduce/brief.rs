@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::Msg;
 use crate::model::event::Event;
-use crate::model::ids::{EventId, ProjectSlug, UtcTime};
+use crate::model::ids::{EventId, NodePath, ProjectSlug, UtcTime};
 use crate::model::state::{
     DecisionLifecycle, FeatureState, NeedsKind, NeedsYouItem, Progress, State,
 };
@@ -148,7 +148,9 @@ pub fn build(state: &State, events: &[Event], since: Option<UtcTime>) -> BriefDa
     let mut needs: Vec<NeedsYouItem> = state
         .projects
         .values()
-        .flat_map(|project| project.needs_you.iter().cloned())
+        .flat_map(|project| project.needs_you.iter())
+        .filter(|need| crate::reduce::attention::is_active_need(need))
+        .cloned()
         .collect();
     ordering::sort_needs(&mut needs);
     let earliest = ordering::earliest_needs(&needs);
@@ -343,7 +345,11 @@ pub fn build(state: &State, events: &[Event], since: Option<UtcTime>) -> BriefDa
                     Msg::new("brief.over_budget").text("title", project.summary.title.clone()),
                 )
                 .with_detail(usage.reasons.join(" "))
-                .with_detail_msg(Some(over_budget_msg(usage, budget))),
+                .with_detail_msg(Some(over_budget_msg(
+                    usage,
+                    budget,
+                    &project.features,
+                ))),
             );
         } else if near_limit(usage.speculative_features, budget.max_speculative_features)
             || near_limit(usage.pending_slices, budget.max_pending_slices)
@@ -400,7 +406,11 @@ pub fn build(state: &State, events: &[Event], since: Option<UtcTime>) -> BriefDa
 }
 
 /// The budget's blocking reasons (`reduce::budget::usage`) as one message.
-fn over_budget_msg(usage: &crate::model::event::BudgetUsage, budget: &crate::model::Budget) -> Msg {
+fn over_budget_msg(
+    usage: &crate::model::event::BudgetUsage,
+    budget: &crate::model::Budget,
+    features: &BTreeMap<NodePath, FeatureState>,
+) -> Msg {
     let mut reasons = Vec::new();
     if usage.speculative_features > budget.max_speculative_features {
         reasons.push(
@@ -417,8 +427,17 @@ fn over_budget_msg(usage: &crate::model::event::BudgetUsage, budget: &crate::mod
         );
     }
     if usage.demo_gap_s >= u64::from(budget.max_demo_gap_s) {
+        // Named with the step the clock runs for; plain when none is in progress.
+        let step = usage
+            .demo_gap_node
+            .as_ref()
+            .and_then(|node| features.get(node));
+        let reason = match step {
+            Some(step) => Msg::new("budget.demo_gap").text("step", step.title.clone()),
+            None => Msg::new("budget.demo_gap.no_step"),
+        };
         reasons.push(
-            Msg::new("budget.demo_gap")
+            reason
                 .minutes("gap", usage.demo_gap_s / 60)
                 .minutes("limit", u64::from(budget.max_demo_gap_s) / 60),
         );

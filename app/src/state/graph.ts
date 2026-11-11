@@ -16,6 +16,21 @@ import { isMotionEligible, type MotionPulse } from "../graph/motion";
 export type GraphRecord = Record<ProjectSlug, Graph | null | undefined>;
 
 /**
+ * The last graph each project answered with, per client. A page opened again
+ * draws its plan in the first render and refetches behind it.
+ */
+const kept = new WeakMap<AgendarClient, Map<ProjectSlug, Graph>>();
+
+function keptGraphs(client: AgendarClient, slugs: readonly ProjectSlug[]): GraphRecord {
+  const graphs: GraphRecord = {};
+  for (const slug of slugs) {
+    const graph = kept.get(client)?.get(slug);
+    if (graph) graphs[slug] = graph;
+  }
+  return graphs;
+}
+
+/**
  * Fetch every requested project graph for the current snapshot. Results are
  * keyed by slug; the previous graph stays visible until the new one lands.
  */
@@ -24,7 +39,7 @@ export function useProjectGraphs(
   slugs: readonly ProjectSlug[],
   anchor: UtcTime,
 ): GraphRecord {
-  const [graphs, setGraphs] = useState<GraphRecord>({});
+  const [graphs, setGraphs] = useState<GraphRecord>(() => keptGraphs(client, slugs));
   const key = [...new Set(slugs.filter(Boolean))].sort().join("|");
 
   useEffect(() => {
@@ -33,6 +48,8 @@ export function useProjectGraphs(
     for (const slug of key.split("|")) {
       void client.getProject({ project: slug }).then(
         (data) => {
+          if (!kept.has(client)) kept.set(client, new Map());
+          kept.get(client)!.set(slug, data.graph);
           if (!cancelled) setGraphs((current) => ({ ...current, [slug]: data.graph }));
         },
         () => {

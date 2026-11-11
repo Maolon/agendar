@@ -127,6 +127,20 @@ export function formatClockTime(value: string | undefined): string {
   return clock(new Date(parsed));
 }
 
+/** A clock time, with its weekday when it is not on the day of `now`: "16:40", "Thu 16:40". */
+export function formatDayClock(value: string, now: Date = new Date()): string {
+  const parsed = Date.parse(value);
+  if (Number.isNaN(parsed)) return "";
+  const date = new Date(parsed);
+  if (date.toDateString() === now.toDateString()) return clock(date);
+  return new Intl.DateTimeFormat(undefined, {
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(date);
+}
+
 /** "~16:40" or "~16:40–17:10" for an absolute finish window. */
 export function formatFinishWindow(range: TimeRange | undefined): string {
   if (!range) return "";
@@ -207,4 +221,17 @@ export function ownOption(card: DecisionCard, text: string): DecisionOption {
     external: card.external,
     icon: "user",
   };
+}
+
+/** A file size in decimal units, as the Finder shows it: `512 B`, `48 KB`, `6.6 MB`. */
+export function formatBytes(bytes: number): string {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = Math.max(0, bytes);
+  let unit = 0;
+  while (value >= 1000 && unit < units.length - 1) {
+    value /= 1000;
+    unit += 1;
+  }
+  const digits = unit === 0 || value >= 100 || (unit === 1 && value >= 10) ? 0 : 1;
+  return `${value.toFixed(digits)} ${units[unit]}`;
 }

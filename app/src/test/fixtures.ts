@@ -28,6 +28,8 @@ import type {
   EventMap,
   GetSetupLocationsData,
   LocalConfig,
+  StorageUsage,
+  UsageNumbers,
   Graph,
   InstallLocalData,
   InstallLocalRequest,
@@ -36,6 +38,8 @@ import type {
   UnlinkRepoData,
   TestNoticeData,
   OpenReportData,
+  CheckUpdatesData,
+  OpenReleaseData,
   OpenReportRequest,
   Binding,
   GetBindingsData,
@@ -57,6 +61,7 @@ import type {
   RunCheckRequest,
   SetPreferencesData,
   SetPreferencesRequest,
+  SnoozeNeedData,
   SnoozeNeedRequest,
   DismissNeedRequest,
   SetupLocation,
@@ -504,7 +509,6 @@ export function makeDeliveryProject(): {
 export function basePreferences(): Preferences { return {
     theme: "system",
     motion: true,
-    snoozed: {},
     last_looked_at: "2026-02-10T12:00:00.000Z",
     last_looked_ids: [],
     revision: sha(0x71),
@@ -819,6 +823,20 @@ export class FakeClient implements AgendarClient {
     return structuredClone(this.localConfig);
   }
 
+  /** `null`: the read fails. */
+  storageUsage: StorageUsage | null = {
+    evaluated_at: "2026-01-01T00:00:00.000Z",
+    superseded_after_days: 30,
+    total: emptyUsage(),
+    projects: [],
+  };
+
+  async getStorageUsage(): Promise<StorageUsage> {
+    this.record("get_storage_usage", {});
+    if (!this.storageUsage) throw new ApiError({ code: "E_IO", message: "Cannot list the Vault.", hint: "", retryable: true });
+    return structuredClone(this.storageUsage);
+  }
+
   testNoticeResult: TestNoticeData = { sent: true };
 
   bindings: Binding[] = [
@@ -1073,6 +1091,15 @@ export class FakeClient implements AgendarClient {
     return { event_id: ulid(502) };
   }
 
+  /** Thrown by `dropSteps` when set; nothing is dropped then. */
+  dropError: Error | null = null;
+
+  async dropSteps(request: { nodes: string[] }) {
+    this.record("drop_steps", request);
+    if (this.dropError) throw this.dropError;
+    return { event_ids: request.nodes.map((_, index) => ulid(600 + index)) };
+  }
+
   async setPolicy(request: unknown) {
     this.record("set_policy", request);
     return { event_id: ulid(503) };
@@ -1126,12 +1153,7 @@ export class FakeClient implements AgendarClient {
       ...(request.theme ? { theme: request.theme } : {}),
       ...(request.motion !== undefined ? { motion: request.motion } : {}),
       ...(request.notifications !== undefined ? { notifications: request.notifications } : {}),
-      snoozed: Object.fromEntries(
-        Object.entries({
-          ...this.snapshot.preferences.snoozed,
-          ...(request.snooze ? { [request.snooze.item_id]: request.snooze.until } : {}),
-        }).filter(([, until]) => Date.parse(until) > Date.parse(EVALUATED_AT)),
-      ),
+      ...(request.update_check !== undefined ? { update_check: request.update_check } : {}),
       last_looked_at: request.mark_looked ? EVALUATED_AT : this.snapshot.preferences.last_looked_at,
       revision: sha(0x72),
     };
@@ -1146,15 +1168,19 @@ export class FakeClient implements AgendarClient {
     return { preferences: structuredClone(this.snapshot.preferences) };
   }
 
-  async snoozeNeed(request: SnoozeNeedRequest): Promise<SetPreferencesData> {
+  /** As the host does: the event is written and the reduced rows carry it. */
+  async snoozeNeed(request: SnoozeNeedRequest): Promise<SnoozeNeedData> {
     this.record("snooze_need", request);
-    const snoozed = Object.fromEntries(
-      Object.entries({ ...this.snapshot.preferences.snoozed, [request.item_id]: request.until }).filter(
-        ([, until]) => Date.parse(until) > Date.parse(EVALUATED_AT),
-      ),
-    );
-    this.snapshot.preferences = { ...this.snapshot.preferences, snoozed, revision: sha(0x75) };
-    return { preferences: structuredClone(this.snapshot.preferences) };
+    const rows = [
+      ...this.snapshot.needs,
+      ...Object.values(this.snapshot.state.projects).flatMap((project) => project.needs_you),
+    ];
+    for (const row of rows) {
+      if (row.id !== request.item_id) continue;
+      if (Date.parse(request.until) > Date.parse(EVALUATED_AT)) row.snoozed_until = request.until;
+      else delete row.snoozed_until;
+    }
+    return { event_id: ulid(900 + this.calls.length), snoozed_until: request.until };
   }
 
   async configureVault(request: ConfigureVaultRequest): Promise<ConfigureVaultData> {
@@ -1239,7 +1265,7 @@ export class FakeClient implements AgendarClient {
     return { repo: request.repo, removed, project, project_still_linked, expected_config_revision: sha(0x74) };
   }
 
-  async showMain(target?: { project: string; item_id: string }): Promise<void> {
+  async showMain(target?: { project: string; item_id: string } | { view: "about" }): Promise<void> {
     this.record("show_main", target ?? {});
   }
 
@@ -1256,6 +1282,18 @@ export class FakeClient implements AgendarClient {
 
   async setGlassRegions(regions: GlassRegion[], tint: GlassTint | null): Promise<void> {
     this.record("set_glass_regions", tint ? { regions, tint } : { regions });
+  }
+
+  async checkUpdates(): Promise<CheckUpdatesData> {
+    this.record("check_updates", {});
+    if (!this.snapshot.update) throw new Error("no update status in this fixture");
+    this.snapshot.update = { ...this.snapshot.update, checked_at: EVALUATED_AT };
+    return { update: structuredClone(this.snapshot.update) };
+  }
+
+  async openRelease(): Promise<OpenReleaseData> {
+    this.record("open_release", {});
+    return { opened: true };
   }
 
   async openPreview(): Promise<never> {
@@ -1285,6 +1323,21 @@ export class FakeClient implements AgendarClient {
   async onNotificationFocus(handler: (event: EventMap["agendar://notification-focus"]) => void): Promise<UnlistenFn> {
     this.subscribeOrder.push("focus");
     return this.addListener("agendar://notification-focus", handler);
+  }
+
+  async onUpdate(handler: (event: EventMap["agendar://update"]) => void): Promise<UnlistenFn> {
+    this.subscribeOrder.push("update");
+    return this.addListener("agendar://update", handler);
+  }
+
+  async onUpload(handler: (event: EventMap["agendar://upload"]) => void): Promise<UnlistenFn> {
+    this.subscribeOrder.push("upload");
+    return this.addListener("agendar://upload", handler);
+  }
+
+  async onNavigate(handler: (event: EventMap["agendar://navigate"]) => void): Promise<UnlistenFn> {
+    this.subscribeOrder.push("navigate");
+    return this.addListener("agendar://navigate", handler);
   }
 
   emit<K extends keyof EventMap>(event: K, payload: EventMap[K]): void {
@@ -1358,9 +1411,31 @@ export function transportFromClient(client: FakeClient): Transport {
           return client.onNotificationFocus(
             handler as (event: EventMap["agendar://notification-focus"]) => void,
           );
+        case "agendar://update":
+          return client.onUpdate(handler as (event: EventMap["agendar://update"]) => void);
+        case "agendar://upload":
+          return client.onUpload(handler as (event: EventMap["agendar://upload"]) => void);
+        case "agendar://navigate":
+          return client.onNavigate(handler as (event: EventMap["agendar://navigate"]) => void);
         default:
           return Promise.resolve(() => undefined);
       }
     },
+  };
+}
+
+/** Usage numbers with nothing in them; tests fill in what they show. */
+export function emptyUsage(): UsageNumbers {
+  const none = { count: 0, bytes: 0, local_bytes: 0 };
+  return {
+    total_bytes: 0,
+    total_local_bytes: 0,
+    event_bytes: 0,
+    event_local_bytes: 0,
+    attachments: { ...none },
+    categories: {},
+    reclaimable: { ...none },
+    superseded: { ...none },
+    unreferenced: { ...none },
   };
 }

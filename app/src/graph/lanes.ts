@@ -57,6 +57,36 @@ function drawn(node: GraphNode): boolean {
   return node.kind === "feature" || Boolean(node.need_id) || node.assumed;
 }
 
+/**
+ * The plan as the snapshot alone knows it: every step and its declared
+ * dependencies. It stands in for the graph until `get_project` answers, so the
+ * lanes, their counts and the room each one takes are right from the first
+ * render. Nothing is drawn from it: pending decisions and reviews, and the
+ * edges the core rejected, are only in the graph.
+ */
+export function planOutline(features: Readonly<Record<NodePath, FeatureState>>): Graph {
+  const steps = Object.values(features);
+  return {
+    nodes: steps.map((feature) => ({
+      id: `feature:${feature.node}`,
+      kind: "feature",
+      label: feature.title,
+      feature: feature.node,
+      state: feature.progress,
+      assumed: false,
+    })),
+    edges: steps.flatMap((feature) =>
+      feature.depends_on
+        .filter((upstream) => upstream !== feature.node && features[upstream] !== undefined)
+        .map((upstream) => ({
+          from: `feature:${upstream}`,
+          to: `feature:${feature.node}`,
+          source_event: feature.field_sources.depends_on ?? "",
+        })),
+    ),
+  };
+}
+
 export function buildLanes(graph: Graph, features: Readonly<Record<NodePath, FeatureState>>): LanePlan {
   const nodes = graph.nodes.filter(drawn);
   const ids = new Set(nodes.map((node) => node.id));

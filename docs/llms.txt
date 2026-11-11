@@ -1,18 +1,21 @@
 # Agendar
 
-> Agendar is an agenda for your AI coding agents: a desktop app and CLI that lists only what needs your call. Agents report their plan and progress through the `agendar` CLI or its MCP server, and ask for a decision with a card (the question, two to four options with what each one costs, a recommendation, and what the answer unblocks). You answer from the app, the menu bar or the notification, and the same agent session continues where it stopped.
+> Agendar lets you manage your AI coding agents like a product manager. It is a desktop app and CLI, an agenda that lists only what needs you. Agents declare their plan and report progress through the `agendar` CLI, its MCP server or hooks. They ask for a decision with a card (the question, two to four options with what each one costs, a recommendation, and what the answer unblocks), and deliver finished work with demos for you to accept or send back. You answer from the app, the menu bar or the notification, and the agent session that asked continues.
 
 - Works with Claude Code and Codex (hooks), Cursor, Gemini CLI, Antigravity, opencode and pi (MCP server, `agendar mcp`), and anything that runs a shell (the `agendar` CLI and the Agent Skill).
+- It does not run, start or assign agents. It works beside any agent environment (Paseo, Conductor, the Claude and Codex desktop apps).
+- The board corrects itself: a step whose session stopped is freed for another agent, and work with no demo for four hours is flagged.
 - Runs on macOS (Apple silicon and Intel), Windows and Linux; macOS is the platform it is tested on.
-- No server: each machine appends to its own files in a folder you choose (iCloud Drive, Dropbox, Syncthing or a local folder).
+- No server, no account, no telemetry: each machine appends to its own plain files in a folder you choose (iCloud Drive, OneDrive, Dropbox, Syncthing or a local folder).
 - Free and open source under the MIT license.
 - Install the Agent Skill with `npx skills add Maolon/agendar -g`.
 
 ## Docs
 
 - [Product page (Markdown)](https://mxlo.top/agendar/index.md): what Agendar does, how the loop works, supported agents, install and FAQ
-- [README](https://raw.githubusercontent.com/Maolon/agendar/main/README.md): overview, install, status and build from source
-- [Agent Skill](https://raw.githubusercontent.com/Maolon/agendar/main/skills/agendar/SKILL.md): the commands an agent runs to report progress, ask, wait for and acknowledge answers
+- [README](https://raw.githubusercontent.com/Maolon/agendar/main/README.md): overview, the loop with its commands, install, principles, FAQ and build from source
+- [README, Simplified Chinese](https://raw.githubusercontent.com/Maolon/agendar/main/README.zh-CN.md): the same in 简体中文
+- [Agent Skill](https://raw.githubusercontent.com/Maolon/agendar/main/skills/agendar/SKILL.md): the commands an agent runs to read the board, report progress, ask, wait for and acknowledge answers, deliver and settle
 - [Releases](https://github.com/Maolon/agendar/releases/latest): the app for each platform, the standalone `agendar` CLI and checksums
 
 ## Optional

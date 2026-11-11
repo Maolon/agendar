@@ -6,8 +6,10 @@
 //! cross-process ingest lock, preserves conflicting raw variants and rebuilds in
 //! place. `schema.sql` is a byte-identical copy of the normative `index.sql`.
 
+pub mod decode;
 pub mod ingest;
 pub mod query;
+pub mod source_reads;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -16,9 +18,7 @@ use std::time::Instant;
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, TransactionBehavior, params};
 
 use crate::error::{AgendarError, ErrorCode, Result};
-use crate::model::{
-    Event, EventId, ProjectSlug, Sha256, State, UtcTime, canonical_json, parse_event,
-};
+use crate::model::{Event, EventId, ProjectSlug, Sha256, State, UtcTime, canonical_json};
 
 use crate::reduce::order::{Resolution, event_digest, resolve};
 use crate::reduce::{ReduceContext, reduce_with_resolution};
@@ -30,6 +30,9 @@ pub const SCHEMA_SQL: &str = include_str!("schema.sql");
 
 pub const SCHEMA_VERSION: i64 = 1;
 pub const REDUCER_VERSION: i64 = 1;
+
+/// `raw_events.reason` of a row no committed decoder could read.
+pub(crate) const UNDECODABLE: &str = "undecodable";
 
 /// Result of one ingest transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,10 +243,87 @@ pub fn open_index_until(
 ) -> Result<Index> {
     local.validate_against_vault_root(vault.root())?;
     local.ensure_layout(vault.root(), vault.id())?;
+    // An initialized index at the current schema needs no lock to open: the
+    // schema, its version and the Vault identity commit together, so a reader
+    // that sees the version also sees the tables.
+    if let Some(index) = open_current(local, vault) {
+        return Ok(index);
+    }
     // First-open initialization is serialized with the ingest lock so two
     // processes can never observe a versioned but incomplete schema.
     let _lock = acquire_ingest_lock_file_until(local, vault, deadline)?;
     open_locked(local, vault)
+}
+
+/// Open an existing, initialized, current index read-write without the
+/// ingest lock. Anything else (missing file, older or unknown schema, not yet
+/// in WAL mode, another Vault) returns `None` so the locked open creates,
+/// completes or refuses it as before.
+fn open_current(local: &LocalPaths, vault: &Vault) -> Option<Index> {
+    let path = local.index_path(vault.id());
+    validate_index_leaves(&path, vault).ok()?;
+    let connection = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    connection
+        .busy_timeout(std::time::Duration::from_millis(5_000))
+        .ok()?;
+    connection.pragma_update(None, "foreign_keys", "ON").ok()?;
+    let journal: String = connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .ok()?;
+    if !journal.eq_ignore_ascii_case("wal") || user_version(&connection).ok()? != SCHEMA_VERSION {
+        return None;
+    }
+    if meta(&connection, "vault_id").ok()?.as_deref() != Some(vault.id().as_str()) {
+        return None;
+    }
+    Some(Index {
+        connection,
+        path,
+        local: local.clone(),
+    })
+}
+
+/// Reopen an initialized index read-only, without taking the ingest lock.
+/// The caller reads a committed snapshot whose stored source cursor matches the
+/// Vault, and uses this connection for that snapshot and local queries/extras. WAL provides a consistent read transaction;
+/// schema or identity mismatches are errors and make the caller fall back to a
+/// normal locked refresh.
+pub(crate) fn open_index_read(local: &LocalPaths, vault: &Vault) -> Result<Index> {
+    local.validate_against_vault_root(vault.root())?;
+    let path = local.index_path(vault.id());
+    validate_index_leaves(&path, vault)?;
+    let connection = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(index_error)?;
+    connection
+        .busy_timeout(std::time::Duration::from_millis(5_000))
+        .map_err(index_error)?;
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .map_err(index_error)?;
+    if user_version(&connection)? != SCHEMA_VERSION {
+        return Err(index_error_message(
+            "The cached index schema is not the version used by this read.",
+            "schema_version_unsupported",
+        ));
+    }
+    if meta(&connection, "vault_id")?.as_deref() != Some(vault.id().as_str()) {
+        return Err(index_error_message(
+            "The index belongs to a different Vault; use a normal refresh.",
+            "vault_id_mismatch",
+        ));
+    }
+    Ok(Index {
+        connection,
+        path,
+        local: local.clone(),
+    })
 }
 
 fn open_locked(local: &LocalPaths, vault: &Vault) -> Result<Index> {
@@ -366,6 +446,22 @@ fn table_names(connection: &Connection) -> Result<Vec<String>> {
 pub fn rebuild(vault: &Vault, local: &LocalPaths, now: UtcTime) -> Result<Index> {
     local.validate_against_vault_root(vault.root())?;
     local.ensure_layout(vault.root(), vault.id())?;
+    // The rebuild reads every source under the lock, so first make sure each
+    // one's content is on this computer, with bounded reads and no lock: a
+    // file a sync app has not downloaded yet refuses the rebuild (retryable)
+    // instead of holding the lock for the download. The scan also asks the
+    // sync app for it.
+    let available = ingest::prescan(
+        vault,
+        &source_reads::SourceReads::shared(),
+        &BTreeMap::new(),
+        &[],
+    )?;
+    if let Some(path) = available.waiting().next() {
+        return Err(source_reads::waiting_error(path)
+            .with_hint("Wait for the sync app to download the Vault, then rebuild again."));
+    }
+    drop(available);
     // The rebuild lock is acquired before preflight so a concurrent ingest can
     // never interleave with the scan/compare/replace sequence.
     let _lock = acquire_ingest_lock_file(local, vault)?;
@@ -374,11 +470,15 @@ pub fn rebuild(vault: &Vault, local: &LocalPaths, now: UtcTime) -> Result<Index>
     let scan = ingest::preflight_scan(vault)?;
     let mut index = open_locked(local, vault)?;
     let cached = cached_variants(&index)?;
-    for variant in &cached {
-        if !scan
-            .variants
-            .contains_key(&(variant.0.clone(), variant.1.clone()))
-        {
+    let scanned_ids: std::collections::BTreeSet<&EventId> =
+        scan.variants.keys().map(|(id, _)| id).collect();
+    for (id, digest, undecodable) in &cached {
+        // A row this binary cannot read (kept for a newer decoder, or stored
+        // by one) may decode here under another digest, be kept again, or be
+        // rejected: its line is still in the Vault when its id is.
+        let kept = scan.variants.contains_key(&(id.clone(), digest.clone()))
+            || (*undecodable && (scanned_ids.contains(id) || scan.rejected_ids.contains(id)));
+        if !kept {
             return Err(index_error_message(
                 "The Vault no longer contains an event the index already observed; rebuild aborted without deleting the cache.",
                 "cached_event_missing",
@@ -418,11 +518,19 @@ pub fn rebuild(vault: &Vault, local: &LocalPaths, now: UtcTime) -> Result<Index>
         }
         insert_raw_event(&transaction, event, &digest)?;
     }
+    for placeholder in &scan.placeholders {
+        insert_placeholder(&transaction, placeholder)?;
+    }
     for occurrence in &scan.occurrences {
         ingest::insert_occurrence(&transaction, occurrence)?;
     }
     apply_resolution(&transaction, &resolution)?;
     store_projection_tx(&transaction, &state, generation, now)?;
+    set_meta(
+        &transaction,
+        "source_digest",
+        ingest::source_records_digest(&scan.sources).as_str(),
+    )?;
     transaction
         .execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES('epoch', ?1)",
@@ -479,26 +587,33 @@ fn integrity_ok(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn cached_variants(index: &Index) -> Result<Vec<(EventId, Sha256)>> {
+/// Every cached `(id, digest)`, and whether this binary cannot read the row
+/// (kept for a newer decoder, or stored by one).
+fn cached_variants(index: &Index) -> Result<Vec<(EventId, Sha256, bool)>> {
     let mut statement = index
         .connection
-        .prepare("SELECT id, digest FROM raw_events")
+        .prepare("SELECT id, digest, reason IS ?1, json, writer FROM raw_events")
         .map_err(index_error)?;
     let rows = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        .query_map(params![UNDECODABLE], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
         })
         .map_err(index_error)?;
     let mut variants = Vec::new();
     for row in rows {
-        let (id, digest) = row.map_err(index_error)?;
-        variants.push((
-            EventId::parse(&id)
-                .map_err(|_| index_error_message("Invalid event id in index.", "index_id"))?,
-            Sha256::parse(&digest).map_err(|_| {
-                index_error_message("Invalid event digest in index.", "index_digest")
-            })?,
-        ));
+        let (id, digest, marked, json, writer) = row.map_err(index_error)?;
+        let id = EventId::parse(&id)
+            .map_err(|_| index_error_message("Invalid event id in index.", "index_id"))?;
+        let digest = Sha256::parse(&digest)
+            .map_err(|_| index_error_message("Invalid event digest in index.", "index_digest"))?;
+        let unreadable = marked || decode_stored(&id, &digest, &json, &writer).is_none();
+        variants.push((id, digest, unreadable));
     }
     Ok(variants)
 }
@@ -778,6 +893,16 @@ pub(crate) fn store_projection_tx(
     set_meta(transaction, "reducer_version", &REDUCER_VERSION.to_string())?;
     set_meta(transaction, "evaluated_at", &state.evaluated_at.canonical())?;
     set_meta(transaction, "generation", &generation.to_string())?;
+    set_meta(
+        transaction,
+        decode::META_DECODER_VERSION,
+        &decode::decoder_version(),
+    )?;
+    set_meta(
+        transaction,
+        decode::META_DECODER_GENERATION,
+        &generation.to_string(),
+    )?;
     set_meta(transaction, "last_scan_at", &now.canonical())?;
     Ok(())
 }
@@ -808,11 +933,59 @@ pub fn insert_raw_event(
     Ok(changed == 1)
 }
 
+/// Keep a line this version cannot decode for a newer one (see [`decode`]).
+pub(crate) fn insert_placeholder(
+    transaction: &rusqlite::Transaction<'_>,
+    placeholder: &decode::Placeholder,
+) -> Result<()> {
+    transaction
+        .execute(
+            "INSERT INTO raw_events(id, digest, writer, seq, ts, project, kind, json, status, reason)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'quarantined', 'undecodable')
+             ON CONFLICT(id, digest) DO NOTHING",
+            params![
+                placeholder.id.as_str(),
+                placeholder.digest.as_str(),
+                placeholder.writer,
+                i64::try_from(placeholder.seq).unwrap_or(i64::MAX),
+                placeholder.ts,
+                placeholder.project,
+                placeholder.kind,
+                placeholder.json
+            ],
+        )
+        .map_err(index_error)?;
+    Ok(())
+}
+
 pub fn apply_resolution(
     transaction: &rusqlite::Transaction<'_>,
     resolution: &Resolution,
 ) -> Result<()> {
+    apply_resolution_changed(transaction, resolution, &BTreeMap::new())
+}
+
+/// Each stored variant's `(status, reason)`; `None` for a row this commit
+/// inserts.
+pub(crate) type StoredStatuses = BTreeMap<(EventId, Sha256), Option<(String, Option<String>)>>;
+
+/// Write each variant's status unless `stored` already holds exactly it. A
+/// variant missing from `stored` is always written.
+pub(crate) fn apply_resolution_changed(
+    transaction: &rusqlite::Transaction<'_>,
+    resolution: &Resolution,
+    stored: &StoredStatuses,
+) -> Result<()> {
     for ((id, digest), variant) in &resolution.variants {
+        if stored
+            .get(&(id.clone(), digest.clone()))
+            .and_then(Option::as_ref)
+            .is_some_and(|(status, reason)| {
+                status == variant.status.as_str() && reason == &variant.reason
+            })
+        {
+            continue;
+        }
         transaction
             .execute(
                 "UPDATE raw_events SET status = ?1, reason = ?2 WHERE id = ?3 AND digest = ?4",
@@ -834,13 +1007,21 @@ pub struct RawVariant {
     pub id: EventId,
     pub digest: Sha256,
     pub event: Option<Event>,
+    /// The row's stored `status` and `reason` (the last commit's resolution).
+    pub status: String,
+    pub reason: Option<String>,
 }
 
-/// Load every raw variant, decoding the ones that still decode.
+/// Load every raw variant, decoding the ones that still decode. A row a
+/// commit marked `undecodable` is not decoded again here: the decoder that
+/// committed could not read it, and a different decoder re-reads it in its
+/// first commit (`ingest::redecode_stored`), never in a read.
 pub fn load_variants(index: &Index) -> Result<Vec<RawVariant>> {
     let mut statement = index
         .connection
-        .prepare("SELECT id, digest, json, writer FROM raw_events ORDER BY id, digest")
+        .prepare(
+            "SELECT id, digest, json, writer, status, reason FROM raw_events ORDER BY id, digest",
+        )
         .map_err(index_error)?;
     let rows = statement
         .query_map([], |row| {
@@ -849,18 +1030,30 @@ pub fn load_variants(index: &Index) -> Result<Vec<RawVariant>> {
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })
         .map_err(index_error)?;
     let mut variants = Vec::new();
     for row in rows {
-        let (id, digest, json, writer) = row.map_err(index_error)?;
+        let (id, digest, json, writer, status, reason) = row.map_err(index_error)?;
         let id = EventId::parse(&id)
             .map_err(|_| index_error_message("Invalid event id in index.", "index_id"))?;
         let digest = Sha256::parse(&digest)
             .map_err(|_| index_error_message("Invalid event digest in index.", "index_digest"))?;
-        let event = decode_stored(&id, &digest, &json, &writer);
-        variants.push(RawVariant { id, digest, event });
+        let event = if reason.as_deref() == Some(UNDECODABLE) {
+            None
+        } else {
+            decode_stored(&id, &digest, &json, &writer)
+        };
+        variants.push(RawVariant {
+            id,
+            digest,
+            event,
+            status,
+            reason,
+        });
     }
     Ok(variants)
 }
@@ -879,7 +1072,7 @@ pub(crate) fn decode_stored(
     let source = crate::model::SourcePath::from_relative_path(&relative).ok()?;
     let mut text = json.as_bytes().to_vec();
     text.push(b'\n');
-    let event = parse_event(&text, &source).ok()?;
+    let event = decode::decode_event(&text, &source).ok()?;
     (event.id == *id).then_some(event)
 }
 

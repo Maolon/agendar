@@ -7,6 +7,7 @@
 
 import { tx, type MessageKey } from "../i18n";
 import { formatFinishWindow, formatWorkRange } from "../api/format";
+import { isMoving, isStalled } from "./moving";
 import type {
   BudgetUsage,
   Calibration,
@@ -23,30 +24,119 @@ export const PROGRESS_LABEL: Record<FeatureState["progress"], string> = new Prox
   { get: (_, progress: string) => tx(`progress.${progress}` as MessageKey) },
 );
 
+export interface AgentCounts {
+  /** Agents with a step Now lists under Moving now. */
+  working: number;
+  /** Connected agents with no moving step and a step Now lists under Stalled. */
+  stalled: number;
+  /** Connected agents with no moving or stalled step and a step that waits on the owner's answer. */
+  waiting: number;
+  /** Connected agents holding nothing that moves, is stalled or waits on the owner's answer. */
+  idle: number;
+}
+
 /**
- * Working means a live agent has a step in progress. A connected agent with
- * nothing in progress (a session idle at its prompt) is idle, not working.
+ * A project's agents by where Now lists their steps, each agent once: working
+ * when one of its steps is moving (`isMoving`, whatever else it holds), else
+ * stalled when it is connected and one of its steps is stalled (`isStalled`),
+ * else waiting when it is connected and one of its steps in progress waits on
+ * its own open question (the owner's answer), else idle when it is connected.
+ * Stalled, waiting and idle never add up to more than the connected agents
+ * that are not working.
  */
-export function workingAgents(project: ProjectState): number {
-  const sessions = new Set<string>();
+export function agentCounts(project: ProjectState): AgentCounts {
+  const working = new Set<string>();
+  const connected = new Set<string>();
+  const stalled = new Set<string>();
+  const asking = new Set<string>();
   for (const feature of Object.values(project.features)) {
-    if (feature.progress === "doing" && feature.liveness === "live" && feature.session) {
-      sessions.add(feature.session);
+    if (!feature.session) continue;
+    if (isMoving(feature)) {
+      working.add(feature.session);
+      if (feature.liveness === "live") connected.add(feature.session);
+    } else if (isStalled(feature) && feature.liveness === "live") {
+      stalled.add(feature.session);
+    } else if (feature.progress === "doing" && feature.claim?.waiting_on && feature.liveness === "live") {
+      asking.add(feature.session);
     }
   }
-  return sessions.size;
+  for (const session of working) {
+    stalled.delete(session);
+    asking.delete(session);
+  }
+  for (const session of stalled) asking.delete(session);
+  const rest = Math.max(0, project.summary.active_agents - connected.size);
+  const stalledCount = Math.min(stalled.size, rest);
+  const waiting = Math.min(asking.size, rest - stalledCount);
+  const idle = rest - stalledCount - waiting;
+  return { working: working.size, stalled: stalledCount, waiting, idle };
 }
 
-/** Connected agents with no step in progress. */
+/** The counts of several projects added up. */
+export function totalAgents(projects: readonly ProjectState[]): AgentCounts {
+  const total: AgentCounts = { working: 0, stalled: 0, waiting: 0, idle: 0 };
+  for (const project of projects) {
+    const counts = agentCounts(project);
+    total.working += counts.working;
+    total.stalled += counts.stalled;
+    total.waiting += counts.waiting;
+    total.idle += counts.idle;
+  }
+  return total;
+}
+
+/** Agents with a moving step: the same steps as Now's Moving now. */
+export function workingAgents(project: ProjectState): number {
+  return agentCounts(project).working;
+}
+
+/** Connected agents with no moving step and a stalled one. */
+export function stalledAgents(project: ProjectState): number {
+  return agentCounts(project).stalled;
+}
+
+/** Connected agents whose only business is their own open question to the owner. */
+export function waitingAgents(project: ProjectState): number {
+  return agentCounts(project).waiting;
+}
+
+/** Connected agents holding nothing that moves, is stalled or waits on the owner. */
 export function idleAgents(project: ProjectState): number {
-  return Math.max(0, project.summary.active_agents - workingAgents(project));
+  return agentCounts(project).idle;
 }
 
-/** "2 agents working", "1 agent idle", or null when no agent is connected. */
-export function agentsLine(working: number, idle: number): string | null {
-  if (working > 0) return working === 1 ? tx("agents.working.one") : tx("agents.working.other", { n: working });
+/**
+ * "2 agents working", "1 agent working · 1 agent waiting on you",
+ * "1 agent waiting on you · 1 agent stalled", "1 agent idle", or null when no
+ * agent is connected. The order is working, waiting on you, stalled; idle
+ * agents are named only when there is none of those.
+ */
+export function agentsLine({ working, stalled, waiting, idle }: AgentCounts): string | null {
+  const parts: string[] = [];
+  if (working > 0) parts.push(working === 1 ? tx("agents.working.one") : tx("agents.working.other", { n: working }));
+  if (waiting > 0) parts.push(waiting === 1 ? tx("agents.waiting.one") : tx("agents.waiting.other", { n: waiting }));
+  if (stalled > 0) parts.push(stalled === 1 ? tx("agents.stalled.one") : tx("agents.stalled.other", { n: stalled }));
+  if (parts.length) return parts.join(" · ");
   if (idle > 0) return idle === 1 ? tx("agents.idle.one") : tx("agents.idle.other", { n: idle });
   return null;
+}
+
+/** Steps with a delivery waiting for the owner's review. */
+export function reviewWaiting(project: ProjectState): Set<string> {
+  const nodes = new Set<string>();
+  for (const delivery of Object.values(project.deliveries)) {
+    if (delivery.superseded_by || delivery.review !== "pending") continue;
+    const feature = project.features[delivery.node];
+    if (!feature || feature.progress === "dropped") continue;
+    nodes.add(delivery.node);
+  }
+  return nodes;
+}
+
+/** Waiting for the owner's review: in review, or finished with a review pending. */
+export function waitsForReview(feature: FeatureState, waiting: ReadonlySet<string>): boolean {
+  if (feature.phase === "in_review") return true;
+  return (feature.progress === "done" || feature.progress === "verified") && waiting.has(feature.node);
 }
 
 export function inFlight(feature: FeatureState): boolean {
@@ -140,7 +230,7 @@ export function whoLabel(
     ? project.sessions[feature.session]
     : undefined;
   if (session) return { host: session.host, text: `${session.host} · ${session.harness.replace("_", " ")}` };
-  if (feature.progress === "done") return { text: tx("who.waiting") };
+  if (waitsForReview(feature, reviewWaiting(project))) return { text: tx("who.waiting") };
   return { text: tx("who.nobody") };
 }
 

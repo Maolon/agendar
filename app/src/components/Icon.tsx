@@ -36,11 +36,14 @@ import {
   Pencil,
   Radar,
   Radio,
+  Redo2,
   RefreshCw,
+  Scan,
   Search,
   Server,
   Settings,
   Shield,
+  SquareDashed,
   Star,
   Target,
   Terminal,
@@ -48,6 +51,8 @@ import {
   Undo2,
   User,
   X,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
 
 /**
@@ -105,6 +110,11 @@ const ICONS = {
   box: Box,
   "circle-dot": CircleDot,
   library: Library,
+  "square-dashed": SquareDashed,
+  "zoom-in": ZoomIn,
+  "zoom-out": ZoomOut,
+  scan: Scan,
+  "redo-2": Redo2,
 } as const;
 
 export type IconName = keyof typeof ICONS;

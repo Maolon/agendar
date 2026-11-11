@@ -13,13 +13,14 @@ use serde_json::{Map, Value};
 use crate::error::{AgendarError, Result};
 use crate::model::cards::{
     CardEvidence, CheckResult, Claim, Criterion, CriterionResult, DecisionCard, Demo,
-    ObservationMethod, ReviewVerdict,
+    ObservationMethod, ReviewAnchor, ReviewComment, ReviewVerdict,
 };
 use crate::model::event::{
     Budget, DecisionAck, DecisionAnswer, DecisionAsk, DecisionChoice, DecisionWithdrawn, Delivered,
-    Delivery, Event, EventPayload, EvidenceObserved, PlanFeature, PolicyCells, PolicyEvaluation,
-    PolicySet, Preset, ProjectDeclared, Pulse, Refs, ReportPublished, ReviewResult, RuleSet,
-    SessionContinued, SessionLost, SourcePath, WorkProgress, WorkStatus,
+    Delivery, Event, EventPayload, EvidenceObserved, MAX_NEED_ID_CHARS, MAX_SNOOZE_MS, NeedSnoozed,
+    PlanDropped, PlanFeature, PolicyCells, PolicyEvaluation, PolicySet, Preset, ProjectDeclared,
+    Pulse, Refs, Reply, ReportPublished, ReviewResult, RuleSet, SessionContinued, SessionLost,
+    SourcePath, WorkProgress, WorkStatus,
 };
 use crate::model::ids::{BlobExt, BlobRef, EventId, Mode, WriterRole};
 
@@ -286,7 +287,7 @@ fn validate_envelope_keys(object: &Map<String, Value>) -> Result<()> {
 /// also accept a positional array of field values for any object-shaped slot, so
 /// every array in a raw event must appear at one of these semantic positions.
 /// A legitimate array added later must be listed here deliberately.
-const SEMANTIC_ARRAYS: [&str; 20] = [
+const SEMANTIC_ARRAYS: [&str; 24] = [
     "refs/causes",
     "refs/basis",
     "body/depends_on",
@@ -294,7 +295,11 @@ const SEMANTIC_ARRAYS: [&str; 20] = [
     "body/criteria",
     "body/demos",
     "body/demos/*/body/check/argv",
+    "body/demos/*/body/shown",
+    "body/demos/*/body/omitted",
     "body/done_when",
+    "body/comments",
+    "body/replies",
     "body/restarted",
     "body/disclosure/proven",
     "body/disclosure/not_proven_yet",
@@ -430,6 +435,8 @@ fn decode_payload(kind: &str, body: &Value) -> Result<EventPayload> {
     match kind {
         "project.declared" => decode_body!(EventPayload::ProjectDeclared, ProjectDeclared),
         "plan.feature" => decode_body!(EventPayload::PlanFeature, PlanFeature),
+        "plan.dropped" => decode_body!(EventPayload::PlanDropped, PlanDropped),
+        "need.snoozed" => decode_body!(EventPayload::NeedSnoozed, NeedSnoozed),
         "work.progress" => decode_body!(EventPayload::WorkProgress, WorkProgress),
         "pulse" => decode_body!(EventPayload::Pulse, Pulse),
         "decision.ask" => decode_body!(EventPayload::DecisionAsk, DecisionAsk),
@@ -530,7 +537,8 @@ enum RoleRule {
 fn role_rule(kind: &str) -> RoleRule {
     match kind {
         "project.declared" | "plan.feature" => RoleRule::HumanOrAgent,
-        "decision.answer" | "review.result" | "rule.set" | "policy.set" => RoleRule::HumanOnly,
+        "decision.answer" | "review.result" | "rule.set" | "policy.set" | "plan.dropped"
+        | "need.snoozed" => RoleRule::HumanOnly,
         "evidence.observed" | "session.lost" | "session.continued" | "delivered" => {
             RoleRule::StewardOnly
         }
@@ -719,7 +727,6 @@ const NODE_ATTEMPT_REFS: &[RefName] = &[RefName::Node, RefName::Attempt];
 const NODE_ASK_REFS: &[RefName] = &[RefName::Node, RefName::Ask];
 const NODE_ASK_ANSWER_REFS: &[RefName] = &[RefName::Node, RefName::Ask, RefName::Answer];
 const NODE_DELIVERY_REFS: &[RefName] = &[RefName::Node, RefName::Delivery];
-const NODE_ATTEMPT_RECEIPT_REFS: &[RefName] = &[RefName::Node, RefName::Attempt, RefName::Receipt];
 const NODE_SUPERSEDES_REFS: &[RefName] = &[RefName::Node, RefName::Supersedes];
 const NODE_ASK_ATTEMPT_REFS: &[RefName] = &[RefName::Node, RefName::Ask, RefName::Attempt];
 const NODE_ATTEMPT_RECEIPT_SUPERSEDES_REFS: &[RefName] = &[
@@ -757,12 +764,13 @@ fn ref_rule(event: &Event) -> Result<RefRule> {
     let rule = match &event.payload {
         EventPayload::ProjectDeclared(_)
         | EventPayload::RuleSet(_)
-        | EventPayload::PolicySet(_) => RefRule {
+        | EventPayload::PolicySet(_)
+        | EventPayload::NeedSnoozed(_) => RefRule {
             required: NONE_REFS,
             allowed: NONE_REFS,
             basis: false,
         },
-        EventPayload::PlanFeature(_) => RefRule {
+        EventPayload::PlanFeature(_) | EventPayload::PlanDropped(_) => RefRule {
             required: NODE_REFS,
             allowed: NODE_REFS,
             basis: false,
@@ -833,8 +841,10 @@ fn ref_rule(event: &Event) -> Result<RefRule> {
             allowed: NODE_ASK_ANSWER_REFS,
             basis: false,
         },
+        // The receipt is optional: finished work no decision asked for is
+        // delivered without one.
         EventPayload::Delivery(_) => RefRule {
-            required: NODE_ATTEMPT_RECEIPT_REFS,
+            required: NODE_ATTEMPT_REFS,
             allowed: NODE_ATTEMPT_RECEIPT_SUPERSEDES_REFS,
             basis: false,
         },
@@ -945,6 +955,11 @@ fn validate_body(event: &Event) -> Result<()> {
     match &event.payload {
         EventPayload::ProjectDeclared(body) => validate_project_declared(body),
         EventPayload::PlanFeature(body) => validate_plan_feature(body, event),
+        EventPayload::PlanDropped(body) => match &body.note {
+            Some(note) => validate_note(note),
+            None => Ok(()),
+        },
+        EventPayload::NeedSnoozed(body) => validate_need_snoozed(body, event),
         EventPayload::WorkProgress(body) => validate_work_progress(body),
         EventPayload::Pulse(body) => validate_pulse(body),
         EventPayload::DecisionAsk(body) => validate_decision_ask(body),
@@ -954,7 +969,7 @@ fn validate_body(event: &Event) -> Result<()> {
         EventPayload::ReportPublished(body) => validate_report_published(body),
         EventPayload::DecisionAnswer(body) => validate_decision_answer(body),
         EventPayload::DecisionAck(body) => validate_decision_ack(body),
-        EventPayload::Delivery(body) => validate_delivery(body),
+        EventPayload::Delivery(body) => validate_delivery(body, event),
         EventPayload::EvidenceObserved(body) => validate_evidence_observed(body, event),
         EventPayload::ReviewResult(body) => validate_review_result(body),
         EventPayload::RuleSet(body) => validate_rule_set(body, "/"),
@@ -1265,8 +1280,17 @@ fn validate_decision_ack(body: &DecisionAck) -> Result<()> {
     Ok(())
 }
 
-fn validate_delivery(body: &Delivery) -> Result<()> {
+fn validate_delivery(body: &Delivery, event: &Event) -> Result<()> {
     validate_text("/name", &body.name, 1, 80, false)?;
+    // Criteria are a receipt's done_when; without a receipt the disclosure
+    // carries the claims.
+    if event.refs.receipt.is_none() && !body.criteria.is_empty() {
+        return Err(validation_at(
+            "/criteria",
+            "delivery_criteria_without_receipt",
+            "A delivery without a receipt must list no criteria.",
+        ));
+    }
     if body.demos.is_empty() || body.demos.len() > 3 {
         return Err(validation_at(
             "/demos",
@@ -1292,7 +1316,58 @@ fn validate_delivery(body: &Delivery) -> Result<()> {
             CriterionContext::Delivery,
         )?;
     }
-    validate_disclosure(&body.disclosure)
+    validate_disclosure(&body.disclosure)?;
+    validate_replies(&body.replies, event)
+}
+
+/// Replies answer the send-back of the delivery this one supersedes: one per
+/// target (the reason, or comment n counted from 1).
+fn validate_replies(replies: &[Reply], event: &Event) -> Result<()> {
+    if replies.is_empty() {
+        return Ok(());
+    }
+    if event.refs.supersedes.is_none() {
+        return Err(validation_at(
+            "/replies",
+            "delivery_replies_without_supersedes",
+            "replies are only allowed on a delivery that supersedes another.",
+        ));
+    }
+    if replies.len() > MAX_REVIEW_COMMENTS + 1 {
+        return Err(validation_at(
+            "/replies",
+            "too_many_replies",
+            format!(
+                "A delivery carries at most {} replies: one to the reason and one per comment.",
+                MAX_REVIEW_COMMENTS + 1
+            ),
+        ));
+    }
+    let mut targets = BTreeSet::new();
+    for (index, reply) in replies.iter().enumerate() {
+        if reply.comment == Some(0) {
+            return Err(validation_at(
+                format!("/replies/{index}/comment"),
+                "reply_comment_out_of_range",
+                "comment numbers count from 1.",
+            ));
+        }
+        if !targets.insert(reply.comment) {
+            return Err(validation_at(
+                format!("/replies/{index}"),
+                "duplicate_reply",
+                "At most one reply per comment, and one to the reason.",
+            ));
+        }
+        validate_text(
+            &format!("/replies/{index}/text"),
+            &reply.text,
+            1,
+            300,
+            false,
+        )?;
+    }
+    Ok(())
 }
 
 fn validate_evidence_observed(body: &EvidenceObserved, event: &Event) -> Result<()> {
@@ -1333,19 +1408,27 @@ fn validate_evidence_observed(body: &EvidenceObserved, event: &Event) -> Result<
 
 fn validate_review_result(body: &ReviewResult) -> Result<()> {
     match body.verdict {
-        ReviewVerdict::SendBack => {
-            let Some(reason) = &body.reason else {
+        ReviewVerdict::SendBack => match &body.reason {
+            Some(reason) => validate_text("/reason", reason, 1, 500, true)?,
+            None if body.comments.is_empty() => {
                 return Err(validation_at(
                     "/reason",
                     "send_back_requires_reason",
-                    "review.result send_back requires a nonblank reason.",
+                    "review.result send_back requires a nonblank reason or at least one comment.",
                 ));
-            };
-            validate_text("/reason", reason, 1, 500, true)?;
-        }
+            }
+            None => {}
+        },
         ReviewVerdict::Accept => {
             if let Some(reason) = &body.reason {
                 validate_text("/reason", reason, 1, 500, true)?;
+            }
+            if !body.comments.is_empty() {
+                return Err(validation_at(
+                    "/comments",
+                    "comments_require_send_back",
+                    "comments are only allowed with send_back.",
+                ));
             }
         }
     }
@@ -1359,6 +1442,93 @@ fn validate_review_result(body: &ReviewResult) -> Result<()> {
     if let Some(rule) = &body.save_rule {
         validate_rule_set(rule, "/save_rule")?;
     }
+    if body.comments.len() > MAX_REVIEW_COMMENTS {
+        return Err(validation_at(
+            "/comments",
+            "too_many_comments",
+            format!("A review carries at most {MAX_REVIEW_COMMENTS} comments."),
+        ));
+    }
+    for (index, comment) in body.comments.iter().enumerate() {
+        validate_review_comment(comment, &format!("/comments/{index}"))?;
+    }
+    Ok(())
+}
+
+/// Most anchored comments one review may carry.
+pub const MAX_REVIEW_COMMENTS: usize = 20;
+/// Longest quoted line, in characters, including the trailing ellipsis.
+pub const MAX_REVIEW_QUOTE: usize = 200;
+
+/// One anchored review comment, on its own: the host checks it against the
+/// delivery's demos before writing.
+pub fn validate_review_comment(comment: &ReviewComment, field: &str) -> Result<()> {
+    validate_text(&format!("{field}/text"), &comment.text, 1, 300, false)?;
+    let anchor = format!("{field}/anchor");
+    if usize::from(comment.anchor.demo()) >= 3 {
+        return Err(validation_at(
+            format!("{anchor}/demo"),
+            "demo_out_of_range",
+            "A delivery has at most 3 demos; demo must be 0, 1 or 2.",
+        ));
+    }
+    match &comment.anchor {
+        ReviewAnchor::DiffLine {
+            file, line, quote, ..
+        } => {
+            validate_text(&format!("{anchor}/file"), file, 1, 300, false)?;
+            validate_anchor_line(&anchor, *line)?;
+            validate_quote(&anchor, quote)?;
+        }
+        ReviewAnchor::TranscriptLine { line, quote, .. } => {
+            validate_anchor_line(&anchor, *line)?;
+            validate_quote(&anchor, quote)?;
+        }
+        ReviewAnchor::Region { x, y, w, h, .. } => {
+            let fits = *w >= 1
+                && *h >= 1
+                && u32::from(*x) + u32::from(*w) <= 1000
+                && u32::from(*y) + u32::from(*h) <= 1000;
+            if !fits {
+                return Err(validation_at(
+                    anchor,
+                    "region_out_of_range",
+                    "A region is per-mille of the image: w and h at least 1, x+w and y+h at most 1000.",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_anchor_line(anchor: &str, line: u32) -> Result<()> {
+    if line == 0 {
+        return Err(validation_at(
+            format!("{anchor}/line"),
+            "line_out_of_range",
+            "Lines are numbered from 1.",
+        ));
+    }
+    Ok(())
+}
+
+/// A quote may be blank (an empty line) but stays one short line.
+fn validate_quote(anchor: &str, quote: &str) -> Result<()> {
+    let field = format!("{anchor}/quote");
+    if quote.chars().count() > MAX_REVIEW_QUOTE {
+        return Err(validation_at(
+            field,
+            "length",
+            format!("A quote is at most {MAX_REVIEW_QUOTE} characters."),
+        ));
+    }
+    if quote.chars().any(|c| c.is_control() && c != '\t') {
+        return Err(validation_at(
+            field,
+            "control_character",
+            "A quote must not contain control characters other than tab.",
+        ));
+    }
     Ok(())
 }
 
@@ -1368,6 +1538,46 @@ fn validate_session_continued(body: &SessionContinued) -> Result<()> {
             "/previous",
             "session_continues_itself",
             "A session cannot continue itself.",
+        ));
+    }
+    Ok(())
+}
+
+/// The note limit shared by `work.progress` and `plan.dropped`.
+pub(crate) fn validate_note(note: &str) -> Result<()> {
+    validate_text("/note", note, 1, limits::NOTE, false)
+}
+
+/// A snooze names one row by its id and ends at most seven days after the
+/// event's own time. An `until` at or before `ts` is valid: it ends the snooze.
+fn validate_need_snoozed(body: &NeedSnoozed, event: &Event) -> Result<()> {
+    let need = &body.need;
+    if need.is_empty() || need != need.trim() {
+        return Err(validation_at(
+            "/need",
+            "blank_string",
+            "/need must be the id of a Needs-you row.",
+        ));
+    }
+    if need.chars().count() > MAX_NEED_ID_CHARS {
+        return Err(validation_at(
+            "/need",
+            "length",
+            format!("/need is at most {MAX_NEED_ID_CHARS} characters."),
+        ));
+    }
+    if need.chars().any(char::is_control) {
+        return Err(validation_at(
+            "/need",
+            "control_character",
+            "/need must not contain control characters.",
+        ));
+    }
+    if body.until.millis() - event.ts.millis() > MAX_SNOOZE_MS {
+        return Err(validation_at(
+            "/until",
+            "snooze_too_long",
+            "A snooze can last at most seven days.",
         ));
     }
     Ok(())
@@ -1933,6 +2143,69 @@ fn validate_demo(field: &str, demo: &Demo) -> Result<()> {
                 "recording poster",
             )?;
         }
+        Demo::Diff(body) => validate_diff_demo(field, body)?,
+    }
+    Ok(())
+}
+
+/// Most hunks one diff demo may show; it is the core, not the whole change.
+pub const DIFF_SHOWN_MAX: usize = 12;
+/// Most files listed as not shown.
+pub const DIFF_OMITTED_MAX: usize = 200;
+
+fn validate_diff_demo(field: &str, body: &crate::model::cards::DiffDemo) -> Result<()> {
+    validate_demo_blob(
+        &format!("{field}/body/blob"),
+        &body.blob,
+        &[BlobExt::Txt],
+        "diff demo",
+    )?;
+    let commit = &body.commit;
+    if commit.len() != 40
+        || !commit
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(validation_at(
+            format!("{field}/body/commit"),
+            "diff_commit",
+            "A diff demo commit must be a full 40-character lowercase hex sha.",
+        ));
+    }
+    if body.shown.is_empty() || body.shown.len() > DIFF_SHOWN_MAX {
+        return Err(validation_at(
+            format!("{field}/body/shown"),
+            "diff_shown_count",
+            format!("A diff demo shows 1..={DIFF_SHOWN_MAX} hunks."),
+        ));
+    }
+    for (index, shown) in body.shown.iter().enumerate() {
+        let at = format!("{field}/body/shown/{index}");
+        validate_text(&format!("{at}/path"), &shown.path, 1, 300, false)?;
+        validate_text(&format!("{at}/why"), &shown.why, 1, 160, false)?;
+        if shown.hunk == 0 {
+            return Err(validation_at(
+                format!("{at}/hunk"),
+                "diff_hunk_index",
+                "A hunk index is 1-based.",
+            ));
+        }
+    }
+    if body.omitted.len() > DIFF_OMITTED_MAX {
+        return Err(validation_at(
+            format!("{field}/body/omitted"),
+            "diff_omitted_count",
+            format!("A diff demo lists at most {DIFF_OMITTED_MAX} omitted files."),
+        ));
+    }
+    for (index, file) in body.omitted.iter().enumerate() {
+        validate_text(
+            &format!("{field}/body/omitted/{index}/path"),
+            &file.path,
+            1,
+            300,
+            false,
+        )?;
     }
     Ok(())
 }

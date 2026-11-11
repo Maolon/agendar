@@ -36,6 +36,8 @@ pub enum NudgeKind {
     EtaOverdue,
     /// A human changed the goal, a step, the rules or the policy.
     PlanChanged,
+    /// A step this session was on was freed and another session took it.
+    TakenOver,
 }
 
 /// Human edits to `project` in `ordered` (O-order) that a session has not
@@ -126,6 +128,16 @@ fn describe(event: &Event) -> Option<(Option<NodePath>, String)> {
             let text = text.trim().to_owned();
             (!text.is_empty()).then(|| (Some(node), format!("{text} Read board before going on.")))
         }
+        EventPayload::PlanDropped(body) => {
+            let node = event.refs.node.clone()?;
+            let note = body
+                .note
+                .as_deref()
+                .map(|note| format!(" ({})", note.trim()))
+                .unwrap_or_default();
+            let text = format!("The owner dropped {node}{note}. Stop work on it; read board.");
+            Some((Some(node), text))
+        }
         EventPayload::RuleSet(_) => Some((
             None,
             "A human changed the house rules; read rules before going on.".to_owned(),
@@ -139,8 +151,59 @@ fn describe(event: &Event) -> Option<(Option<NodePath>, String)> {
 }
 
 /// Nudges for the steps `session` currently runs in `project`, by node.
-/// A step on hold (waiting for a human) is never overdue.
+/// A step on hold (waiting for a human) is never overdue. A step it was on
+/// that another session took over is told once (the local cursor).
 pub fn for_session(project: &ProjectState, session: &SessionId) -> Vec<Nudge> {
+    let mut nudges = overdue(project, session);
+    nudges.extend(taken_over(project, session));
+    nudges
+}
+
+/// "Freed, now with …": the session's unfinished attempt was replaced by
+/// another session's start while that start is still the current attempt.
+fn taken_over(project: &ProjectState, session: &SessionId) -> Vec<Nudge> {
+    project
+        .features
+        .values()
+        .filter(|feature| !feature.progress.is_terminal())
+        .filter_map(|feature| {
+            let from = feature.taken_from.as_ref()?;
+            if &from.session != session || feature.session.as_ref() == Some(session) {
+                return None;
+            }
+            let holder = feature.session.as_ref()?;
+            let why = if project
+                .sessions
+                .get(session)
+                .is_some_and(|state| state.lost_event.is_some())
+            {
+                "your session had stopped"
+            } else if feature.handoff_consumed_by.is_some() {
+                "the owner handed it over"
+            } else if from.granted_by.is_some() {
+                "the owner let another agent continue it"
+            } else {
+                "your ETA had passed and no word came from you for a day"
+            };
+            Some(Nudge {
+                kind: NudgeKind::TakenOver,
+                text: format!(
+                    "{} was freed ({why}); now with session {}. Do not go on with it; \
+                     read board.",
+                    feature.node,
+                    holder.as_str()
+                ),
+                node: Some(feature.node.clone()),
+                attempt: feature.attempt.clone(),
+                due_at: None,
+                late_by_s: None,
+                event: None,
+            })
+        })
+        .collect()
+}
+
+fn overdue(project: &ProjectState, session: &SessionId) -> Vec<Nudge> {
     project
         .features
         .values()

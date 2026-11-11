@@ -11,9 +11,9 @@ use serde_json::Value;
 
 use crate::error::{AgendarError, Result};
 use crate::model::cards::{
-    CheckResult, Criterion, DecisionCard, DecisionOption, Demo, DemoKind, Disclosure,
+    CheckResult, Criterion, DecisionCard, DecisionOption, Demo, DemoKind, Disclosure, ReviewComment,
 };
-use crate::model::event::{BudgetUsage, PolicySet, ReviewResult, RuleSet};
+use crate::model::event::{BudgetUsage, PolicySet, Reply, ReviewResult, RuleSet};
 use crate::model::ids::{
     EtaRange, EventId, Harness, HostId, Mode, NodePath, ProjectSlug, RuleId, SessionId, Sha256,
     UtcTime,
@@ -57,6 +57,108 @@ impl Progress {
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Done | Self::Verified | Self::Dropped)
     }
+}
+
+/// The derived phase of a step in progress whose latest work is a delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    /// Delivered; the owner holds it until they review. Never late.
+    InReview,
+    /// The owner sent the delivery back; the step is open again.
+    SentBack,
+}
+
+/// Whether an agent still stands behind a step in progress. Derived from the
+/// events and `as_of`; a time rule never writes an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Lease {
+    /// The agent's ETA has not passed, it spoke recently, or the clock is
+    /// stopped because it waits on a human.
+    Held,
+    /// The ETA passed and nothing was heard on the attempt: a label only.
+    Stalled,
+    /// Nobody stands behind it: its session was lost, or no word came for
+    /// [`CLAIM_EXPIRY_S`] after the later of its ETA and its last word.
+    Free,
+}
+
+/// A claim with nothing heard after its ETA is free this long after the later
+/// of its ETA bound and the agent's last word on the attempt (T = 24 h).
+pub const CLAIM_EXPIRY_S: i64 = 24 * 60 * 60;
+
+/// A planned step nobody touched for this long (14 days) is `untouched`.
+pub const UNTOUCHED_AFTER_S: i64 = 14 * 24 * 60 * 60;
+
+/// The claim of the agent session on a step in progress (doing or sent back).
+/// A step in review, paused or handed off has none: it is the owner's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimState {
+    pub state: Lease,
+    /// When this state began: held, from the last word (or the answer that
+    /// restarted the clock); stalled, from the ETA bound; free, from the loss
+    /// or the expiry.
+    pub since: UtcTime,
+    /// The latest event on this attempt by its session: a pulse, a delivery, a
+    /// progress event or a question on the step.
+    pub last_word: UtcTime,
+    /// The open question to the owner that stops the clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_on: Option<EventId>,
+}
+
+/// The closed table of corrections: rules by which the board shows something
+/// other than the agent's last self-report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CorrectionRule {
+    /// The owner accepted every live delivery: done.
+    Accepted,
+    /// The owner sent the delivery back: open again.
+    SentBack,
+    /// The host reported the session gone: free.
+    Lost,
+    /// No word on the attempt for T after its ETA: free.
+    Silent,
+    /// Rule 1b: the claim on an accepted step expired: done.
+    ClosedAfterAccept,
+}
+
+/// Why the board shows a step differently from its last self-report. Present
+/// exactly when the shown status differs from what the agent last said.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Correction {
+    pub rule: CorrectionRule,
+    pub since: UtcTime,
+    /// The events the rule rests on, at most two.
+    pub evidence: Vec<EventId>,
+}
+
+/// The attempt the current one took over from another session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TakenFrom {
+    pub attempt: EventId,
+    pub session: SessionId,
+    /// The start that took it over.
+    pub at: UtcTime,
+    /// The owner's answer that let it (a takeover the agent asked for).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_by: Option<EventId>,
+}
+
+/// The owner let `session` continue a step another agent holds: their
+/// current answer to its question chose the `takeover` option. The session
+/// starts the step by applying `answer`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TakeoverGrant {
+    pub session: SessionId,
+    pub ask: EventId,
+    pub answer: EventId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -359,6 +461,24 @@ pub struct FeatureState {
     pub complete: bool,
     pub field_sources: BTreeMap<String, EventId>,
     pub progress: Progress,
+    /// Where a step in progress stands after its delivery: waiting for the
+    /// owner's review, or sent back. Derived from the reviews; absent while
+    /// the agent is at work and once the step is finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<Phase>,
+    /// The agent's claim on a step in progress; see [`ClaimState`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<ClaimState>,
+    /// Present exactly when the shown status differs from the last
+    /// self-report; see [`CorrectionRule`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correction: Option<Correction>,
+    /// The other session's unfinished attempt the current one replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taken_from: Option<TakenFrom>,
+    /// Agents the owner let continue this step while another agent holds it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub takeover_grants: Vec<TakeoverGrant>,
     pub gate: Gate,
     pub basis: Basis,
     pub liveness: Liveness,
@@ -379,6 +499,26 @@ pub struct FeatureState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub handoff_consumed_by: Option<EventId>,
     pub handoff_pending: bool,
+    /// A planned step only agents wrote, nobody started, with no question on
+    /// it and no word for [`UNTOUCHED_AFTER_S`]: the app folds it at the end
+    /// of the list. A label, never a correction; the step stays work left. Any
+    /// owner event on the step (the "Keep" button is one) clears it for good.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub untouched: bool,
+    /// Present when the step is dropped and the owner dropped it
+    /// (`plan.dropped`); a step an agent dropped has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_drop: Option<OwnerDrop>,
+}
+
+/// The owner's drop a dropped step rests on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerDrop {
+    pub event: EventId,
+    pub at: UtcTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -452,7 +592,10 @@ pub struct DeliveryState {
     pub id: EventId,
     pub node: NodePath,
     pub attempt: EventId,
-    pub receipt: EventId,
+    /// The decision receipt this delivery answers. A delivery of finished work
+    /// that no decision asked for has none, and then lists no criteria.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<EventId>,
     pub name: String,
     pub demos: Vec<Demo>,
     pub criteria: Vec<ProjectedCriterion>,
@@ -465,6 +608,27 @@ pub struct DeliveryState {
     pub review_history: Vec<EventId>,
     pub review_frontier: Vec<EventId>,
     pub review_conflict: bool,
+    /// The earlier delivery on the same feature this one replaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<EventId>,
+    /// The agent's replies to the send-back of `supersedes`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replies: Vec<Reply>,
+    /// This delivery's latest send-back, kept after it is superseded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent_back: Option<SentBackNote>,
+}
+
+/// What a send-back said: its reason and anchored comments, in stored order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SentBackNote {
+    pub review: EventId,
+    pub at: UtcTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub comments: Vec<ReviewComment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -507,6 +671,36 @@ pub struct NeedsYouItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question_msg: Option<crate::model::Msg>,
     pub unblocks: Vec<NodePath>,
+    /// A question whose step was dropped, or done with the owner's accept:
+    /// when the step closed, and whether the row has folded out of the active
+    /// list ([`MOOT_FOLD_S`] later, still unanswered). A folded question stays
+    /// answerable, never notifies and no longer holds its session's steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_step: Option<ClosedStep>,
+    /// The owner snoozed this row (`need.snoozed`): hosts hide it until
+    /// then. Display only; nothing else in the state depends on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snoozed_until: Option<UtcTime>,
+}
+
+/// A question that is still open on a step that has closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClosedStep {
+    /// When the step was dropped, or accepted and done.
+    pub since: UtcTime,
+    /// The row left the active Needs-you list ("On closed steps").
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub folded: bool,
+}
+
+/// An open question on a closed step folds this long after the step closed
+/// (T = 24 h).
+pub const MOOT_FOLD_S: i64 = 24 * 60 * 60;
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -524,6 +718,10 @@ pub struct ProjectSummary {
     pub variance: Variance,
     pub active_agents: u32,
     pub stalled_agents: u32,
+    /// Steps that are not finished and whose holder is lost. A project with
+    /// live work stays active and carries this count instead of `stopped`.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub stopped_steps: u32,
     pub needs_count: u32,
     pub feature_counts: BTreeMap<Progress, u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -565,6 +763,10 @@ pub struct ReportState {
     pub title: String,
     pub summary: String,
     pub report: crate::model::BlobRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<crate::model::ReportKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<crate::model::Domain>,
     pub ts: UtcTime,
     pub session: SessionId,
     pub harness: Harness,
@@ -625,6 +827,9 @@ pub struct InboxPacket {
     pub receipt: Option<Receipt>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewResult>,
+    /// On a review packet, the delivery reviewed: a redelivery supersedes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<EventId>,
     pub source: EventId,
     pub redo: Vec<NodePath>,
     pub created_at: UtcTime,

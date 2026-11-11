@@ -4,7 +4,7 @@
 //! status, preferences and registration live elsewhere: `snapshot`
 //! reports `E_NOT_IMPLEMENTED` until the app shell supplies those local facts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::{AgendarError, ErrorCode, Result};
 use crate::index::{Index, index_error, index_error_message, meta};
 use crate::model::{
-    DecisionState, EventId, EventPayload, InboxPacket, NeedsYouItem, NodePath, PacketKind,
-    ProjectSlug, ProjectState, ProjectSummary, Receipt, RuleState, SessionId, Sha256, UtcTime,
+    DecisionState, Event, EventId, EventPayload, InboxPacket, NeedsYouItem, NodePath, PacketKind,
+    Progress, ProjectSlug, ProjectState, ProjectSummary, Receipt, ReviewStatus, ReviewVerdict,
+    RuleState, SessionId, Sha256, UtcTime, WorkStatus,
 };
 use crate::reduce::{ReduceContext, reduce};
 
@@ -79,6 +80,78 @@ pub struct FileHealth {
     pub health: String,
 }
 
+/// A local health note about one Vault file: its content is not on this
+/// computer yet (`source_waiting`, retryable) or its name is not a writer file
+/// (`source_stray`, a conflict copy or foreign file whose events are not read).
+/// One more note, `awaiting_newer_version` with path `projects`, counts the
+/// event lines this version cannot read but a newer one may.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SourceDiagnostic {
+    pub code: String,
+    pub message: String,
+    pub path: String,
+    pub retryable: bool,
+}
+
+/// The source notes the last full ingest recorded.
+pub fn source_diagnostics(index: &Index) -> Result<Vec<SourceDiagnostic>> {
+    use crate::index::ingest::{SOURCE_STRAY, SOURCE_WAITING};
+    let mut statement = index
+        .connection
+        .prepare(
+            "SELECT code, message, path FROM diagnostics
+             WHERE code IN (?1, ?2) AND path IS NOT NULL ORDER BY path, code",
+        )
+        .map_err(index_error)?;
+    let rows = statement
+        .query_map(params![SOURCE_WAITING, SOURCE_STRAY], |row| {
+            let code: String = row.get(0)?;
+            Ok(SourceDiagnostic {
+                retryable: code == SOURCE_WAITING,
+                code,
+                message: row.get(1)?,
+                path: row.get(2)?,
+            })
+        })
+        .map_err(index_error)?;
+    let mut notes: Vec<SourceDiagnostic> = rows
+        .collect::<std::result::Result<_, _>>()
+        .map_err(index_error)?;
+    let waiting: i64 = index
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM raw_events WHERE reason = ?1",
+            params![crate::index::UNDECODABLE],
+            |row| row.get(0),
+        )
+        .map_err(index_error)?;
+    if waiting > 0 {
+        notes.push(awaiting_newer_version(u64::try_from(waiting).unwrap_or(0)));
+    }
+    Ok(notes)
+}
+
+/// Code of the one health note that counts the lines kept for a newer
+/// Agendar version.
+pub const AWAITING_NEWER_VERSION: &str = "awaiting_newer_version";
+
+fn awaiting_newer_version(lines: u64) -> SourceDiagnostic {
+    let message = if lines == 1 {
+        "1 event line was written by a newer Agendar version. It is kept and read automatically once Agendar is updated.".to_owned()
+    } else {
+        format!(
+            "{lines} event lines were written by a newer Agendar version. They are kept and read automatically once Agendar is updated."
+        )
+    };
+    SourceDiagnostic {
+        code: AWAITING_NEWER_VERSION.to_owned(),
+        message,
+        path: "projects".to_owned(),
+        retryable: false,
+    }
+}
+
 /// One rule with the identity of its winning event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -120,6 +193,9 @@ pub enum QueryResult {
         invalid: u64,
         generation: u64,
         event_set_digest: Option<Sha256>,
+        /// Files waiting for the sync app, and stray file names.
+        #[serde(default)]
+        diagnostics: Vec<SourceDiagnostic>,
     },
 }
 
@@ -137,7 +213,7 @@ pub fn query(index: &Index, request: Query, now: UtcTime) -> Result<QueryResult>
     read_transaction(&index.connection, || query_inner(index, request, now))
 }
 
-fn read_transaction<T>(
+pub(crate) fn read_transaction<T>(
     connection: &rusqlite::Connection,
     action: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
@@ -334,6 +410,7 @@ fn query_inner(index: &Index, request: Query, now: UtcTime) -> Result<QueryResul
             let digest = meta(&index.connection, "event_set_digest")?
                 .and_then(|value| Sha256::parse(&value).ok());
             Ok(QueryResult::Health {
+                diagnostics: source_diagnostics(index)?,
                 files,
                 pending: u64::try_from(pending).unwrap_or(0),
                 invalid: u64::try_from(invalid).unwrap_or(0),
@@ -588,11 +665,6 @@ fn load_decision(index: &Index, ask: &EventId) -> Result<Option<DecisionState>> 
     }
 }
 
-fn state_at(index: &Index, now: UtcTime) -> Result<crate::model::State> {
-    let (events, _) = crate::index::load_resolution(index)?;
-    Ok(reduce(&events, &ReduceContext { as_of: now }))
-}
-
 fn inbox(
     index: &Index,
     project: &ProjectSlug,
@@ -600,11 +672,19 @@ fn inbox(
     node: Option<&NodePath>,
     now: UtcTime,
 ) -> Result<Vec<InboxPacket>> {
-    let state = state_at(index, now)?;
+    let (events, resolution) = crate::index::load_resolution(index)?;
+    let state = reduce(&events, &ReduceContext { as_of: now });
     let Some(project_state) = state.projects.get(project) else {
         return Err(not_found("Project", project.as_str()));
     };
-    let mut packets = Vec::new();
+    let mut packets = review_packets(
+        project_state,
+        &events,
+        &resolution.order_index,
+        project,
+        session,
+        node,
+    );
     for decision in project_state.decisions.values() {
         let Some(effective) = &decision.effective_receipt else {
             continue;
@@ -646,6 +726,7 @@ fn inbox(
                 answer: Some(effective.clone()),
                 receipt: Some(receipt.clone()),
                 review: None,
+                delivery: None,
                 source: effective.clone(),
                 redo,
                 created_at: receipt.created_at,
@@ -685,6 +766,7 @@ fn inbox(
             answer: Some(effective.clone()),
             receipt: Some(receipt.clone()),
             review: None,
+            delivery: None,
             source: effective.clone(),
             redo,
             created_at: receipt.created_at,
@@ -695,6 +777,119 @@ fn inbox(
             .cmp(&(right.created_at.canonical(), right.id.as_str()))
     });
     Ok(packets)
+}
+
+/// Review intents (an accepted or sent-back delivery) for the session that
+/// owns the step. A review has no ack: the packet stays until the agent reports
+/// progress or delivers again on that step. An accept on a step the agent had
+/// already reported finished, or on one that was dropped, is not sent; an
+/// accept that finished the step says there is nothing to do.
+fn review_packets(
+    project_state: &ProjectState,
+    events: &[Event],
+    order: &BTreeMap<EventId, usize>,
+    project: &ProjectSlug,
+    session: &SessionId,
+    node: Option<&NodePath>,
+) -> Vec<InboxPacket> {
+    let order_of = |id: &EventId| order.get(id).copied();
+    // The causally latest progress or delivery event on each step.
+    let mut continued: BTreeMap<&NodePath, usize> = BTreeMap::new();
+    for event in events {
+        if !matches!(
+            event.payload,
+            EventPayload::WorkProgress(_) | EventPayload::Delivery(_)
+        ) {
+            continue;
+        }
+        let (Some(step), Some(position)) = (event.refs.node.as_ref(), order_of(&event.id)) else {
+            continue;
+        };
+        let latest = continued.entry(step).or_insert(position);
+        *latest = (*latest).max(position);
+    }
+    // Attempts the agent itself reported done or verified.
+    let reported_finished: BTreeSet<&EventId> = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            EventPayload::WorkProgress(body)
+                if matches!(body.status, WorkStatus::Done | WorkStatus::Verified) =>
+            {
+                event.refs.attempt.as_ref()
+            }
+            _ => None,
+        })
+        .collect();
+    let mut packets = Vec::new();
+    for delivery in project_state.deliveries.values() {
+        if delivery.superseded_by.is_some() || delivery.review_conflict {
+            continue;
+        }
+        if node.is_some_and(|node| &delivery.node != node) {
+            continue;
+        }
+        let verdict = match delivery.review {
+            ReviewStatus::Pending => continue,
+            ReviewStatus::Accepted => ReviewVerdict::Accept,
+            ReviewStatus::SentBack => ReviewVerdict::SendBack,
+        };
+        let Some(review_id) = &delivery.review_event else {
+            continue;
+        };
+        let Some(feature) = project_state.features.get(&delivery.node) else {
+            continue;
+        };
+        if feature.session.as_ref() != Some(session) {
+            continue;
+        }
+        // An accept the step was finished by (a derived done) still reaches the
+        // agent once, as "nothing to do"; an accept on work the agent had
+        // already reported finished is not sent.
+        let finished = matches!(feature.progress, Progress::Done | Progress::Verified)
+            && feature
+                .attempt
+                .as_ref()
+                .is_some_and(|attempt| reported_finished.contains(attempt));
+        if feature.progress == Progress::Dropped || (finished && verdict == ReviewVerdict::Accept) {
+            continue;
+        }
+        let Some(reviewed) = order_of(review_id) else {
+            continue;
+        };
+        if continued
+            .get(&delivery.node)
+            .is_some_and(|latest| *latest > reviewed)
+        {
+            continue;
+        }
+        let Some(review) = events.iter().find(|event| &event.id == review_id) else {
+            continue;
+        };
+        let EventPayload::ReviewResult(body) = &review.payload else {
+            continue;
+        };
+        packets.push(InboxPacket {
+            id: InboxPacket::compute_id(
+                PacketKind::Review,
+                project,
+                &delivery.node,
+                review_id,
+                &[],
+            ),
+            project: project.clone(),
+            node: delivery.node.clone(),
+            kind: PacketKind::Review,
+            ask: None,
+            answer: None,
+            receipt: None,
+            review: Some(body.clone()),
+            delivery: Some(delivery.id.clone()),
+            source: review_id.clone(),
+            redo: Vec::new(),
+            created_at: review.ts,
+        });
+    }
+    packets
 }
 
 fn history(
@@ -710,6 +905,8 @@ fn history(
         .ordered
         .iter()
         .filter(|event| &event.project == project)
+        // A snooze is the owner's display state, not project history.
+        .filter(|event| !crate::reduce::snooze::is_snooze(event))
         .collect();
     if let Some(after) = after {
         let index = ordered
@@ -737,7 +934,7 @@ pub fn recent_project_events(
         .connection
         .prepare(
             "SELECT id, digest, json, writer FROM raw_events
-             WHERE project = ?1 AND status = 'valid'
+             WHERE project = ?1 AND status = 'valid' AND kind != 'need.snoozed'
              ORDER BY ts DESC, id DESC
              LIMIT ?2",
         )
@@ -785,6 +982,15 @@ fn summary_text(event: &crate::model::Event) -> String {
         EventPayload::PlanFeature(body) => format!(
             "Planned feature {}",
             body.title.as_deref().unwrap_or("(unnamed)")
+        ),
+        EventPayload::NeedSnoozed(_) => "Snoozed a row".to_owned(),
+        EventPayload::PlanDropped(_) => format!(
+            "Dropped {} (owner)",
+            event
+                .refs
+                .node
+                .as_ref()
+                .map_or("a step", crate::model::NodePath::as_str)
         ),
         EventPayload::WorkProgress(body) => format!(
             "Work {} on {}",

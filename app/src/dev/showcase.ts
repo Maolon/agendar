@@ -309,10 +309,20 @@ export function buildShowcaseSnapshot(): Snapshot {
     preferences: {
       theme: "system",
       motion: true,
-      snoozed: {},
       last_looked_at: "2026-02-10T14:00:00.000Z",
       last_looked_ids: [],
       revision: sha(0xb1),
+    },
+    // A local build: neutral info only, so the screenshots carry no update row.
+    update: {
+      current: "0.1.0",
+      channel: "dev",
+      latest: "0.1.0",
+      available: false,
+      url: "https://github.com/Maolon/agendar/releases/tag/v0.1.0",
+      published_at: "2026-02-01T10:00:00Z",
+      checked_at: "2026-02-10T14:00:00.000Z",
+      enabled: true,
     },
   } satisfies Snapshot);
 }

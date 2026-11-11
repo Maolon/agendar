@@ -1,7 +1,8 @@
 import { useState } from "react";
 import { useT } from "../i18n";
 import type { MessageKey } from "../i18n/messages";
-import { SNOOZE_CHOICES, useSnooze, type SnoozeChoice } from "../state/snooze";
+import { formatDayClock } from "../api/format";
+import { useSnooze, type SnoozeChoice } from "../state/snooze";
 import { Icon } from "./Icon";
 
 const CHOICE_LABEL: Record<SnoozeChoice, MessageKey> = {
@@ -39,18 +40,21 @@ export function NeedSnooze({ id, compact = false }: { id: string; compact?: bool
       </span>
     );
   }
+  // An item whose default is due cannot be snoozed: nothing is offered.
+  const offers = api.offers(id);
+  if (!offers.length) return null;
   if (api.open === id) {
     return (
       <span className="snooze" role="group" aria-label={t("snooze.button")}>
-        {SNOOZE_CHOICES.map((choice) => (
+        {offers.map((offer) => (
           <button
-            key={choice}
+            key={offer.choice}
             type="button"
             className="btn sm ghost"
             disabled={busy}
-            onClick={() => void run(() => api.snooze(id, choice))}
+            onClick={() => void run(() => api.snooze(id, offer))}
           >
-            {t(CHOICE_LABEL[choice])}
+            {offer.cut ? t("snooze.until", { t: formatDayClock(offer.until) }) : t(CHOICE_LABEL[offer.choice])}
           </button>
         ))}
       </span>
@@ -73,8 +77,8 @@ export function NeedSnooze({ id, compact = false }: { id: string; compact?: bool
 }
 
 /**
- * Cancel for a hand-off item: it closes for good on this computer. The step is
- * untouched and stays stopped on its project page, where it can be handed off.
+ * Dismiss for a rescue row that asks who continues: it closes for good on this
+ * computer. The step is untouched and the row stays openable from its page.
  */
 export function NeedDismiss({ id, compact = false }: { id: string; compact?: boolean }) {
   const api = useSnooze();

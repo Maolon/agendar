@@ -230,7 +230,7 @@ pub struct TauriUi {
     app: AppHandle,
     sink: Arc<NativeSink>,
     /// Last attention count shown in the tray, so unchanged publishes are free.
-    attention: Mutex<Option<(usize, usize, crate::preferences::Lang)>>,
+    attention: Mutex<Option<(usize, usize, usize, crate::preferences::Lang)>>,
 }
 
 impl TauriUi {
@@ -270,6 +270,18 @@ impl Ui for TauriUi {
         });
     }
 
+    fn open_settings(&self, tab: &str) {
+        let payload = serde_json::json!({ "view": "settings", "tab": tab });
+        let app = self.app.clone();
+        let _ = self.app.run_on_main_thread(move || {
+            if let Some(popover) = app.get_webview_window("popover") {
+                let _ = popover.hide();
+            }
+            crate::show_main(&app);
+            let _ = app.emit_to("main", "agendar://navigate", payload);
+        });
+    }
+
     fn emit_changed(&self, event: &Value) {
         let _ = self.app.emit("agendar://changed", event);
     }
@@ -282,18 +294,26 @@ impl Ui for TauriUi {
         let _ = self.app.emit("agendar://health", event);
     }
 
+    fn emit_update(&self, event: &Value) {
+        let _ = self.app.emit("agendar://update", event);
+    }
+
+    fn emit_upload(&self, event: &Value) {
+        let _ = self.app.emit("agendar://upload", event);
+    }
+
     fn start_notifications(&self) {
         self.sink.start();
     }
 
-    fn attention(&self, needs: usize, working: usize) {
+    fn attention(&self, needs: usize, working: usize, projects: usize) {
         {
             let mut last = self
                 .attention
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
             // A language switch alone also refreshes the tooltip.
-            let seen = (needs, working, crate::preferences::active_lang());
+            let seen = (needs, working, projects, crate::preferences::active_lang());
             if *last == Some(seen) {
                 return;
             }
@@ -302,6 +322,6 @@ impl Ui for TauriUi {
         let app = self.app.clone();
         let _ = self
             .app
-            .run_on_main_thread(move || crate::tray::apply(&app, needs, working));
+            .run_on_main_thread(move || crate::tray::apply(&app, needs, working, projects));
     }
 }

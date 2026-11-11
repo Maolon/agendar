@@ -157,7 +157,37 @@ fn scratch() -> Scratch {
         .answer_decision(&project, &asked.ask_id, &option, None, None, None)
         .expect("answer");
     let blob = fixture_blob();
-    let body = Delivery {
+    let body = example_body(&session, &blob);
+    let delivered = service
+        .deliver(
+            &project,
+            &session,
+            &node(),
+            &attempt,
+            Some(&receipt),
+            None,
+            body,
+            Some(&ulid::Ulid::generate().to_string()),
+        )
+        .expect("deliver");
+    let delivery = EventId::parse(delivered["event_id"].as_str().expect("event")).expect("id");
+    Scratch {
+        _root: root,
+        data,
+        repo,
+        service,
+        project,
+        session,
+        node: node(),
+        attempt,
+        receipt,
+        delivery,
+        blob,
+    }
+}
+
+fn example_body(session: &SessionId, blob: &BlobRef) -> Delivery {
+    Delivery {
         agent: Agent {
             session: session.clone(),
             harness: Harness::Generic,
@@ -179,32 +209,7 @@ fn scratch() -> Scratch {
             not_proven_yet: vec!["Independent check".to_owned()],
             faked_for_now: Vec::new(),
         },
-    };
-    let delivered = service
-        .deliver(
-            &project,
-            &session,
-            &node(),
-            &attempt,
-            &receipt,
-            None,
-            body,
-            Some(&ulid::Ulid::generate().to_string()),
-        )
-        .expect("deliver");
-    let delivery = EventId::parse(delivered["event_id"].as_str().expect("event")).expect("id");
-    Scratch {
-        _root: root,
-        data,
-        repo,
-        service,
-        project,
-        session,
-        node: node(),
-        attempt,
-        receipt,
-        delivery,
-        blob,
+        replies: Vec::new(),
     }
 }
 
@@ -373,6 +378,7 @@ fn an_approved_check_records_seen_and_a_causal_review_accepts_it() {
             ReviewVerdict::Accept,
             None,
             None,
+            Vec::new(),
             vec![scratch.receipt.clone()],
         )
         .expect("stale review");
@@ -402,6 +408,7 @@ fn an_approved_check_records_seen_and_a_causal_review_accepts_it() {
                 text: "Compare bytes before delivery".to_owned(),
                 enabled: true,
             }),
+            Vec::new(),
             vec![scratch.receipt.clone(), observation.clone()],
         )
         .expect("send back");
@@ -429,6 +436,7 @@ fn an_approved_check_records_seen_and_a_causal_review_accepts_it() {
             ReviewVerdict::Accept,
             None,
             None,
+            Vec::new(),
             vec![scratch.receipt.clone(), observation.clone(), review.clone()],
         )
         .expect("rereview");
@@ -618,6 +626,7 @@ fn a_pending_review_blocks_downstream_until_accepted() {
             ReviewVerdict::Accept,
             None,
             None,
+            Vec::new(),
             vec![scratch.receipt.clone()],
         )
         .expect("accept");
@@ -683,5 +692,604 @@ fn concurrent_observations_are_visible_as_a_frontier() {
         criterion.seen_result,
         Some(CheckResult::Passed),
         "a causally later observation supersedes the frontier"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Review intents reach the step owner's inbox
+// ---------------------------------------------------------------------------
+
+fn review_packets(scratch: &Scratch) -> Vec<agendar_core::model::InboxPacket> {
+    let (packets, _, _) = scratch
+        .service
+        .inbox(&scratch.project, &scratch.session, None, false)
+        .expect("inbox");
+    packets
+        .into_iter()
+        .filter(|packet| packet.kind == agendar_core::model::PacketKind::Review)
+        .collect()
+}
+
+#[test]
+fn a_send_back_with_only_comments_carries_them_in_the_review_packet() {
+    use agendar_core::model::{ReviewAnchor, ReviewComment};
+    let scratch = scratch();
+    let comments = vec![
+        ReviewComment {
+            anchor: ReviewAnchor::Region {
+                demo: 0,
+                x: 100,
+                y: 50,
+                w: 300,
+                h: 150,
+            },
+            text: "The legend is cut off".to_owned(),
+        },
+        ReviewComment {
+            anchor: ReviewAnchor::TranscriptLine {
+                demo: 0,
+                line: 3,
+                quote: "ok".to_owned(),
+            },
+            text: "Show the failing case too".to_owned(),
+        },
+    ];
+    scratch
+        .service
+        .review_delivery(
+            &scratch.project,
+            &scratch.node,
+            &scratch.delivery,
+            ReviewVerdict::SendBack,
+            None,
+            None,
+            comments.clone(),
+            vec![scratch.receipt.clone()],
+        )
+        .expect("send back with comments only");
+    let packets = review_packets(&scratch);
+    assert_eq!(packets.len(), 1, "{packets:?}");
+    let body = packets[0].review.as_ref().expect("review body");
+    assert_eq!(body.reason, None);
+    assert_eq!(body.comments, comments);
+}
+
+#[test]
+fn a_sent_back_delivery_reaches_the_step_owner_until_it_works_on_the_step_again() {
+    let scratch = scratch();
+    assert!(
+        review_packets(&scratch).is_empty(),
+        "a delivery still waiting for review sends nothing"
+    );
+    let (review, _) = scratch
+        .service
+        .review_delivery(
+            &scratch.project,
+            &scratch.node,
+            &scratch.delivery,
+            ReviewVerdict::SendBack,
+            Some("The screenshot is cropped".to_owned()),
+            None,
+            Vec::new(),
+            vec![scratch.receipt.clone()],
+        )
+        .expect("send back");
+
+    let packets = review_packets(&scratch);
+    assert_eq!(packets.len(), 1, "the owner gets the verdict: {packets:?}");
+    let packet = &packets[0];
+    assert_eq!(packet.node, scratch.node);
+    assert_eq!(packet.source, review);
+    let body = packet.review.as_ref().expect("review body");
+    assert_eq!(body.verdict, ReviewVerdict::SendBack);
+    assert_eq!(body.reason.as_deref(), Some("The screenshot is cropped"));
+
+    // Reading it is checkpointed with a delivered record the Vault accepts; a
+    // review has no ack, so the inbox keeps showing it.
+    let written = scratch
+        .service
+        .mark_delivered(
+            &scratch.project,
+            &scratch.session,
+            &packets,
+            agendar_core::model::DeliveredOutcome::InboxRead,
+        )
+        .expect("checkpoint");
+    assert_eq!(written.len(), 1, "one delivered record for the review");
+    let now = UtcTime::parse("2026-01-01T01:00:00.000Z").expect("time");
+    let fresh = scratch.service.refresh(now, false).expect("refresh");
+    assert!(
+        fresh.state.diagnostics.is_empty(),
+        "the delivered record validates: {:?}",
+        fresh.state.diagnostics
+    );
+    let runtime = scratch.service.runtime().expect("runtime");
+    assert!(runtime.delivery_attempts.contains_key(&format!(
+        "{}:{}",
+        packet.id.as_str(),
+        scratch.session.as_str()
+    )));
+    assert_eq!(review_packets(&scratch).len(), 1);
+
+    // Starting the fix is the continuation that retires it.
+    scratch
+        .service
+        .progress_started_applying(
+            &scratch.project,
+            &scratch.session,
+            &scratch.node,
+            agendar_core::model::EtaRange {
+                min_s: agendar_core::model::Seconds::new(600).expect("min"),
+                max_s: agendar_core::model::Seconds::new(1_200).expect("max"),
+            },
+            Some("fix the crop".to_owned()),
+            std::slice::from_ref(&scratch.receipt),
+            None,
+        )
+        .expect("restart");
+    assert!(
+        review_packets(&scratch).is_empty(),
+        "new work on the step retires the send-back"
+    );
+}
+
+#[test]
+fn an_accept_reaches_the_step_owner_until_it_marks_the_step_done() {
+    let scratch = scratch();
+    scratch
+        .service
+        .review_delivery(
+            &scratch.project,
+            &scratch.node,
+            &scratch.delivery,
+            ReviewVerdict::Accept,
+            None,
+            None,
+            Vec::new(),
+            vec![scratch.receipt.clone()],
+        )
+        .expect("accept");
+    let packets = review_packets(&scratch);
+    assert_eq!(packets.len(), 1, "{packets:?}");
+    assert_eq!(
+        packets[0].review.as_ref().map(|review| review.verdict),
+        Some(ReviewVerdict::Accept)
+    );
+    scratch
+        .service
+        .progress_finished(
+            &scratch.project,
+            &scratch.session,
+            &scratch.node,
+            &scratch.attempt,
+            WorkStatus::Done,
+            Vec::new(),
+            None,
+            None,
+        )
+        .expect("done");
+    assert!(review_packets(&scratch).is_empty());
+}
+
+#[test]
+fn a_finished_step_hears_a_send_back_but_not_an_accept() {
+    let scratch = scratch();
+    scratch
+        .service
+        .progress_finished(
+            &scratch.project,
+            &scratch.session,
+            &scratch.node,
+            &scratch.attempt,
+            WorkStatus::Done,
+            Vec::new(),
+            None,
+            None,
+        )
+        .expect("done");
+    let (review, _) = scratch
+        .service
+        .review_delivery(
+            &scratch.project,
+            &scratch.node,
+            &scratch.delivery,
+            ReviewVerdict::Accept,
+            None,
+            None,
+            Vec::new(),
+            vec![scratch.receipt.clone()],
+        )
+        .expect("accept");
+    assert!(
+        review_packets(&scratch).is_empty(),
+        "an accept on finished work leaves nothing to do"
+    );
+    scratch
+        .service
+        .review_delivery(
+            &scratch.project,
+            &scratch.node,
+            &scratch.delivery,
+            ReviewVerdict::SendBack,
+            Some("Wrong window".to_owned()),
+            None,
+            Vec::new(),
+            vec![scratch.receipt.clone(), review],
+        )
+        .expect("rereview");
+    let packets = review_packets(&scratch);
+    assert_eq!(packets.len(), 1, "{packets:?}");
+    assert_eq!(
+        packets[0]
+            .review
+            .as_ref()
+            .and_then(|review| review.reason.as_deref()),
+        Some("Wrong window")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Finished work no decision asked for is delivered without a receipt
+// ---------------------------------------------------------------------------
+
+fn deliver_without_receipt(
+    scratch: &Scratch,
+    criteria: Vec<CriterionResult>,
+    supersedes: Option<&EventId>,
+) -> agendar_core::error::Result<EventId> {
+    let body = Delivery {
+        agent: Agent {
+            session: scratch.session.clone(),
+            harness: Harness::Generic,
+        },
+        name: "Wake shipped".to_owned(),
+        demos: vec![Demo::CliTranscript(CliTranscriptDemo {
+            blob: scratch.blob.clone(),
+            check: None,
+        })],
+        criteria,
+        disclosure: Disclosure {
+            proven: vec!["Wake adapter runs end to end".to_owned()],
+            not_proven_yet: vec!["Windows wake".to_owned()],
+            faked_for_now: vec!["Sample schedule".to_owned()],
+        },
+        replies: Vec::new(),
+    };
+    let delivered = scratch.service.deliver(
+        &scratch.project,
+        &scratch.session,
+        &scratch.node,
+        &scratch.attempt,
+        None,
+        supersedes,
+        body,
+        Some(&ulid::Ulid::generate().to_string()),
+    )?;
+    Ok(EventId::parse(delivered["event_id"].as_str().expect("event")).expect("id"))
+}
+
+fn fresh_project(scratch: &Scratch) -> agendar_core::model::ProjectState {
+    let now = UtcTime::parse("2026-01-01T01:00:00.000Z").expect("time");
+    let fresh = scratch.service.refresh(now, false).expect("refresh");
+    assert!(
+        fresh.state.diagnostics.is_empty(),
+        "{:?}",
+        fresh.state.diagnostics
+    );
+    fresh.state.projects[&scratch.project].clone()
+}
+
+#[test]
+fn a_delivery_without_a_receipt_is_projected_pending_review() {
+    let scratch = scratch();
+    let delivery = deliver_without_receipt(&scratch, Vec::new(), None).expect("deliver");
+    let project = fresh_project(&scratch);
+    let state = &project.deliveries[&delivery];
+    assert_eq!(state.receipt, None);
+    assert!(state.criteria.is_empty());
+    assert_eq!(state.review, agendar_core::model::ReviewStatus::Pending);
+    assert_eq!(
+        state.disclosure.faked_for_now,
+        vec!["Sample schedule".to_owned()]
+    );
+}
+
+#[test]
+fn a_delivery_without_a_receipt_must_list_no_criteria() {
+    let scratch = scratch();
+    let error = deliver_without_receipt(
+        &scratch,
+        vec![CriterionResult {
+            criterion: agendar_core::model::CriterionId::parse("bytes").expect("criterion"),
+            status: CheckResult::Passed,
+            claim: Claim::AgentSays,
+            evidence: None,
+            observation: None,
+        }],
+        None,
+    )
+    .expect_err("criteria without a receipt");
+    assert_eq!(error.code(), ErrorCode::Validation);
+    assert_eq!(error.detail(), Some("delivery_criteria_without_receipt"));
+    assert_eq!(error.field(), Some("/criteria"));
+}
+
+#[test]
+fn a_delivery_without_a_receipt_is_accepted_and_sent_back() {
+    let scratch = scratch();
+    let delivery = deliver_without_receipt(&scratch, Vec::new(), None).expect("deliver");
+    let (accepted, _) = scratch
+        .service
+        .review_delivery(
+            &scratch.project,
+            &scratch.node,
+            &delivery,
+            ReviewVerdict::Accept,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("accept");
+    let project = fresh_project(&scratch);
+    assert_eq!(
+        project.deliveries[&delivery].review,
+        agendar_core::model::ReviewStatus::Accepted
+    );
+    let packets = review_packets(&scratch);
+    assert_eq!(packets.len(), 1, "{packets:?}");
+    assert_eq!(packets[0].source, accepted);
+
+    let (sent_back, _) = scratch
+        .service
+        .review_delivery(
+            &scratch.project,
+            &scratch.node,
+            &delivery,
+            ReviewVerdict::SendBack,
+            Some("Show the Windows run".to_owned()),
+            None,
+            Vec::new(),
+            vec![accepted],
+        )
+        .expect("send back");
+    let project = fresh_project(&scratch);
+    assert_eq!(
+        project.deliveries[&delivery].review,
+        agendar_core::model::ReviewStatus::SentBack
+    );
+    let packets = review_packets(&scratch);
+    assert_eq!(packets.len(), 1, "{packets:?}");
+    assert_eq!(packets[0].source, sent_back);
+    assert_eq!(
+        packets[0]
+            .review
+            .as_ref()
+            .and_then(|review| review.reason.as_deref()),
+        Some("Show the Windows run")
+    );
+}
+
+#[test]
+fn a_delivery_without_a_receipt_counts_once_in_pending_slices() {
+    let scratch = scratch();
+    scratch
+        .service
+        .review_delivery(
+            &scratch.project,
+            &scratch.node,
+            &scratch.delivery,
+            ReviewVerdict::Accept,
+            None,
+            None,
+            Vec::new(),
+            vec![scratch.receipt.clone()],
+        )
+        .expect("accept the receipt delivery");
+    assert_eq!(fresh_project(&scratch).summary.budget.pending_slices, 0);
+    let first = deliver_without_receipt(&scratch, Vec::new(), None).expect("deliver");
+    assert_eq!(fresh_project(&scratch).summary.budget.pending_slices, 1);
+    deliver_without_receipt(&scratch, Vec::new(), Some(&first)).expect("redeliver");
+    assert_eq!(
+        fresh_project(&scratch).summary.budget.pending_slices,
+        1,
+        "a superseded delivery never occupies the budget"
+    );
+}
+
+fn redeliver(
+    scratch: &Scratch,
+    supersedes: Option<&EventId>,
+    replies: Vec<agendar_core::model::Reply>,
+) -> agendar_core::error::Result<serde_json::Value> {
+    let mut body = example_body(&scratch.session, &scratch.blob);
+    body.name = "Example bytes, fixed".to_owned();
+    body.replies = replies;
+    scratch.service.deliver(
+        &scratch.project,
+        &scratch.session,
+        &scratch.node,
+        &scratch.attempt,
+        Some(&scratch.receipt),
+        supersedes,
+        body,
+        Some(&ulid::Ulid::generate().to_string()),
+    )
+}
+
+fn reply(comment: Option<u8>, text: &str) -> agendar_core::model::Reply {
+    agendar_core::model::Reply {
+        comment,
+        text: text.to_owned(),
+    }
+}
+
+fn detail(error: &agendar_core::error::AgendarError) -> Option<&str> {
+    error.detail()
+}
+
+#[test]
+fn a_redelivery_replies_to_the_send_back_it_supersedes() {
+    let scratch = scratch();
+    // Replies need a delivery to supersede.
+    let error = redeliver(&scratch, None, vec![reply(None, "Fixed")]).expect_err("no supersedes");
+    assert_eq!(error.code(), ErrorCode::Validation);
+    assert_eq!(detail(&error), Some("delivery_replies_without_supersedes"));
+    // ... and that delivery must have been sent back.
+    let error = redeliver(
+        &scratch,
+        Some(&scratch.delivery),
+        vec![reply(None, "Fixed")],
+    )
+    .expect_err("no send-back");
+    assert_eq!(error.code(), ErrorCode::Validation);
+    assert_eq!(detail(&error), Some("replies_without_send_back"));
+    assert!(error.hint().is_some(), "{error:?}");
+
+    let region = |x: u16| agendar_core::model::ReviewComment {
+        anchor: agendar_core::model::ReviewAnchor::Region {
+            demo: 0,
+            x,
+            y: 0,
+            w: 10,
+            h: 10,
+        },
+        text: format!("Area at {x}"),
+    };
+    let (review, _) = scratch
+        .service
+        .review_delivery(
+            &scratch.project,
+            &scratch.node,
+            &scratch.delivery,
+            ReviewVerdict::SendBack,
+            Some("Too slow".to_owned()),
+            None,
+            vec![region(0), region(500)],
+            vec![scratch.receipt.clone()],
+        )
+        .expect("send back");
+
+    // A comment number past the send-back's comments is refused.
+    let error = redeliver(
+        &scratch,
+        Some(&scratch.delivery),
+        vec![reply(Some(3), "Which one?")],
+    )
+    .expect_err("past the count");
+    assert_eq!(error.code(), ErrorCode::Validation);
+    assert_eq!(detail(&error), Some("reply_comment_out_of_range"));
+    // Wire rules: one reply per target, numbers from 1, short text.
+    for (replies, code) in [
+        (vec![reply(None, "a"), reply(None, "b")], "duplicate_reply"),
+        (vec![reply(Some(0), "zero")], "reply_comment_out_of_range"),
+        (vec![reply(Some(1), &"x".repeat(400))], "length"),
+    ] {
+        let error = redeliver(&scratch, Some(&scratch.delivery), replies).expect_err(code);
+        assert_eq!(error.code(), ErrorCode::Validation, "{code}");
+        assert_eq!(detail(&error), Some(code));
+    }
+
+    let delivered = redeliver(
+        &scratch,
+        Some(&scratch.delivery),
+        vec![reply(None, "Cached the lookup"), reply(Some(2), "Moved it")],
+    )
+    .expect("redeliver");
+    let redelivery = EventId::parse(delivered["event_id"].as_str().expect("event")).expect("id");
+    let fresh = scratch
+        .service
+        .refresh(
+            UtcTime::parse("2026-01-01T01:00:00.000Z").expect("time"),
+            false,
+        )
+        .expect("refresh");
+    let project_state = &fresh.state.projects[&scratch.project];
+    let old = &project_state.deliveries[&scratch.delivery];
+    let new = &project_state.deliveries[&redelivery];
+    assert_eq!(old.superseded_by.as_ref(), Some(&redelivery));
+    assert_eq!(old.review, agendar_core::model::ReviewStatus::Pending);
+    let note = old
+        .sent_back
+        .as_ref()
+        .expect("send-back kept after supersede");
+    assert_eq!(note.review, review);
+    assert_eq!(note.reason.as_deref(), Some("Too slow"));
+    assert_eq!(note.comments, vec![region(0), region(500)]);
+    assert_eq!(new.supersedes.as_ref(), Some(&scratch.delivery));
+    assert_eq!(
+        new.replies,
+        vec![reply(None, "Cached the lookup"), reply(Some(2), "Moved it")]
+    );
+    assert!(new.sent_back.is_none());
+
+    // The new fields are skipped when empty, so a first delivery projects
+    // and stores the same bytes as before.
+    let old_json = serde_json::to_value(old).expect("json");
+    assert!(old_json.get("supersedes").is_none());
+    assert!(old_json.get("replies").is_none());
+    let new_json = serde_json::to_value(new).expect("json");
+    assert!(new_json.get("sent_back").is_none());
+    let first = serde_json::to_value(example_body(&scratch.session, &scratch.blob)).expect("json");
+    assert!(first.get("replies").is_none(), "{first}");
+}
+
+fn accept(scratch: &Scratch) {
+    scratch
+        .service
+        .review_delivery(
+            &scratch.project,
+            &scratch.node,
+            &scratch.delivery,
+            ReviewVerdict::Accept,
+            None,
+            None,
+            Vec::new(),
+            vec![scratch.receipt.clone()],
+        )
+        .expect("accept");
+}
+
+fn finish(scratch: &Scratch, status: WorkStatus) -> agendar_core::Result<serde_json::Value> {
+    scratch.service.progress_finished(
+        &scratch.project,
+        &scratch.session,
+        &scratch.node,
+        &scratch.attempt,
+        status,
+        Vec::new(),
+        None,
+        None,
+    )
+}
+
+#[test]
+fn an_accepted_step_is_done_and_a_confirmation_says_it_was_already_accepted() {
+    let scratch = scratch();
+    accept(&scratch);
+    let fresh = scratch
+        .service
+        .refresh(
+            agendar_core::vault::Clock::now(&agendar_core::vault::SystemClock),
+            false,
+        )
+        .expect("refresh");
+    let feature = &fresh.state.projects[&scratch.project].features[&scratch.node];
+    assert_eq!(feature.progress, agendar_core::model::Progress::Done);
+    let done = finish(&scratch, WorkStatus::Done).expect("done succeeds");
+    assert_eq!(done["progress"], "done");
+    assert_eq!(done["already"], "accepted");
+}
+
+#[test]
+fn the_service_refuses_to_drop_an_accepted_step() {
+    let scratch = scratch();
+    accept(&scratch);
+    let error = finish(&scratch, WorkStatus::Dropped).expect_err("drop refused");
+    assert_eq!(error.detail(), Some("accepted_by_owner"));
+    assert!(
+        error.message().contains("send it back"),
+        "{}",
+        error.message()
     );
 }

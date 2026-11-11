@@ -338,9 +338,14 @@ export function Graph({
                     ))}
                   </span>
                   <span className="gtext">
-                    <span className="gn">{display.label}</span>
+                    <span className="gn">
+                      {display.label}
+                      {display.corrected ? (
+                        <span className="corr-mark" data-corrected="" title={display.corrected} aria-label={display.corrected} role="img" />
+                      ) : null}
+                    </span>
                     <span className="gs">
-                      {after?.has(id) && display.dot !== "review" && display.dot !== "verified" ? (
+                      {after?.has(id) && display.dot !== "review" && display.dot !== "verified" && display.dot !== "done" ? (
                         <>
                           <Icon name="corner-down-left" className="gs-after" />
                           {tx("gr.after", { x: after.get(id) ?? "" })}

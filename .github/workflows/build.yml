@@ -11,6 +11,12 @@ on:
         description: Git ref to build; empty builds the triggering commit.
         type: string
         default: ""
+      channel:
+        description: >-
+          Update channel compiled into the app and CLI. Only release.yml passes
+          `release`; every other build is `dev` and is never told to update.
+        type: string
+        default: dev
 
 permissions:
   contents: read
@@ -94,9 +100,13 @@ jobs:
           echo "Signing with the Developer ID and notarizing."
 
       - name: Stage the bundled CLI
+        env:
+          AGENDAR_CHANNEL: ${{ inputs.channel }}
         run: node app/scripts/bundle-cli.mjs --target ${{ matrix.target }}
 
       - name: Build the app
+        env:
+          AGENDAR_CHANNEL: ${{ inputs.channel }}
         run: pnpm -C app exec tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
       - name: Collect installers, the CLI and checksums

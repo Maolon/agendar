@@ -1427,6 +1427,248 @@ fn board_lists_steps_to_reconcile_and_a_never_started_step_drops_without_an_atte
     assert_eq!(open, ["core/wake"], "a dropped step is settled");
 }
 
+/// core/wake (open, no milestone), misc/e (done, no milestone), MVP: a, b
+/// done, c dropped; "Next batch 1": d open (depends on mvp/a).
+fn paged_project(env: &mut CliEnv) {
+    prepare(env);
+    let declare = |env: &CliEnv, node: &str, milestone: Option<&str>, depends_on: &[&str]| {
+        let mut patch = json!({"title": node, "slice": "s", "demo_kind": "cli_transcript"});
+        if let Some(milestone) = milestone {
+            patch["milestone"] = json!(milestone);
+        }
+        if !depends_on.is_empty() {
+            patch["depends_on"] = json!(depends_on);
+        }
+        let file = write_json(env, &format!("{}.json", node.replace('/', "-")), &patch);
+        expect_success(
+            &env.run(&["feature", "declare", "--node", node, "--json", &file]),
+            "feature declare",
+        );
+    };
+    declare(env, "mvp/a", Some("MVP"), &[]);
+    declare(env, "mvp/b", Some("MVP"), &[]);
+    declare(env, "mvp/c", Some("MVP"), &[]);
+    declare(env, "next/d", Some("Next batch 1"), &["mvp/a"]);
+    declare(env, "misc/e", None, &[]);
+    for node in ["mvp/a", "mvp/b", "misc/e"] {
+        let started = expect_success(
+            &env.run(&["progress", "started", "--node", node, "--eta", "1m..2m"]),
+            "progress",
+        );
+        let attempt = started["data"]["attempt"].as_str().expect("attempt");
+        expect_success(
+            &env.run(&["progress", "done", "--node", node, "--attempt", attempt]),
+            "progress",
+        );
+    }
+    expect_success(
+        &env.run(&["progress", "dropped", "--node", "mvp/c", "--note", "cut"]),
+        "progress",
+    );
+}
+
+fn board_nodes(board: &Value, key: &str) -> Vec<String> {
+    let mut nodes: Vec<String> = board["data"][key]
+        .as_array()
+        .expect(key)
+        .iter()
+        .map(|step| step["node"].as_str().expect("node").to_owned())
+        .collect();
+    nodes.sort();
+    nodes
+}
+
+#[test]
+fn board_lists_open_steps_and_a_page_per_milestone() {
+    let mut env = CliEnv::new("demo");
+    paged_project(&mut env);
+    let board = expect_success(&env.run(&["board"]), "board");
+    assert_eq!(board_nodes(&board, "features"), ["core/wake", "next/d"]);
+    let d = board["data"]["features"]
+        .as_array()
+        .expect("features")
+        .iter()
+        .find(|step| step["node"] == "next/d")
+        .expect("next/d");
+    assert_eq!(
+        d["depends_on"],
+        json!(["mvp/a"]),
+        "a finished dependency stays named"
+    );
+    let mut pages = board["data"]["pages"].as_array().expect("pages").clone();
+    pages.sort_by_key(|page| page["milestone"].as_str().unwrap_or_default().to_owned());
+    assert_eq!(
+        pages,
+        [
+            json!({"milestone": null, "open": 1, "done": 1, "verified": 0, "dropped": 0, "cmd": "agendar board --milestone ''"}),
+            json!({"milestone": "MVP", "open": 0, "done": 2, "verified": 0, "dropped": 1, "cmd": "agendar board --milestone 'MVP'"}),
+            json!({"milestone": "Next batch 1", "open": 1, "done": 0, "verified": 0, "dropped": 0, "cmd": "agendar board --milestone 'Next batch 1'"}),
+        ]
+    );
+    let hint = board["data"]["hint"].as_str().expect("hint");
+    for flag in ["cmd", "--all", "--out"] {
+        assert!(hint.contains(flag), "{flag} in {hint}");
+    }
+    assert_eq!(board_nodes(&board, "reconcile"), ["core/wake", "next/d"]);
+    assert_eq!(
+        board["data"]["reconcile"][0]
+            .as_object()
+            .expect("step")
+            .keys()
+            .collect::<Vec<_>>(),
+        ["node", "owner"],
+        "compact reconcile does not repeat features"
+    );
+}
+
+#[test]
+fn a_milestone_page_shows_finished_steps_short_and_open_ones_in_full() {
+    let mut env = CliEnv::new("demo");
+    paged_project(&mut env);
+    let mvp = expect_success(&env.run(&["board", "--milestone", "MVP"]), "board");
+    assert_eq!(mvp["data"]["milestone"], "MVP");
+    assert_eq!(board_nodes(&mvp, "features"), ["mvp/a", "mvp/b", "mvp/c"]);
+    for step in mvp["data"]["features"].as_array().expect("features") {
+        let mut keys: Vec<&String> = step.as_object().expect("step").keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["node", "progress", "title"], "short form: {step}");
+    }
+    assert_eq!(mvp["data"]["pages"].as_array().expect("pages").len(), 3);
+    for omitted in ["you", "yours", "runnable", "reconcile", "nudges", "others"] {
+        assert!(
+            mvp["data"].get(omitted).is_none(),
+            "{omitted} only on page 1"
+        );
+    }
+
+    let next = expect_success(&env.run(&["board", "--milestone", "Next batch 1"]), "board");
+    let d = &next["data"]["features"][0];
+    assert_eq!(d["node"], "next/d");
+    assert_eq!(d["depends_on"], json!(["mvp/a"]), "an open step is in full");
+    assert!(d.get("owner").is_some() && d.get("gate").is_some());
+
+    let none = expect_success(&env.run(&["board", "--milestone", ""]), "board");
+    assert_eq!(none["data"]["milestone"], Value::Null);
+    assert_eq!(board_nodes(&none, "features"), ["core/wake", "misc/e"]);
+    let e = none["data"]["features"]
+        .as_array()
+        .expect("features")
+        .iter()
+        .find(|step| step["node"] == "misc/e")
+        .expect("misc/e");
+    assert_eq!(e["progress"], "done");
+    assert!(e.get("owner").is_none());
+
+    let unknown = env.run(&["board", "--milestone", "Beta"]);
+    let unknown = expect_error(&unknown, "E_VALIDATION", 2);
+    assert_eq!(unknown["error"]["field"], "/milestone");
+    let message = unknown["error"]["message"].as_str().expect("message");
+    for name in ["'MVP'", "'Next batch 1'", "no milestone"] {
+        assert!(message.contains(name), "{name} in {message}");
+    }
+}
+
+#[test]
+fn board_all_keeps_the_full_shape_and_out_saves_it_only_when_asked() {
+    let mut env = CliEnv::new("demo");
+    paged_project(&mut env);
+    let full = expect_success(&env.run(&["board", "--all"]), "board");
+    let mut keys: Vec<&String> = full["data"].as_object().expect("data").keys().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "features",
+            "nudges",
+            "others",
+            "project",
+            "reconcile",
+            "runnable",
+            "you",
+            "yours"
+        ],
+        "--all keeps the full shape"
+    );
+    assert_eq!(
+        board_nodes(&full, "features"),
+        ["core/wake", "misc/e", "mvp/a", "mvp/b", "mvp/c", "next/d"]
+    );
+    for step in full["data"]["reconcile"].as_array().expect("reconcile") {
+        for field in ["node", "title", "progress", "gate", "owner"] {
+            assert!(step.get(field).is_some(), "{field} in {step}");
+        }
+    }
+
+    let listing = |dir: &std::path::Path| -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .expect("read dir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    };
+    let out_dir = env.root.path().join("out");
+    fs::create_dir(&out_dir).expect("out dir");
+    expect_success(&env.run(&["board", "--all"]), "board");
+    assert!(
+        listing(&out_dir).is_empty(),
+        "nothing is written without --out"
+    );
+
+    let file = out_dir.join("board.json");
+    let saved = expect_success(
+        &env.run(&["board", "--all", "--out", file.to_str().expect("utf-8")]),
+        "board",
+    );
+    assert_eq!(saved["data"]["steps"], 6);
+    let written = fs::read(&file).expect("saved board");
+    assert_eq!(saved["data"]["bytes"], written.len());
+    assert_eq!(
+        fs::canonicalize(saved["data"]["path"].as_str().expect("path")).expect("path"),
+        fs::canonicalize(&file).expect("file")
+    );
+    let on_disk: Value = serde_json::from_slice(&written).expect("board JSON");
+    assert_eq!(on_disk["features"], full["data"]["features"]);
+    assert!(
+        saved["data"].get("features").is_none(),
+        "prints the envelope only"
+    );
+    assert_eq!(listing(&out_dir), ["board.json"], "no staging file left");
+
+    let page = out_dir.join("mvp.json");
+    let saved = expect_success(
+        &env.run(&[
+            "board",
+            "--milestone",
+            "MVP",
+            "--out",
+            page.to_str().expect("utf-8"),
+        ]),
+        "board",
+    );
+    assert_eq!(saved["data"]["steps"], 3);
+
+    let in_vault = env.vault.join("board.json");
+    let refused = env.run(&["board", "--all", "--out", in_vault.to_str().expect("utf-8")]);
+    let refused = expect_error(&refused, "E_VALIDATION", 2);
+    assert_eq!(refused["error"]["field"], "/out");
+    assert!(!in_vault.exists(), "never writes inside the Vault");
+
+    let missing = out_dir.join("nope").join("board.json");
+    let refused = env.run(&["board", "--out", missing.to_str().expect("utf-8")]);
+    expect_error(&refused, "E_VALIDATION", 2);
+    assert!(
+        !out_dir.join("nope").exists(),
+        "parent folders are not created"
+    );
+}
+
 #[test]
 fn an_overdue_eta_shows_as_a_nudge_in_inbox_and_board_until_re_estimated() {
     let mut env = CliEnv::new("demo");
@@ -1789,6 +2031,134 @@ fn a_report_publishes_its_document_and_a_summary() {
 }
 
 #[test]
+fn a_request_record_from_a_newer_agendar_never_blocks_other_commands() {
+    let mut env = CliEnv::new("demo");
+    prepare(&mut env);
+    let doc = env.root.path().join("note.md");
+    fs::write(&doc, "# Note\n").expect("md");
+    let doc = doc.to_string_lossy().into_owned();
+    let report = |id: &str, title: &str| {
+        env.run(&[
+            "--request-id",
+            id,
+            "report",
+            "--title",
+            title,
+            "--summary",
+            "s",
+            "--file",
+            &doc,
+        ])
+    };
+    expect_success(&report("first", "First"), "report");
+
+    // A newer Agendar on this computer journals a record with a field this
+    // version does not know.
+    let runtime_path = fs::read_dir(env.data.join("vaults"))
+        .expect("vaults")
+        .flatten()
+        .next()
+        .expect("one vault")
+        .path()
+        .join("runtime.json");
+    let mut runtime: serde_json::Value =
+        serde_json::from_slice(&fs::read(&runtime_path).expect("runtime")).expect("json");
+    let key = format!("{}/first", env.session);
+    let mut foreign = runtime["operations"][&key].clone();
+    foreign["draft"]["payload"]["body"]["from_the_future"] = json!(true);
+    let foreign_key = format!("{}/newer", env.session);
+    runtime["operations"][&foreign_key] = foreign.clone();
+    fs::write(&runtime_path, serde_json::to_vec(&runtime).expect("json")).expect("write");
+
+    expect_success(&report("second", "Second"), "report");
+    let refused = report("newer", "Retry of the newer one");
+    assert_ne!(refused.status.code(), Some(0));
+    let refusal = String::from_utf8_lossy(&refused.stderr);
+    assert!(refusal.contains("newer Agendar"), "{refusal}");
+
+    let after: serde_json::Value =
+        serde_json::from_slice(&fs::read(&runtime_path).expect("runtime")).expect("json");
+    assert_eq!(
+        after["operations"][&foreign_key], foreign,
+        "the newer record stays exactly as it was written"
+    );
+}
+
+#[test]
+fn a_report_carries_its_kind_and_domain_and_older_reports_have_none() {
+    let mut env = CliEnv::new("demo");
+    prepare(&mut env);
+    let doc = env.root.path().join("audit.md");
+    fs::write(&doc, "# Retry audit\n\nNo path exceeds the limit.\n").expect("md");
+    let doc = doc.to_string_lossy().into_owned();
+    expect_success(
+        &env.run(&[
+            "report",
+            "--title",
+            "Plain note",
+            "--summary",
+            "No kind given.",
+            "--file",
+            &doc,
+        ]),
+        "report",
+    );
+    expect_success(
+        &env.run(&[
+            "report",
+            "--title",
+            "Retry audit",
+            "--summary",
+            "No path exceeds the daily limit.",
+            "--file",
+            &doc,
+            "--kind",
+            "finding",
+            "--domain",
+            "code",
+        ]),
+        "report",
+    );
+    let refused = env.run(&[
+        "report",
+        "--title",
+        "x",
+        "--summary",
+        "x",
+        "--file",
+        &doc,
+        "--kind",
+        "delivery",
+    ]);
+    assert_ne!(
+        refused.status.code(),
+        Some(0),
+        "finished work is a delivery, not a report kind"
+    );
+
+    let service = env.service();
+    let now = agendar_core::model::UtcTime::parse("2099-01-01T00:00:00.000Z").expect("time");
+    let state = service.export_state(now).expect("state");
+    let project = &state.projects[&ProjectSlug::parse("demo").expect("slug")];
+    let by_title = |title: &str| {
+        project
+            .reports
+            .iter()
+            .find(|report| report.title == title)
+            .expect("report")
+    };
+    let audit = by_title("Retry audit");
+    assert_eq!(audit.kind, Some(agendar_core::model::ReportKind::Finding));
+    assert_eq!(audit.domain, Some(agendar_core::model::Domain::Code));
+    let plain = by_title("Plain note");
+    assert_eq!(plain.kind, None);
+    assert_eq!(plain.domain, None);
+    // The projection leaves absent fields out, so older readers see the same shape.
+    let json = serde_json::to_value(plain).expect("json");
+    assert!(json.get("kind").is_none() && json.get("domain").is_none());
+}
+
+#[test]
 fn wait_rides_out_a_briefly_held_lock_instead_of_failing_busy() {
     use fs2::FileExt as _;
     let mut env = CliEnv::new("demo");
@@ -1819,6 +2189,101 @@ fn wait_rides_out_a_briefly_held_lock_instead_of_failing_busy() {
     let waited = expect_success(&env.run(&["wait", &ask_id, "--timeout", "30s"]), "wait");
     holder.join().expect("holder");
     assert_eq!(waited["data"]["packet"]["answer"], answer.as_str());
+}
+
+/// Hold the named lock files (a `writer-` prefix holds every writer lock) from
+/// this test process for `held`, as another Agendar process would.
+fn hold_locks(
+    env: &CliEnv,
+    names: &[&str],
+    held: std::time::Duration,
+) -> std::thread::JoinHandle<()> {
+    use fs2::FileExt as _;
+    let locks = fs::read_dir(env.data.join("vaults"))
+        .expect("vaults")
+        .flatten()
+        .next()
+        .expect("one vault")
+        .path()
+        .join("locks");
+    let mut files = Vec::new();
+    for entry in fs::read_dir(&locks).expect("locks").flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if names
+            .iter()
+            .any(|wanted| name == *wanted || (wanted.ends_with('-') && name.starts_with(wanted)))
+        {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(entry.path())
+                .expect("lock file");
+            file.lock_exclusive().expect("hold lock");
+            files.push(file);
+        }
+    }
+    assert!(!files.is_empty(), "no lock named {names:?}");
+    std::thread::spawn(move || {
+        std::thread::sleep(held);
+        for file in files {
+            fs2::FileExt::unlock(&file).expect("unlock");
+        }
+    })
+}
+
+#[test]
+fn agent_commands_wait_out_locks_held_past_five_seconds() {
+    let mut env = CliEnv::new("demo");
+    prepare(&mut env);
+    let asked = expect_success(&ask(&env, "core/wake", &ask_card(), &[]), "ask");
+    let ask_id = asked["data"]["ask_id"].as_str().expect("ask").to_owned();
+    let answer = human_answer(&env, &ask_id, "adapters");
+
+    // The app gives up after five seconds; a queue of refreshing processes on a
+    // loaded machine can last longer. An ack (a write) and an inbox read both
+    // wait instead of failing E_BUSY.
+    let held = std::time::Duration::from_millis(7_000);
+    let holder = hold_locks(&env, &["ingest.lock", "writer-"], held);
+    let started = std::time::Instant::now();
+    let (inbox, ack) = std::thread::scope(|scope| {
+        let inbox = scope.spawn(|| (env.run(&["inbox"]), started.elapsed()));
+        let ack = scope.spawn(|| (env.run(&["ack", &answer]), started.elapsed()));
+        (inbox.join().expect("inbox"), ack.join().expect("ack"))
+    });
+    holder.join().expect("holder");
+    expect_success(&inbox.0, "inbox");
+    expect_success(&ack.0, "ack");
+    for (command, took) in [("inbox", inbox.1), ("ack", ack.1)] {
+        assert!(
+            took >= std::time::Duration::from_millis(6_000),
+            "{command} finished in {took:?}, so it never met the held lock"
+        );
+    }
+}
+
+#[test]
+fn a_wait_whose_timeout_passes_on_a_held_lock_times_out_instead_of_failing_busy() {
+    let mut env = CliEnv::new("demo");
+    prepare(&mut env);
+    let asked = expect_success(&ask(&env, "core/wake", &ask_card(), &[]), "ask");
+    let ask_id = asked["data"]["ask_id"].as_str().expect("ask").to_owned();
+
+    // The index lock: every look at the answer is refused until the timeout.
+    // The runtime lock: the wait cannot even take its lease. Either way the
+    // agent hears "no answer yet, call wait again", on time.
+    for lock in ["ingest.lock", "runtime.lock"] {
+        let holder = hold_locks(&env, &[lock], std::time::Duration::from_millis(4_000));
+        let started = std::time::Instant::now();
+        let output = env.run(&["wait", &ask_id, "--timeout", "1s"]);
+        let took = started.elapsed();
+        holder.join().expect("holder");
+        let error = expect_error(&output, "E_TIMEOUT", 7);
+        assert_eq!(error["error"]["retryable"], true, "{lock}");
+        assert!(
+            took < std::time::Duration::from_millis(3_000),
+            "{lock}: the 1 s wait took {took:?}"
+        );
+    }
 }
 
 #[test]
@@ -1918,6 +2383,9 @@ fn the_mcp_server_speaks_mcp_and_runs_tools_as_its_own_session() {
         json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "start", "arguments": {"node": "core/wake", "eta": "30m..1h"}}}),
         json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "start", "arguments": {"node": "core/wake"}}}),
         json!({"jsonrpc": "2.0", "id": 5, "method": "nope"}),
+        json!({"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "board", "arguments": {}}}),
+        json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "board", "arguments": {"all": true}}}),
+        json!({"jsonrpc": "2.0", "id": 8, "method": "tools/call", "params": {"name": "board", "arguments": {"milestone": ""}}}),
     ];
     {
         let mut stdin = child.stdin.take().expect("stdin");
@@ -1970,6 +2438,25 @@ fn the_mcp_server_speaks_mcp_and_runs_tools_as_its_own_session() {
         "missing eta is an error result"
     );
     assert_eq!(by_id(5)["error"]["code"], -32601);
+    let board = |id: i64| -> Value {
+        let text = by_id(id)["result"]["content"][0]["text"]
+            .as_str()
+            .expect("board text")
+            .to_owned();
+        serde_json::from_str(&text).expect("board envelope")
+    };
+    assert!(board(6)["data"]["pages"].is_array(), "paged by default");
+    assert!(
+        board(7)["data"].get("pages").is_none(),
+        "all: true is the full board"
+    );
+    assert!(board(7)["data"]["features"].is_array());
+    assert_eq!(
+        board(8)["data"]["milestone"],
+        Value::Null,
+        "\"\" is the no-milestone page"
+    );
+    assert_eq!(board(8)["data"]["features"][0]["node"], "core/wake");
 
     let runtime = env.service().runtime().expect("runtime");
     let session = runtime

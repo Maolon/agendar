@@ -59,6 +59,8 @@ export function isMotionEligible(
 ): boolean {
   if (!feature) return false;
   if (feature.progress !== "doing") return false;
+  // Delivered and waiting for the owner's review: the owner's, not moving.
+  if (feature.phase === "in_review") return false;
   if (feature.gate !== "open") return false;
   if (feature.basis === "tainted") return false;
   if (feature.paused) return false;

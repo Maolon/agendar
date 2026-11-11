@@ -5,14 +5,15 @@
 //! facts or writes. The same event multiset and the same `as_of` produce
 //! byte-identical canonical state.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::model::event::{BudgetUsage, Event, EventPayload, PolicySet, RuleSet, WorkStatus};
 use crate::model::ids::{EventId, HostId, NodePath, ProjectSlug, SessionId, UtcTime};
 use crate::model::state::{
     Basis, Calibration, DecisionState, Diagnostic, FeatureState, Liveness, NeedsYouItem, Progress,
-    ProjectState, ProjectSummary, Receipt, RuleState, SessionState, State, Variance,
-    policy_revision, rule_revision,
+    ProjectState, ProjectSummary, Receipt, RuleState, SessionState, State, UNTOUCHED_AFTER_S,
+    Variance, policy_revision, rule_revision,
 };
 
 pub mod activity;
@@ -21,20 +22,29 @@ pub mod attention;
 pub mod brief;
 pub mod budget;
 pub mod calibration;
+pub mod claim;
 pub mod decisions;
 pub mod eta;
 pub mod evidence;
 pub mod forecast;
 pub mod graph;
+pub mod moot;
+pub mod motion;
 pub mod nudges;
 pub mod order;
 pub mod ordering;
 pub mod plan;
 pub mod policy;
+pub mod settle;
+pub mod snooze;
 pub mod stats;
+pub mod usage;
+pub mod waits;
 
 pub use decisions::{AckFold, AskFold};
-pub use order::{Resolution, VariantState, VariantStatus, resolve, resolve_with_quarantine};
+pub use order::{
+    CausalIndex, Resolution, VariantState, VariantStatus, resolve, resolve_with_quarantine,
+};
 
 /// Outcome of one replicated semantic check performed while folding.
 #[derive(Debug, Clone)]
@@ -64,7 +74,7 @@ pub struct ReduceContext {
 /// Read-only causal view used by fold helpers.
 pub struct CausalView<'a> {
     pub order_index: &'a BTreeMap<EventId, usize>,
-    pub ancestors: &'a BTreeMap<EventId, BTreeSet<EventId>>,
+    pub ancestors: &'a CausalIndex,
 }
 
 impl CausalView<'_> {
@@ -73,9 +83,7 @@ impl CausalView<'_> {
     }
 
     pub fn before(&self, earlier: &EventId, later: &EventId) -> bool {
-        self.ancestors
-            .get(later)
-            .is_some_and(|set| set.contains(earlier))
+        self.ancestors.before(earlier, later)
     }
 }
 
@@ -100,6 +108,8 @@ pub struct ProjectFold {
     pub assumed_by_attempt: BTreeMap<EventId, BTreeSet<EventId>>,
     /// Published reports in O-order.
     pub reports: Vec<crate::model::state::ReportState>,
+    /// The latest event on each step and whether the owner wrote any.
+    pub touches: BTreeMap<NodePath, plan::Touch>,
 }
 
 impl ProjectFold {
@@ -121,6 +131,7 @@ impl ProjectFold {
             declaration_event: None,
             assumed_by_attempt: BTreeMap::new(),
             reports: Vec::new(),
+            touches: BTreeMap::new(),
         }
     }
 
@@ -201,7 +212,46 @@ pub fn reduce_with_resolution(
     initial: Option<&Resolution>,
 ) -> ReduceOutput {
     let (state, resolution, _) = reduce_impl(events, ctx, initial);
-    ReduceOutput { state, resolution }
+    ReduceOutput {
+        state,
+        resolution: resolution.into_owned(),
+    }
+}
+
+/// One reduction that keeps both resolutions of its event set.
+#[derive(Debug, Clone)]
+pub struct ReduceKept {
+    pub state: State,
+    /// `resolve(events)`: what [`reduce_resolved`] starts from when a reader
+    /// reloads the same event set.
+    pub resolved: Resolution,
+    /// The final resolution after semantic quarantine, when it differs from
+    /// `resolved` (the index persists its variant statuses).
+    pub quarantined: Option<Resolution>,
+}
+
+impl ReduceKept {
+    /// The resolution the state was folded with.
+    pub fn last(&self) -> &Resolution {
+        self.quarantined.as_ref().unwrap_or(&self.resolved)
+    }
+}
+
+/// [`reduce_with_resolution`] with no initial resolution, also keeping the
+/// plain resolution: the state equals `reduce_resolved(&resolved, events, ctx)`
+/// because that is exactly the call made here.
+pub fn reduce_keeping_resolution(events: &[Event], ctx: &ReduceContext) -> ReduceKept {
+    let resolved = resolve(events);
+    let (state, last, _) = reduce_impl(events, ctx, Some(&resolved));
+    let quarantined = match last {
+        Cow::Borrowed(_) => None,
+        Cow::Owned(resolution) => Some(resolution),
+    };
+    ReduceKept {
+        state,
+        resolved,
+        quarantined,
+    }
 }
 
 /// Reduce and also return the calibration report of every project.
@@ -210,15 +260,17 @@ pub fn reduce_with_report(events: &[Event], ctx: &ReduceContext) -> (State, Redu
     (state, report)
 }
 
-fn reduce_impl(
+fn reduce_impl<'a>(
     events: &[Event],
     ctx: &ReduceContext,
-    initial: Option<&Resolution>,
-) -> (State, Resolution, ReduceReport) {
+    initial: Option<&'a Resolution>,
+) -> (State, Cow<'a, Resolution>, ReduceReport) {
     let mut quarantine: BTreeMap<EventId, String> = BTreeMap::new();
+    // A caller's resolution is only borrowed: it is copied only if a semantic
+    // rejection forces a new one or the caller asks for it back.
     let mut resolution = match initial {
-        Some(resolution) => resolution.clone(),
-        None => resolve(events),
+        Some(resolution) => Cow::Borrowed(resolution),
+        None => Cow::Owned(resolve(events)),
     };
     // Replicated semantic rejections feed back into eligibility: a rejected fact
     // must not fold, and its causal descendants stay pending. Each pass is a
@@ -235,7 +287,7 @@ fn reduce_impl(
         if !changed {
             return (state, resolution, report);
         }
-        resolution = resolve_with_quarantine(events, &quarantine);
+        resolution = Cow::Owned(resolve_with_quarantine(events, &quarantine));
     }
     let (state, _, report) = fold(&resolution, events, ctx);
     (state, resolution, report)
@@ -247,7 +299,7 @@ pub fn reduce_resolved(
     all_events: &[Event],
     ctx: &ReduceContext,
 ) -> State {
-    reduce_with_resolution(all_events, ctx, Some(resolution)).state
+    reduce_impl(all_events, ctx, Some(resolution)).0
 }
 
 fn fold(
@@ -270,13 +322,31 @@ fn fold(
     };
 
     let mut folds: BTreeMap<ProjectSlug, ProjectFold> = BTreeMap::new();
-    for event in all_events {
+    // A snooze is display only: it is read once, here, and skipped by the
+    // fold below (see `snooze`).
+    let snoozes = snooze::latest(&resolution.ordered);
+    for event in all_events.iter().filter(|event| !snooze::is_snooze(event)) {
         folds
             .entry(event.project.clone())
             .or_insert_with(|| ProjectFold::new(event.project.clone()));
     }
 
+    // The owner's drops are known before any event folds, so whether a drop
+    // closes an attempt never depends on where the two fall in `O`.
+    for event in &resolution.ordered {
+        if let (EventPayload::PlanDropped(_), Some(node)) = (&event.payload, &event.refs.node) {
+            folds
+                .entry(event.project.clone())
+                .or_insert_with(|| ProjectFold::new(event.project.clone()))
+                .feature(node)
+                .record_owner_drop(event);
+        }
+    }
+
     for (order, event) in resolution.ordered.iter().enumerate() {
+        if snooze::is_snooze(event) {
+            continue;
+        }
         let fold = folds
             .entry(event.project.clone())
             .or_insert_with(|| ProjectFold::new(event.project.clone()));
@@ -290,6 +360,7 @@ fn fold(
             .or_insert(event.ts);
         *host_entry = (*host_entry).max(event.ts);
         plan::touch_session(&mut fold.sessions, event, order);
+        plan::Touch::record(&mut fold.touches, event);
 
         match &event.payload {
             EventPayload::ProjectDeclared(_) => {
@@ -304,6 +375,10 @@ fn fold(
                     fold.feature(&node).apply(event, order);
                 }
             }
+            // Recorded before the fold and applied after it.
+            EventPayload::PlanDropped(_) => {}
+            // Skipped above.
+            EventPayload::NeedSnoozed(_) => {}
             EventPayload::WorkProgress(_) => {
                 let node = event.refs.node.clone();
                 if let Some(node) = node {
@@ -318,6 +393,15 @@ fn fold(
                 }
             }
             EventPayload::DecisionAsk(body) => {
+                // A question on the step is a word on its attempt.
+                if let Some(feature) = event
+                    .refs
+                    .node
+                    .as_ref()
+                    .and_then(|node| fold.features.get_mut(node))
+                {
+                    feature.heard(event);
+                }
                 // Revalidate against the declared causal policy snapshot (that
                 // event, or balanced when absent), never a concurrent policy the
                 // author could not have observed.
@@ -374,6 +458,8 @@ fn fold(
                     title: body.title.clone(),
                     summary: body.summary.clone(),
                     report: body.report.clone(),
+                    kind: body.kind,
+                    domain: body.domain,
                     ts: event.ts,
                     session: body.agent.session.clone(),
                     harness: body.agent.harness,
@@ -411,10 +497,27 @@ fn fold(
             EventPayload::SessionContinued(_) => {
                 plan::apply_session_continued(&fold.sessions, &mut fold.features, event);
             }
-            EventPayload::Delivery(_)
-            | EventPayload::EvidenceObserved(_)
-            | EventPayload::ReviewResult(_) => fold.evidence.apply(event),
+            EventPayload::Delivery(_) => {
+                if let Some(feature) = event
+                    .refs
+                    .node
+                    .as_ref()
+                    .and_then(|node| fold.features.get_mut(node))
+                {
+                    feature.heard(event);
+                }
+                fold.evidence.apply(event);
+            }
+            EventPayload::EvidenceObserved(_) | EventPayload::ReviewResult(_) => {
+                fold.evidence.apply(event)
+            }
             EventPayload::Delivered(_) => {}
+        }
+    }
+
+    for fold in folds.values_mut() {
+        for feature in fold.features.values_mut() {
+            feature.settle_owner_drops(&causal);
         }
     }
 
@@ -422,8 +525,9 @@ fn fold(
     let mut diagnostics = resolution.diagnostics.clone();
     let mut report = ReduceReport::default();
     for (slug, fold) in &mut folds {
-        let (project, project_diagnostics, calibration) =
+        let (mut project, project_diagnostics, calibration) =
             finalize_project(fold, ctx.as_of, &event_ts, &resolution.order_index, &causal);
+        snooze::apply(&mut project, &snoozes, ctx.as_of);
         diagnostics.extend(project_diagnostics);
         projects.insert(slug.clone(), project);
         report.calibration.insert(slug.clone(), calibration);
@@ -533,9 +637,7 @@ fn finalize_project(
     // 2. Decisions: receipts, effective answers and lifecycles.
     let mut decision_states: BTreeMap<EventId, DecisionState> =
         decisions::finalize(&mut fold.asks, &fold.acks, &fold.receipts, causal);
-    for (ask, state) in &mut decision_states {
-        state.applied_sessions = applied_sessions(ask, state, fold);
-    }
+    applied_sessions(fold, &mut decision_states);
 
     // 2a. Assumption consumption per current attempt, then `built_on`.
     let effective_by_ask: BTreeMap<EventId, Option<EventId>> = decision_states
@@ -555,8 +657,9 @@ fn finalize_project(
             ),
         );
     }
+    let mut built_on = assumptions::built_on_by_ask(&consumption_by_node, &fold.receipts);
     for (ask, state) in &mut decision_states {
-        state.built_on = assumptions::built_on(ask, &consumption_by_node, &fold.receipts);
+        state.built_on = built_on.remove(ask).unwrap_or_default();
     }
 
     // 2b. Deliveries, Seen observations and reviews.
@@ -568,6 +671,23 @@ fn finalize_project(
         order_index,
     );
     let (review_pending, review_accepted) = evidence::review_gates(&delivery_states);
+
+    // 2c. Derived settle per attempt: in review, sent back or done from its own
+    // live deliveries' reviews. A drop ordered after the accept is history.
+    for (node, dropped) in
+        settle::apply(&mut fold.features, &delivery_states, order_index, event_ts)
+    {
+        diagnostics.push(Diagnostic::new(
+            format!("semantic_history:{}", dropped.as_str()),
+            "semantic_history",
+            Some(fold.slug.clone()),
+            Some(dropped.clone()),
+            format!(
+                "The owner accepted {} before this drop; the drop is history only.",
+                node.as_str()
+            ),
+        ));
+    }
 
     // 3. Session liveness.
     let mut session_states: BTreeMap<SessionId, SessionState> = BTreeMap::new();
@@ -593,14 +713,109 @@ fn finalize_project(
         );
     }
 
-    // 4. Feature progress, then gates (upstream progress is known after step 4a).
-    let mut progress_map: BTreeMap<NodePath, Progress> = BTreeMap::new();
-    for (node, feature) in &fold.features {
-        progress_map.insert(
-            node.clone(),
-            plan::progress(feature, policy_value.require_human_review),
-        );
+    // 4. ETAs and claims, then the shown progress, then gates (upstream
+    // progress is known once every step is shown).
+    let waits_by_attempt = waits_by_attempt(fold, &mut diagnostics);
+    let calibration_report = calibration::report(&fold.features, &waits_by_attempt, as_of);
+    // Open mandatory decisions per feature, in decision order.
+    let mut open_by_node: BTreeMap<NodePath, Vec<EventId>> = BTreeMap::new();
+    for (ask, decision) in &decision_states {
+        if decision.lifecycle == crate::model::state::DecisionLifecycle::Open
+            && decision.mode == crate::model::ids::Mode::Ask
+        {
+            open_by_node
+                .entry(decision.node.clone())
+                .or_default()
+                .push(ask.clone());
+        }
     }
+    // Questions on steps dropped or accepted a day ago fold and stop holding.
+    let closed_steps = moot::closed_steps(&fold.features, event_ts);
+    let folded = moot::folded(&decision_states, &closed_steps, as_of);
+    let holds = claim::SessionHolds::build(&fold.asks, &decision_states, &folded);
+    let mut upstream_adjacency: BTreeMap<NodePath, BTreeSet<NodePath>> = BTreeMap::new();
+    for edge in &plan_edges.accepted {
+        upstream_adjacency
+            .entry(edge.upstream.clone())
+            .or_default()
+            .insert(edge.downstream.clone());
+    }
+    // An attempt with a delivery waiting for review is the owner's.
+    let reviewing: BTreeSet<&EventId> = delivery_states
+        .values()
+        .filter(|delivery| {
+            delivery.superseded_by.is_none()
+                && delivery.review == crate::model::state::ReviewStatus::Pending
+        })
+        .map(|delivery| &delivery.attempt)
+        .collect();
+    let mut etas: BTreeMap<NodePath, crate::model::state::EtaState> = BTreeMap::new();
+    let mut shown_map: BTreeMap<NodePath, plan::Shown> = BTreeMap::new();
+    for (node, feature) in &fold.features {
+        let eta = feature
+            .current()
+            .filter(|attempt| attempt.status != WorkStatus::Dropped)
+            .map(|attempt| {
+                let pauses = waits_by_attempt
+                    .get(&attempt.id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let ratio = calibration_report.ratio_for(attempt.harness);
+                plan::attempt_eta(attempt, pauses, as_of, ratio)
+            });
+        let fields = &field_views[node];
+        let outcome = feature
+            .current()
+            .filter(|attempt| attempt.status == WorkStatus::Started)
+            .filter(|attempt| attempt.accepted_at().is_none())
+            .filter(|attempt| attempt.settle.phase != Some(settle::SettlePhase::InReview))
+            .filter(|attempt| !reviewing.contains(&attempt.id))
+            .filter(|_| !fields.paused && !fields.handoff_pending)
+            .map(|attempt| {
+                let lost = session_states
+                    .get(&attempt.session)
+                    .and_then(|session| session.lost_event.as_ref())
+                    .map(|lost| (lost, event_ts.get(lost).copied().unwrap_or(as_of)));
+                let decision = open_by_node
+                    .get(node)
+                    .and_then(|asks| asks.first().cloned())
+                    .or_else(|| {
+                        // Only an ETA held by a human wait can rest on an
+                        // upstream question.
+                        eta.as_ref().filter(|eta| eta.paused)?;
+                        graph::ancestors(&upstream_adjacency, node)
+                            .iter()
+                            .find_map(|upstream| {
+                                open_by_node
+                                    .get(upstream)?
+                                    .iter()
+                                    .find(|ask| !folded.contains(*ask))
+                                    .cloned()
+                            })
+                    });
+                claim::claim(
+                    attempt,
+                    &claim::ClaimInputs {
+                        lost,
+                        eta: eta.as_ref(),
+                        decision,
+                        holds: &holds,
+                        as_of,
+                    },
+                )
+            });
+        shown_map.insert(
+            node.clone(),
+            plan::shown(feature, policy_value.require_human_review, outcome),
+        );
+        if let Some(eta) = eta {
+            etas.insert(node.clone(), eta);
+        }
+    }
+    let progress_map: BTreeMap<NodePath, Progress> = shown_map
+        .iter()
+        .map(|(node, shown)| (node.clone(), shown.progress))
+        .collect();
     let mut dependency_view = plan::DependencyView::default();
     for edge in &plan_edges.accepted {
         dependency_view
@@ -623,32 +838,33 @@ fn finalize_project(
             .or_default()
             .insert(edge.upstream.clone());
     }
-    let accepted_adjacency = {
-        let mut adjacency: BTreeMap<NodePath, BTreeSet<NodePath>> = BTreeMap::new();
-        for edge in &plan_edges.accepted {
-            adjacency
-                .entry(edge.upstream.clone())
-                .or_default()
-                .insert(edge.downstream.clone());
-        }
-        adjacency
-    };
+    let mut unblocks_by_node = graph::all_descendants(&known, &plan_edges.accepted);
     // Human waits are replayed from causal transitions: accepted dependency
     // edges, upstream restarts and completions, and ask answers decide when a
     // hold opens and closes. A later agenda edit therefore cannot rewrite a
     // wait that was already spent, and calibration measures
     // active duration against the ETA the agent declared at start.
-    let dependency_steps = eta::dependency_steps(&fold.features, &known);
-    let waits_by_attempt = waits_by_attempt(fold, &dependency_steps, &mut diagnostics);
-    let calibration_report = calibration::report(&fold.features, &waits_by_attempt, as_of);
+    // Accepted upstreams per feature, in accepted-edge order.
+    let mut accepted_by_downstream: BTreeMap<NodePath, Vec<NodePath>> = BTreeMap::new();
+    for edge in &plan_edges.accepted {
+        accepted_by_downstream
+            .entry(edge.downstream.clone())
+            .or_default()
+            .push(edge.upstream.clone());
+    }
+    let human_decided = plan::human_decided(fold.receipts.values());
+    let takeover_answers = plan::takeover_answers(&fold.asks, &fold.receipts, &decision_states);
     let mut feature_states: BTreeMap<NodePath, FeatureState> = BTreeMap::new();
     for (node, feature) in &fold.features {
         let fields = field_views
             .get(node)
             .cloned()
             .expect("every folded feature has resolved fields");
-        let progress = progress_map.get(node).copied().unwrap_or(Progress::Planned);
-        let pending_decisions = plan::open_decisions(&decision_states, node);
+        let shown = shown_map
+            .remove(node)
+            .expect("every folded feature has a shown state");
+        let progress = shown.progress;
+        let pending_decisions = open_by_node.remove(node).unwrap_or_default();
         let mut context = plan::FeatureContext::default();
         for upstream in &fields.depends_on {
             if let Some(value) = progress_map.get(upstream) {
@@ -681,32 +897,25 @@ fn finalize_project(
             .and_then(|attempt| session_states.get(&attempt.session))
             .map(|session| session.liveness)
             .unwrap_or(Liveness::Quiet);
-        let accepted_depends_on: Vec<NodePath> = plan_edges
-            .accepted
-            .iter()
-            .filter(|edge| &edge.downstream == node)
-            .map(|edge| edge.upstream.clone())
-            .collect();
-        let unblocks = graph::descendants(&accepted_adjacency, node);
-        let eta = feature
-            .current()
-            .filter(|attempt| attempt.status != WorkStatus::Dropped)
-            .map(|attempt| {
-                let pauses = waits_by_attempt
-                    .get(&attempt.id)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                let ratio = calibration_report.ratio_for(attempt.harness);
-                plan::attempt_eta(attempt, pauses, as_of, ratio)
-            });
+        let accepted_depends_on = accepted_by_downstream.remove(node).unwrap_or_default();
+        let unblocks = unblocks_by_node.remove(node).unwrap_or_default();
+        let eta = etas.remove(node);
         let consumption = consumption_by_node.get(node).cloned().unwrap_or_default();
         let assumptions = consumption.unconfirmed.clone();
         let taints = consumption.tainted.clone();
+        // Untouched: only agents wrote it, nobody started it, no question on
+        // it, no event on it for UNTOUCHED_AFTER_S. Event time only.
+        let untouched = progress == Progress::Planned
+            && pending_decisions.is_empty()
+            && !human_decided.contains(node)
+            && fold.touches.get(node).is_some_and(|touch| {
+                !touch.owner && touch.last.add_seconds(UNTOUCHED_AFTER_S) <= as_of
+            });
         let state = plan::build_feature(
             feature,
             fields,
             accepted_depends_on,
-            progress,
+            shown,
             gate,
             waits_on,
             unblocks,
@@ -715,7 +924,41 @@ fn finalize_project(
             assumptions,
             taints,
             policy_value.require_human_review,
+            untouched,
         );
+        let mut state = state;
+        // The owner's takeover answers on this step: the one the current
+        // start applied, and the current ones that let another agent start.
+        if let Some(answers) = takeover_answers.get(node)
+            && let Some(current) = feature.current()
+        {
+            if let Some(from) = state.taken_from.as_mut()
+                && let Some(replaced) = feature.attempts.get(&from.attempt)
+            {
+                from.granted_by = answers
+                    .iter()
+                    .find(|answer| answer.lets(current, replaced, causal))
+                    .map(|answer| answer.answer.clone());
+            }
+            // Shown only while the step can be taken by it: in progress and
+            // under no hold of the owner (a pause, an open question, an old
+            // hand-off, a delivery in review).
+            if current.status == WorkStatus::Started
+                && state.progress == Progress::Doing
+                && state.gate != crate::model::state::Gate::AwaitingDecision
+                && state.phase != Some(crate::model::state::Phase::InReview)
+            {
+                state.takeover_grants = answers
+                    .iter()
+                    .filter(|answer| answer.covers(current, causal))
+                    .map(|answer| crate::model::state::TakeoverGrant {
+                        session: answer.session.clone(),
+                        ask: answer.ask.clone(),
+                        answer: answer.answer.clone(),
+                    })
+                    .collect();
+            }
+        }
         feature_states.insert(node.clone(), state);
     }
 
@@ -733,7 +976,7 @@ fn finalize_project(
     let speculative_features =
         budget::speculative_features(&feature_states, &decision_states, &fold.receipts);
     let pending_slices = budget::pending_slices(&delivery_states, &feature_states);
-    let (demo_active, earliest_active_start) =
+    let (demo_active, earliest_active_start, demo_gap_node) =
         demo_activity(fold, &feature_states, &delivery_states);
     let last_demo = fold
         .evidence
@@ -746,6 +989,7 @@ fn finalize_project(
         speculative_features,
         pending_slices,
         demo_gap_s,
+        demo_step: budget::DemoStep::of(demo_gap_node, &feature_states),
     };
     let budget_usage = budget::usage(&policy_value.budget, activity);
 
@@ -795,7 +1039,7 @@ fn finalize_project(
             .collect(),
     };
 
-    let start_conflicts = start_conflicts(fold);
+    let start_conflicts = start_conflicts(fold, causal, &provisional.decisions);
     let lost_sessions: Vec<attention::LostSession> = provisional
         .sessions
         .values()
@@ -811,12 +1055,21 @@ fn finalize_project(
                 })
         })
         .collect();
+    let dropped_attempts: BTreeSet<EventId> = fold
+        .features
+        .values()
+        .flat_map(|feature| feature.attempts.values())
+        .filter(|attempt| attempt.status == WorkStatus::Dropped)
+        .map(|attempt| attempt.id.clone())
+        .collect();
     let needs = {
         let inputs = attention::RescueInputs {
             rejected: &plan_edges.rejected,
             start_conflicts: &start_conflicts,
             lost_sessions: &lost_sessions,
             event_ts,
+            dropped_attempts: &dropped_attempts,
+            closed_steps: &closed_steps,
             as_of,
         };
         attention::build_needs(&provisional, &inputs)
@@ -856,36 +1109,88 @@ fn finalize_project(
     (provisional, diagnostics, calibration_report)
 }
 
-fn applied_sessions(ask: &EventId, state: &DecisionState, fold: &ProjectFold) -> Vec<SessionId> {
-    let Some(effective) = &state.effective_receipt else {
-        return Vec::new();
-    };
-    let mut sessions: BTreeSet<SessionId> = BTreeSet::new();
+/// Sessions that applied each decision's effective receipt: by an ack of that
+/// answer, or by any eligible own attempt or progress event that carries it,
+/// not only an attempt on the ask's target: a descendant start with the
+/// receipt in basis counts.
+fn applied_sessions(fold: &ProjectFold, decisions: &mut BTreeMap<EventId, DecisionState>) {
+    let mut by_ack: BTreeMap<(&EventId, &EventId), BTreeSet<&SessionId>> = BTreeMap::new();
     for ack in fold.acks.values() {
-        if &ack.ask == ask && &ack.answer == effective {
-            sessions.insert(ack.session.clone());
-        }
+        by_ack
+            .entry((&ack.ask, &ack.answer))
+            .or_default()
+            .insert(&ack.session);
     }
-    // Application may be proven by any eligible own attempt or progress event
-    // that carries the current receipt, not only an attempt on the ask's target
-    //: a descendant start with the receipt in basis counts.
+    let mut by_receipt: BTreeMap<&EventId, BTreeSet<&SessionId>> = BTreeMap::new();
     for feature in fold.features.values() {
         for attempt in feature.attempts.values() {
-            if attempt.applied.contains(effective) {
-                sessions.insert(attempt.session.clone());
+            for receipt in &attempt.applied {
+                by_receipt
+                    .entry(receipt)
+                    .or_default()
+                    .insert(&attempt.session);
             }
         }
     }
-    sessions.into_iter().collect()
+    for (ask, state) in decisions.iter_mut() {
+        let Some(effective) = &state.effective_receipt else {
+            state.applied_sessions = Vec::new();
+            continue;
+        };
+        let mut sessions: BTreeSet<&SessionId> = BTreeSet::new();
+        if let Some(acked) = by_ack.get(&(ask, effective)) {
+            sessions.extend(acked);
+        }
+        if let Some(carried) = by_receipt.get(effective) {
+            sessions.extend(carried);
+        }
+        state.applied_sessions = sessions.into_iter().cloned().collect();
+    }
 }
 
-fn start_conflicts(fold: &ProjectFold) -> Vec<(NodePath, EventId, UtcTime)> {
+/// "Who should continue?" rows: concurrent starts, and contested takeovers
+/// (a start that replaced another session's attempt it had not heard the last
+/// of). One row per step: a contested takeover on a step that already has a
+/// start conflict adds nothing.
+fn start_conflicts(
+    fold: &ProjectFold,
+    causal: &CausalView<'_>,
+    decisions: &BTreeMap<EventId, DecisionState>,
+) -> Vec<(NodePath, EventId, UtcTime)> {
     let mut conflicts = Vec::new();
+    let takeover_answers = plan::takeover_answers(&fold.asks, &fold.receipts, decisions);
     for (node, feature) in &fold.features {
+        let before = conflicts.len();
+        // The owner's drop settles who continues: no row on a step it
+        // closed, nor for an attempt it ended.
+        if feature.owner_drop().is_some() {
+            continue;
+        }
+        let owners = |id: &EventId| {
+            feature
+                .attempts
+                .get(id)
+                .is_some_and(|attempt| feature.dropped_by_owner(attempt))
+        };
         for attempt_id in &feature.start_conflicts {
+            if owners(attempt_id) {
+                continue;
+            }
             if let Some(attempt) = feature.attempts.get(attempt_id) {
                 conflicts.push((node.clone(), attempt_id.clone(), attempt.started_at));
             }
+        }
+        if conflicts.len() > before {
+            continue;
+        }
+        let answers = takeover_answers.get(node).map_or(&[][..], Vec::as_slice);
+        let mut contested = plan::contested_takeovers(feature, causal, answers);
+        contested.retain(|(replaced, start)| !owners(replaced) && !owners(start));
+        contested.sort_by_key(|(_, start)| causal.order_of(start));
+        if let Some((replaced, start)) = contested.first()
+            && let Some(start) = feature.attempts.get(start)
+        {
+            conflicts.push((node.clone(), replaced.clone(), start.started_at));
         }
     }
     conflicts.sort_by(|left, right| {
@@ -905,7 +1210,6 @@ fn start_conflicts(fold: &ProjectFold) -> Vec<(NodePath, EventId, UtcTime)> {
 /// diagnosed once per ask.
 fn waits_by_attempt(
     fold: &ProjectFold,
-    dependency_steps: &BTreeMap<NodePath, Vec<eta::DependencyStep>>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> BTreeMap<EventId, Vec<(UtcTime, Option<UtcTime>)>> {
     let mut asks: Vec<eta::WaitAsk> = Vec::new();
@@ -934,29 +1238,35 @@ fn waits_by_attempt(
             end,
         });
     }
+    let by_node = waits::by_node(&fold.features, &asks);
     let mut waits: BTreeMap<EventId, Vec<(UtcTime, Option<UtcTime>)>> = BTreeMap::new();
-    let no_steps: Vec<eta::DependencyStep> = Vec::new();
     for (node, feature) in &fold.features {
-        let steps = dependency_steps.get(node).unwrap_or(&no_steps);
-        let intervals = eta::waits(node, steps, &asks, &fold.features);
+        let intervals = &by_node[node];
         for attempt in feature.attempts.values() {
-            waits.insert(attempt.id.clone(), intervals.clone());
+            // A pending review is a human wait on the attempt that delivered.
+            let mut own = intervals.clone();
+            own.extend(attempt.settle.waits.iter().copied());
+            waits.insert(attempt.id.clone(), own);
         }
     }
     waits
 }
 
-/// Whether the project has current doing or done-awaiting-review work, and the
-/// earliest start of that work for the demo-gap clock.
-fn demo_activity(
+/// Whether the project has current doing or done-awaiting-review work, the
+/// earliest start of that work for the demo-gap clock, and the step the clock
+/// runs for: the doing step started first (the first node on a tie). A step
+/// that waits for a review is delivered, so it is never that step.
+fn demo_activity<'a>(
     fold: &ProjectFold,
-    features: &BTreeMap<NodePath, FeatureState>,
+    features: &'a BTreeMap<NodePath, FeatureState>,
     deliveries: &BTreeMap<EventId, crate::model::state::DeliveryState>,
-) -> (bool, Option<UtcTime>) {
+) -> (bool, Option<UtcTime>, Option<&'a NodePath>) {
+    let review_pending = budget::review_pending_nodes(deliveries);
     let mut active = false;
     let mut earliest: Option<UtcTime> = None;
+    let mut undelivered: Option<(UtcTime, &NodePath)> = None;
     for (node, feature_state) in features {
-        if !budget::in_flight(feature_state, deliveries) {
+        if !budget::in_flight(feature_state, &review_pending) {
             continue;
         }
         active = true;
@@ -965,9 +1275,13 @@ fn demo_activity(
                 Some(current) => current.min(attempt.started_at),
                 None => attempt.started_at,
             });
+            let doing = feature_state.progress == Progress::Doing;
+            if doing && undelivered.is_none_or(|(start, _)| attempt.started_at < start) {
+                undelivered = Some((attempt.started_at, node));
+            }
         }
     }
-    (active, earliest)
+    (active, earliest, undelivered.map(|(_, node)| node))
 }
 
 /// Values the summary needs that are derived outside it.
@@ -1015,10 +1329,19 @@ fn build_summary(
     {
         variance = Variance::Rework;
     }
-    if features
+    // A stopped step marks the whole project stopped only when nothing on the
+    // project is live: no step that is doing under a holder that is not lost,
+    // and no live agent. With live work the project keeps its other state and
+    // the summary carries the count of stopped steps.
+    let stopped_steps = features
         .values()
-        .any(|feature| !feature.progress.is_terminal() && feature.liveness == Liveness::Lost)
-    {
+        .filter(|feature| !feature.progress.is_terminal() && feature.liveness == Liveness::Lost)
+        .count() as u32;
+    let live_work = active_agents > 0
+        || features.values().any(|feature| {
+            feature.progress == Progress::Doing && feature.liveness != Liveness::Lost
+        });
+    if stopped_steps > 0 && !live_work {
         variance = Variance::Stopped;
     }
     if variance == Variance::Quiet
@@ -1083,7 +1406,11 @@ fn build_summary(
         variance,
         active_agents,
         stalled_agents: stalled.len() as u32,
-        needs_count: needs.len() as u32,
+        stopped_steps,
+        needs_count: needs
+            .iter()
+            .filter(|need| attention::is_active_need(need))
+            .count() as u32,
         feature_counts,
         last_demo: deliveries
             .values()

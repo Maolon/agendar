@@ -10,11 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use agendar_core::model::state::Liveness;
 use agendar_core::model::{
-    DecisionLifecycle, DecisionOption, DecisionState, MsgArg, NeedsKind, NeedsYouItem, OptionId,
-    Progress, ProjectState, UtcTime,
+    DecisionOption, DecisionState, MsgArg, NeedsKind, NeedsYouItem, Progress, ProjectState, UtcTime,
 };
 use agendar_core::reduce::attention::notification_eligible;
-use agendar_core::reduce::policy::risk_scan;
 
 use crate::preferences::{Lang, fill};
 
@@ -66,84 +64,11 @@ pub trait NoticeSink: Send + Sync {
     fn refresh(&self) {}
 }
 
-/// The only approval a notification may offer: easy effective risk, current
-/// recommendation with confidence med/high, still open and unanswered.
-///
-/// Returns the recommended option and its label.
-pub fn approve_eligible(
-    need: &NeedsYouItem,
-    decision: Option<&DecisionState>,
-) -> Option<(OptionId, String)> {
-    if need.kind != NeedsKind::Decide {
-        return None;
-    }
-    let decision = decision?;
-    if decision.lifecycle != DecisionLifecycle::Open
-        || decision.effective_receipt.is_some()
-        || decision.superseded_by.is_some()
-        || decision.withdrawn_by.is_some()
-    {
-        return None;
-    }
-    if !matches!(
-        decision.card.recommended.confidence,
-        agendar_core::model::Confidence::Med | agendar_core::model::Confidence::High
-    ) {
-        return None;
-    }
-    let (risk, external, hits) = risk_scan(&decision.card);
-    if risk != agendar_core::model::Reversibility::Easy || external || !hits.is_empty() {
-        return None;
-    }
-    let recommended = decision
-        .card
-        .options
-        .iter()
-        .find(|option| option.id == decision.card.recommended.option)?;
-    Some((recommended.id.clone(), recommended.label.clone()))
-}
+/// What an answer surface may offer is decided in the core, for every host.
+pub use agendar_core::guard::{approve_eligible, choice_options, notice_eligible};
 
-/// Buttons a question's notice may offer: every option of an open, easy
-/// (reversible, local, no risky words) question, recommended first, at most
-/// three. Each button carries the option's own label, so pressing one is an
-/// explicit choice. Costly and irreversible questions offer Open only.
-pub fn choice_options(
-    need: &NeedsYouItem,
-    decision: Option<&DecisionState>,
-) -> Vec<(OptionId, String)> {
-    if need.kind != NeedsKind::Decide {
-        return Vec::new();
-    }
-    let Some(decision) = decision else {
-        return Vec::new();
-    };
-    if decision.lifecycle != DecisionLifecycle::Open
-        || decision.effective_receipt.is_some()
-        || decision.superseded_by.is_some()
-        || decision.withdrawn_by.is_some()
-    {
-        return Vec::new();
-    }
-    let (risk, external, hits) = risk_scan(&decision.card);
-    if risk != agendar_core::model::Reversibility::Easy || external || !hits.is_empty() {
-        return Vec::new();
-    }
-    let recommended = &decision.card.recommended.option;
-    let mut options: Vec<&DecisionOption> = decision.card.options.iter().collect();
-    options.sort_by_key(|option| &option.id != recommended);
-    options
-        .into_iter()
-        .take(agendar_notify::MAX_CHOICES)
-        .map(|option| (option.id.clone(), option.label.clone()))
-        .collect()
-}
-
-/// Whether an item is announced at all: every open question (once per
-/// revision), even while its agent still has other work, and every rescue row.
-/// Confirm/review rows are in-app only.
-pub fn notice_eligible(need: &NeedsYouItem) -> bool {
-    matches!(need.kind, NeedsKind::Decide | NeedsKind::Rescue)
-}
+// The core caps a notice's answer buttons at what the native transport shows.
+const _: () = assert!(agendar_core::guard::MAX_NOTICE_CHOICES == agendar_notify::MAX_CHOICES);
 
 /// An agent can do nothing until this question is answered.
 fn stalls_an_agent(need: &NeedsYouItem) -> bool {
@@ -198,10 +123,10 @@ fn question_text(need: &NeedsYouItem, lang: Lang) -> String {
         _ => String::new(),
     };
     let template = match msg.key.as_str() {
-        "need.q.handoff" => lang.pick(
-            "Hand {node} to the next session?",
-            "把 {node} 交给下一个会话？",
-            "把 {node} 交給下一個工作階段？",
+        "need.q.abandoned" => lang.pick(
+            "{node}: abandoned · open to any agent",
+            "{node}：已无人在做 · 任何 agent 都可接手",
+            "{node}：已無人在做 · 任何 AI 代理都可接手",
         ),
         "need.q.conflict" => lang.pick(
             "Who should continue {node}?",
@@ -218,6 +143,7 @@ fn question_text(need: &NeedsYouItem, lang: Lang) -> String {
             "审核 {name}：它做到你要求的了吗？",
             "審核 {name}：它做到你要求的了嗎？",
         ),
+        "need.q.review_ready" => lang.pick("Review {name}", "审核 {name}", "審核 {name}"),
         _ => return need.question.clone(),
     };
     fill(
@@ -389,7 +315,7 @@ pub fn progress_notice(
     );
     let stopped_title = lang.pick(
         "{project}: agents stopped",
-        "{project}：智能体已停止",
+        "{project}：agent 已停止",
         "{project}：AI 代理已停止",
     );
     match (milestones.as_slice(), stopped) {
@@ -437,7 +363,7 @@ pub fn progress_notice(
             if stopped.is_some() {
                 body.push_str(lang.pick(
                     " · agents stopped",
-                    " · 智能体已停止",
+                    " · agent 已停止",
                     " · AI 代理已停止",
                 ));
             }
