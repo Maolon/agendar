@@ -11,7 +11,8 @@
 //! all freeze the writer instead of admitting a new draft. A readable suffix is
 //! flushed to durable storage before the recovery material is cleared.
 
-use std::collections::BTreeMap;
+use std::cell::Cell;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -204,9 +205,35 @@ struct Scan {
     partial_offset: Option<u64>,
 }
 
+/// The events of one completed pending append, with each event's exact line.
 struct Recovered {
-    result: AppendResult,
-    line: Vec<u8>,
+    results: Vec<AppendResult>,
+    lines: Vec<Vec<u8>>,
+}
+
+/// The drafts that follow the first event of one append, each with its
+/// optionally reserved ID. They are built from the first event's ID so a
+/// follower can cite it.
+pub type Following<'a> = &'a dyn Fn(&EventId) -> Vec<(EventDraft, Option<EventId>)>;
+
+enum Slot {
+    Existing(AppendResult),
+    New { event: Event, line: String },
+}
+
+thread_local! {
+    static SEGMENT_WRITES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How many write calls this thread has made to writer segments. Tests count
+/// appends with it; nothing reads it to decide anything.
+#[doc(hidden)]
+pub fn segment_write_calls() -> u64 {
+    SEGMENT_WRITES.with(Cell::get)
+}
+
+fn count_segment_write() {
+    SEGMENT_WRITES.with(|count| count.set(count.get().saturating_add(1)));
 }
 
 /// Whether appending `line_len` bytes to a nonempty segment would exceed the
@@ -247,6 +274,46 @@ pub fn append_event_reserved(
     clock: &dyn crate::vault::Clock,
     ids: &mut dyn crate::vault::IdSource,
 ) -> Result<AppendResult> {
+    let mut results = append_events_reserved(
+        vault,
+        local,
+        key,
+        draft,
+        reserved,
+        &|_| Vec::new(),
+        clock,
+        ids,
+    )?;
+    Ok(results.remove(0))
+}
+
+/// Append the events of one command in one write call: `draft`, then the
+/// drafts `following` builds from its event ID, in that order and with
+/// consecutive sequence numbers. One event is returned per draft.
+///
+/// Every line of a write is validated before that write. The lines are one
+/// pending record and one buffer, so the segment grows once; a write that stops
+/// in the middle leaves whole lines and at most one unfinished line, which the
+/// next append of this writer completes from the pending record. One write is
+/// never split over two segments. Lines that together exceed
+/// [`MAX_LINE_BYTES`] take more than one write, each as large as fits, so a
+/// pending record keeps the bound it has for one line.
+///
+/// A draft whose reserved ID is already in this writer's segments is returned
+/// as the original event and not written again (see [`append_event_reserved`]);
+/// the other drafts are still appended. When the pending record just completed
+/// holds exactly these drafts, its events are returned and nothing is written.
+#[allow(clippy::too_many_arguments)]
+pub fn append_events_reserved(
+    vault: &Vault,
+    local: &LocalPaths,
+    key: &WriterKey,
+    draft: EventDraft,
+    reserved: Option<EventId>,
+    following: Following<'_>,
+    clock: &dyn crate::vault::Clock,
+    ids: &mut dyn crate::vault::IdSource,
+) -> Result<Vec<AppendResult>> {
     let layout = local.ensure_layout(vault.root(), vault.id())?;
     let lock_path = layout.locks.join(lock_file_name(vault, key));
     let _lock = acquire_lock(&lock_path)?;
@@ -268,56 +335,147 @@ pub fn append_event_reserved(
         &journal_path,
         &payload_path,
         &mut journal,
-    )? && draft_matches(&recovered, key, &draft)?
+    )? && batch_matches(&recovered, key, &draft, following)?
     {
-        return Ok(recovered.result);
+        return Ok(recovered.results);
     }
-    let scan = scan_writer(vault, key)?;
-    if let Some(reserved) = &reserved
-        && scan.ids.contains_key(reserved)
-    {
-        return existing_draft_event(vault, key, reserved, &draft);
+    let mut queue = VecDeque::from([(draft, reserved)]);
+    let mut results = Vec::new();
+    while !queue.is_empty() {
+        // Each write takes at least one draft, so only the first one has no
+        // result yet; the followers are built once, from its event ID.
+        let following = results.is_empty().then_some(following);
+        results.extend(append_pending(
+            vault,
+            &layout,
+            key,
+            &mut journal,
+            &journal_path,
+            &payload_path,
+            &mut queue,
+            following,
+            clock,
+            ids,
+        )?);
     }
-    let next_seq = scan.max_seq.saturating_add(1).max(journal.next_seq);
-    if next_seq > MAX_SAFE_SEQ {
-        return Err(AgendarError::validation_at(
-            "/seq",
-            "seq_exhausted",
-            "The writer stream exhausted the JavaScript-safe sequence range.",
-        ));
+    Ok(results)
+}
+
+/// One write call under the writer lock: the drafts at the head of `queue`
+/// whose lines together fit [`MAX_LINE_BYTES`] (always at least one), so a
+/// pending record never exceeds the length of one line. A draft that does not
+/// fit stays in `queue` with its ID for the next write.
+#[allow(clippy::too_many_arguments)]
+fn append_pending(
+    vault: &Vault,
+    layout: &crate::runtime::LocalLayout,
+    key: &WriterKey,
+    journal: &mut WriterJournal,
+    journal_path: &Path,
+    payload_path: &Path,
+    queue: &mut VecDeque<(EventDraft, Option<EventId>)>,
+    following: Option<Following<'_>>,
+    clock: &dyn crate::vault::Clock,
+    ids: &mut dyn crate::vault::IdSource,
+) -> Result<Vec<AppendResult>> {
+    let mut scan = scan_writer(vault, key)?;
+    let mut next_seq = scan.max_seq.saturating_add(1).max(journal.next_seq);
+
+    let mut slots: Vec<Slot> = Vec::new();
+    let mut batch_bytes = 0_usize;
+    while let Some((draft, reserved)) = queue.pop_front() {
+        let slot = if let Some(reserved) = &reserved
+            && scan.ids.contains_key(reserved)
+        {
+            Slot::Existing(existing_draft_event(vault, key, reserved, &draft)?)
+        } else {
+            if next_seq > MAX_SAFE_SEQ {
+                return Err(AgendarError::validation_at(
+                    "/seq",
+                    "seq_exhausted",
+                    "The writer stream exhausted the JavaScript-safe sequence range.",
+                ));
+            }
+            let event_id = match reserved {
+                Some(id) => id,
+                None => next_unused_id(ids, &scan.ids)?,
+            };
+            let event = Event {
+                v: 1,
+                id: event_id,
+                seq: next_seq,
+                writer: key.writer.clone(),
+                ts: clock.now(),
+                project: key.project.clone(),
+                refs: draft.refs,
+                payload: draft.payload,
+            };
+            let line = canonical_event_line(&event)?;
+            if line.len() > MAX_LINE_BYTES {
+                return Err(AgendarError::validation_at(
+                    "/",
+                    "event_line_too_long",
+                    format!(
+                        "A complete event line must be at most {MAX_LINE_BYTES} bytes including LF; got {}.",
+                        line.len()
+                    ),
+                ));
+            }
+            if batch_bytes > 0 && batch_bytes.saturating_add(line.len()) > MAX_LINE_BYTES {
+                queue.push_front((
+                    EventDraft {
+                        refs: event.refs,
+                        payload: event.payload,
+                    },
+                    Some(event.id),
+                ));
+                break;
+            }
+            batch_bytes = batch_bytes.saturating_add(line.len());
+            // A later draft of this batch never takes this ID again.
+            scan.ids
+                .insert(event.id.clone(), Sha256::from_bytes(line.as_bytes()));
+            next_seq = next_seq.saturating_add(1);
+            Slot::New { event, line }
+        };
+        if slots.is_empty()
+            && let Some(following) = following
+        {
+            let first = match &slot {
+                Slot::Existing(existing) => &existing.event.id,
+                Slot::New { event, .. } => &event.id,
+            };
+            queue.extend(following(first));
+        }
+        slots.push(slot);
+    }
+    // Whole lines only, in draft order: the one buffer the segment receives.
+    let line: String = slots
+        .iter()
+        .filter_map(|slot| match slot {
+            Slot::New { line, .. } => Some(line.as_str()),
+            Slot::Existing(_) => None,
+        })
+        .collect();
+    if line.is_empty() {
+        return Ok(slots
+            .into_iter()
+            .filter_map(|slot| match slot {
+                Slot::Existing(existing) => Some(existing),
+                Slot::New { .. } => None,
+            })
+            .collect());
     }
 
-    let event_id = match reserved {
-        Some(id) => id,
-        None => next_unused_id(ids, &scan.ids)?,
-    };
-    let event = Event {
-        v: 1,
-        id: event_id,
-        seq: next_seq,
-        writer: key.writer.clone(),
-        ts: clock.now(),
-        project: key.project.clone(),
-        refs: draft.refs,
-        payload: draft.payload,
-    };
-    let line = canonical_event_line(&event)?;
-    if line.len() > MAX_LINE_BYTES {
-        return Err(AgendarError::validation_at(
-            "/",
-            "event_line_too_long",
-            format!(
-                "A complete event line must be at most {MAX_LINE_BYTES} bytes including LF; got {}.",
-                line.len()
-            ),
-        ));
-    }
-
-    let (segment, abandoned) = choose_segment(&scan, &journal, line.len() as u64);
+    let (segment, abandoned) = choose_segment(&scan, journal, line.len() as u64);
     let relative_path = writer_relative_path(&key.project, &key.writer, segment)?;
     let source = SourcePath::from_relative_path(&relative_path)?;
     // Full model validation before any journal or Vault write.
-    parse_event(line.as_bytes(), &source)?;
+    for slot in &slots {
+        if let Slot::New { line, .. } = slot {
+            parse_event(line.as_bytes(), &source)?;
+        }
+    }
 
     let host_dir = ensure_host_directory(vault.root(), &key.project, key.writer.host())?;
     let target = host_dir.join(writer_file_name(&key.writer, segment)?);
@@ -347,7 +505,7 @@ pub fn append_event_reserved(
     let offset = target_size;
 
     let digest = Sha256::from_bytes(line.as_bytes());
-    write_bytes_atomic(&payload_path, line.as_bytes())?;
+    write_bytes_atomic(payload_path, line.as_bytes())?;
     journal.pending = Some(PendingAppend {
         path: relative_path.clone(),
         offset,
@@ -362,7 +520,7 @@ pub fn append_event_reserved(
     {
         journal.abandoned.push(abandoned);
     }
-    write_json_atomic(&journal_path, &journal)?;
+    write_json_atomic(journal_path, journal)?;
 
     let appended = (|| -> std::io::Result<()> {
         let mut file = if new_segment {
@@ -373,6 +531,7 @@ pub fn append_event_reserved(
         } else {
             OpenOptions::new().append(true).open(&target)?
         };
+        count_segment_write();
         file.write_all(line.as_bytes())?;
         file.sync_data()?;
         Ok(())
@@ -392,20 +551,30 @@ pub fn append_event_reserved(
     }
 
     journal.pending = None;
-    journal.next_seq = next_seq.saturating_add(1);
-    write_json_atomic(&journal_path, &journal)?;
-    remove_if_present(&payload_path)?;
+    journal.next_seq = next_seq;
+    write_json_atomic(journal_path, journal)?;
+    remove_if_present(payload_path)?;
     sync_dir(&layout.pending)?;
 
-    Ok(AppendResult {
-        event,
-        relative_path,
-        byte_end: offset.saturating_add(line.len() as u64),
-    })
+    let mut byte_end = offset;
+    Ok(slots
+        .into_iter()
+        .map(|slot| match slot {
+            Slot::Existing(existing) => existing,
+            Slot::New { event, line } => {
+                byte_end = byte_end.saturating_add(line.len() as u64);
+                AppendResult {
+                    event,
+                    relative_path: relative_path.clone(),
+                    byte_end,
+                }
+            }
+        })
+        .collect())
 }
 
 /// Complete any durable pending append for this writer without consuming a new
-/// draft. Used by service startup and recovery tests.
+/// draft, and return its last event. Used by service startup and recovery tests.
 pub fn recover_writer(
     vault: &Vault,
     local: &LocalPaths,
@@ -427,7 +596,7 @@ pub fn recover_writer(
         &payload_path,
         &mut journal,
     )?
-    .map(|recovered| recovered.result))
+    .and_then(|recovered| recovered.results.into_iter().next_back()))
 }
 
 /// Seal a writer. `SessionEnded` is permanent and refuses later appends;
@@ -624,7 +793,6 @@ fn recover_locked(
             return Err(fork_error(detail));
         }
     };
-
     let host_relative = pending
         .path
         .rsplit_once('/')
@@ -663,6 +831,7 @@ fn recover_locked(
                 .create_new(true)
                 .open(&target)?
         };
+        count_segment_write();
         file.write_all(&line[available as usize..])?;
         file.sync_data()?;
     }
@@ -687,21 +856,28 @@ fn recover_locked(
     // the missing suffix. A flush failure keeps the recovery material.
     sync_segment(&target)?;
 
-    let event = parse_event(&line, &source)?;
+    let mut results = Vec::new();
+    let mut lines = Vec::new();
+    let mut next_seq = journal.next_seq;
+    let mut byte_end = pending.offset;
+    for one in line.split_inclusive(|byte| *byte == b'\n') {
+        let event = parse_event(one, &source)?;
+        next_seq = next_seq.max(event.seq.saturating_add(1));
+        byte_end = byte_end.saturating_add(one.len() as u64);
+        results.push(AppendResult {
+            event,
+            relative_path: pending.path.clone(),
+            byte_end,
+        });
+        lines.push(one.to_vec());
+    }
     journal.pending = None;
-    journal.next_seq = journal.next_seq.max(event.seq.saturating_add(1)).max(1);
+    journal.next_seq = next_seq.max(1);
     write_json_atomic(journal_path, journal)?;
     remove_if_present(payload_path)?;
     sync_dir(&layout.pending)?;
 
-    Ok(Some(Recovered {
-        result: AppendResult {
-            event,
-            relative_path: pending.path,
-            byte_end: pending.offset.saturating_add(pending.bytes),
-        },
-        line,
-    }))
+    Ok(Some(Recovered { results, lines }))
 }
 
 fn freeze(journal: &mut WriterJournal, journal_path: &Path, detail: &str) -> Result<()> {
@@ -793,8 +969,36 @@ fn sync_segment(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn draft_matches(recovered: &Recovered, key: &WriterKey, draft: &EventDraft) -> Result<bool> {
-    let event = &recovered.result.event;
+/// Whether the completed pending append holds exactly these drafts, in order.
+fn batch_matches(
+    recovered: &Recovered,
+    key: &WriterKey,
+    draft: &EventDraft,
+    following: Following<'_>,
+) -> Result<bool> {
+    let (Some(first), Some(first_line)) = (recovered.results.first(), recovered.lines.first())
+    else {
+        return Ok(false);
+    };
+    if !draft_matches(&first.event, first_line, key, draft)? {
+        return Ok(false);
+    }
+    let rest = following(&first.event.id);
+    if rest.len().saturating_add(1) != recovered.results.len() {
+        return Ok(false);
+    }
+    for ((draft, _), (result, line)) in rest
+        .iter()
+        .zip(recovered.results.iter().zip(&recovered.lines).skip(1))
+    {
+        if !draft_matches(&result.event, line, key, draft)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn draft_matches(event: &Event, line: &[u8], key: &WriterKey, draft: &EventDraft) -> Result<bool> {
     let candidate = Event {
         v: 1,
         id: event.id.clone(),
@@ -805,7 +1009,7 @@ fn draft_matches(recovered: &Recovered, key: &WriterKey, draft: &EventDraft) -> 
         refs: draft.refs.clone(),
         payload: draft.payload.clone(),
     };
-    Ok(canonical_event_line(&candidate)?.into_bytes() == recovered.line)
+    Ok(canonical_event_line(&candidate)?.as_bytes() == line)
 }
 
 /// Return an already durable event for a reserved ID without appending it again.

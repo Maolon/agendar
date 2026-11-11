@@ -52,6 +52,51 @@ pub fn build(project: &ProjectState, events: &[Event], now: UtcTime) -> ProjectS
     let mut instant = 0_u32;
     let mut finished_24h = 0_u32;
     let mut agent_ms_24h = 0_u64;
+    let mut record = |start: i64, at: UtcTime| {
+        let elapsed = u64::try_from(at.millis() - start).unwrap_or(0);
+        if elapsed < MIN_SAMPLE_MS {
+            instant += 1;
+            return;
+        }
+        durations.push(elapsed);
+        if now.millis() - at.millis() <= DAY_MS {
+            finished_24h += 1;
+            agent_ms_24h = agent_ms_24h.saturating_add(elapsed);
+        }
+    };
+    // An attempt the owner dropped is not finished work, whatever its agent
+    // reported, also once the step was started again. The reducer's rule
+    // (`FeatureFold::settle_owner_drops`), read from the events at hand: a
+    // start that does not cite a drop of its step is closed by it, unless a
+    // start that does not cite that drop either had replaced it. The service
+    // writes every drop it has seen into a start's `causes`.
+    let starts: Vec<&Event> = events
+        .iter()
+        .filter(|event| {
+            matches!(&event.payload, EventPayload::WorkProgress(body) if body.status == WorkStatus::Started)
+        })
+        .collect();
+    let owner_dropped: std::collections::BTreeSet<&EventId> = events
+        .iter()
+        .filter(|event| matches!(event.payload, EventPayload::PlanDropped(_)))
+        .flat_map(|drop| {
+            let closed = |start: &&&Event| {
+                start.project == drop.project
+                    && start.refs.node == drop.refs.node
+                    && !start.refs.causes.contains(&drop.id)
+            };
+            starts
+                .iter()
+                .filter(closed)
+                .filter(|start| {
+                    !starts
+                        .iter()
+                        .any(|later| closed(&later) && later.refs.causes.contains(&start.id))
+                })
+                .map(|start| &start.id)
+                .collect::<Vec<_>>()
+        })
+        .collect();
     for event in events {
         let EventPayload::WorkProgress(body) = &event.payload else {
             continue;
@@ -64,24 +109,47 @@ pub fn build(project: &ProjectState, events: &[Event], now: UtcTime) -> ProjectS
                 let Some(attempt) = event.refs.attempt.as_ref() else {
                     continue;
                 };
+                if owner_dropped.contains(attempt) {
+                    continue;
+                }
                 // First completion only: a later "verified" is not new work.
                 let Some(start) = started.remove(attempt) else {
                     continue;
                 };
-                let elapsed = u64::try_from(event.ts.millis() - start).unwrap_or(0);
-                if elapsed < MIN_SAMPLE_MS {
-                    instant += 1;
-                    continue;
-                }
-                durations.push(elapsed);
-                if now.millis() - event.ts.millis() <= DAY_MS {
-                    finished_24h += 1;
-                    agent_ms_24h = agent_ms_24h.saturating_add(elapsed);
-                }
+                record(start, event.ts);
             }
             WorkStatus::Dropped => {
                 started.remove(event.refs.attempt.as_ref().unwrap_or(&event.id));
             }
+        }
+    }
+    // A step the owner's accept finished, with no done from its agent, ends at
+    // the delivery that accept rests on.
+    for feature in project.features.values() {
+        if feature.progress != crate::model::state::Progress::Done {
+            continue;
+        }
+        let Some(attempt) = feature.attempt.as_ref() else {
+            continue;
+        };
+        if !crate::reduce::settle::accepted_by_owner(project, attempt) {
+            continue;
+        }
+        let Some(start) = started.remove(attempt) else {
+            continue;
+        };
+        let delivered = events
+            .iter()
+            .filter(|event| matches!(event.payload, EventPayload::Delivery(_)))
+            .filter(|event| {
+                project.deliveries.get(&event.id).is_some_and(|delivery| {
+                    &delivery.attempt == attempt && delivery.superseded_by.is_none()
+                })
+            })
+            .map(|event| event.ts)
+            .max();
+        if let Some(at) = delivered {
+            record(start, at);
         }
     }
     durations.sort_unstable();
@@ -96,6 +164,7 @@ pub fn build(project: &ProjectState, events: &[Event], now: UtcTime) -> ProjectS
         .filter(|feature| {
             feature.progress == crate::model::state::Progress::Doing
                 && feature.liveness == crate::model::state::Liveness::Live
+                && feature.phase != Some(crate::model::state::Phase::InReview)
         })
         .filter_map(|feature| feature.session.as_ref())
         .collect();

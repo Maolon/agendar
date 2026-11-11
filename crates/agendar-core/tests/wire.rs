@@ -207,6 +207,8 @@ fn all_valid_fixture_kinds_accept() {
         "review.result",
         "rule.set",
         "policy.set",
+        "plan.dropped",
+        "need.snoozed",
         "session.lost",
         "session.continued",
         "delivered.answer",
@@ -422,7 +424,7 @@ struct MatrixCase {
     basis: bool,
 }
 
-const MATRIX: [MatrixCase; 23] = [
+const MATRIX: [MatrixCase; 25] = [
     MatrixCase {
         key: "project.declared",
         required: &[],
@@ -510,7 +512,8 @@ const MATRIX: [MatrixCase; 23] = [
     },
     MatrixCase {
         key: "delivery",
-        required: &["node", "attempt", "receipt"],
+        // The receipt is optional; without one the delivery lists no criteria.
+        required: &["node", "attempt"],
         allowed: &["node", "attempt", "receipt", "supersedes"],
         basis: false,
     },
@@ -534,6 +537,18 @@ const MATRIX: [MatrixCase; 23] = [
     },
     MatrixCase {
         key: "policy.set",
+        required: &[],
+        allowed: &[],
+        basis: false,
+    },
+    MatrixCase {
+        key: "plan.dropped",
+        required: &["node"],
+        allowed: &["node"],
+        basis: false,
+    },
+    MatrixCase {
+        key: "need.snoozed",
         required: &[],
         allowed: &[],
         basis: false,
@@ -604,6 +619,8 @@ fn wire_kind(key: &str) -> &'static str {
             "review.result" => "review.result",
             "rule.set" => "rule.set",
             "policy.set" => "policy.set",
+            "plan.dropped" => "plan.dropped",
+            "need.snoozed" => "need.snoozed",
             "session.lost" => "session.lost",
             "session.continued" => "session.continued",
             _ => panic!("unknown wire kind key {other}"),
@@ -815,7 +832,14 @@ const AGENT_ONLY: [&str; 12] = [
     "delivery",
 ];
 
-const HUMAN_ONLY: [&str; 4] = ["decision.answer", "review.result", "rule.set", "policy.set"];
+const HUMAN_ONLY: [&str; 6] = [
+    "decision.answer",
+    "review.result",
+    "rule.set",
+    "policy.set",
+    "plan.dropped",
+    "need.snoozed",
+];
 
 const STEWARD_ONLY: [&str; 5] = [
     "evidence.observed",
@@ -1753,6 +1777,17 @@ fn card_timeout_and_report_are_validated() {
 // Delivery demos, criteria and disclosure
 // ---------------------------------------------------------------------------
 
+#[test]
+fn a_delivery_line_without_a_receipt_lists_no_criteria() {
+    let mut without = valid_event("delivery");
+    remove_ref(&mut without, "receipt");
+    assert_error(&without, "/criteria", "delivery_criteria_without_receipt");
+
+    body_mut(&mut without)["criteria"] = json!([]);
+    let event = expect_ok(&without);
+    assert!(event.refs.receipt.is_none());
+}
+
 fn delivery_with_demo(demo: Value) -> Value {
     let mut value = valid_event("delivery");
     body_mut(&mut value)["demos"] = json!([demo]);
@@ -2644,6 +2679,134 @@ fn review_result_requires_reason_for_send_back_and_rule_only_then() {
     expect_ok(&accepted_with_reason);
 }
 
+fn send_back_with(comments: Value) -> Value {
+    let mut event = valid_event("review.result");
+    body_mut(&mut event)["verdict"] = json!("send_back");
+    body_mut(&mut event).insert("comments".to_owned(), comments);
+    event
+}
+
+fn diff_comment() -> Value {
+    json!({
+        "anchor": {"kind": "diff_line", "demo": 0, "file": "src/a.rs", "side": "new", "line": 840, "quote": "let x = 1;"},
+        "text": "Use the helper here."
+    })
+}
+
+#[test]
+fn review_comments_round_trip_and_are_validated() {
+    let comments = json!([
+        diff_comment(),
+        {"anchor": {"kind": "transcript_line", "demo": 1, "line": 12, "quote": ""}, "text": "Missing output."},
+        {"anchor": {"kind": "region", "demo": 2, "x": 100, "y": 50, "w": 300, "h": 150}, "text": "Clipped."},
+    ]);
+    // A send-back with only comments needs no reason, and survives a round trip.
+    let event = expect_ok(&send_back_with(comments.clone()));
+    let EventPayload::ReviewResult(body) = &event.payload else {
+        panic!("review.result");
+    };
+    assert_eq!(body.comments.len(), 3);
+    assert_eq!(body.reason, None);
+    let wire = serde_json::to_value(body).expect("serialize");
+    assert_eq!(wire["comments"], comments);
+    assert!(wire.get("reason").is_none());
+    let back: agendar_core::model::ReviewResult =
+        serde_json::from_value(wire).expect("deserialize");
+    assert_eq!(&back, body);
+    // No comments: the field is not written at all.
+    let plain = agendar_core::model::ReviewResult {
+        comments: Vec::new(),
+        ..back
+    };
+    assert!(
+        serde_json::to_value(&plain)
+            .expect("plain")
+            .get("comments")
+            .is_none()
+    );
+
+    let mut accept = valid_event("review.result");
+    body_mut(&mut accept).insert("comments".to_owned(), json!([diff_comment()]));
+    assert_error(&accept, "/comments", "comments_require_send_back");
+
+    assert_error(
+        &send_back_with(json!([])),
+        "/reason",
+        "send_back_requires_reason",
+    );
+
+    let region = |x: u16, y: u16, w: u16, h: u16| json!([{"anchor": {"kind": "region", "demo": 0, "x": x, "y": y, "w": w, "h": h}, "text": "here"}]);
+    for bad in [
+        region(900, 0, 101, 10),
+        region(0, 999, 10, 2),
+        region(0, 0, 0, 10),
+        region(0, 0, 10, 0),
+    ] {
+        assert_error(
+            &send_back_with(bad),
+            "/comments/0/anchor",
+            "region_out_of_range",
+        );
+    }
+    expect_ok(&send_back_with(region(0, 0, 1000, 1000)));
+    // Floats are not integers.
+    assert_error_code(
+        &send_back_with(
+            json!([{"anchor": {"kind": "region", "demo": 0, "x": 0.5, "y": 0, "w": 10, "h": 10}, "text": "here"}]),
+        ),
+        "E_VALIDATION",
+    );
+
+    let many: Vec<Value> = (0..21).map(|_| diff_comment()).collect();
+    assert_error(
+        &send_back_with(json!(many)),
+        "/comments",
+        "too_many_comments",
+    );
+    let twenty: Vec<Value> = (0..20).map(|_| diff_comment()).collect();
+    expect_ok(&send_back_with(json!(twenty)));
+
+    let mut empty = diff_comment();
+    empty["text"] = json!(" ");
+    assert_error(
+        &send_back_with(json!([empty])),
+        "/comments/0/text",
+        "blank_string",
+    );
+
+    let mut demo = diff_comment();
+    demo["anchor"]["demo"] = json!(3);
+    assert_error(
+        &send_back_with(json!([demo])),
+        "/comments/0/anchor/demo",
+        "demo_out_of_range",
+    );
+
+    let mut zero = diff_comment();
+    zero["anchor"]["line"] = json!(0);
+    assert_error(
+        &send_back_with(json!([zero])),
+        "/comments/0/anchor/line",
+        "line_out_of_range",
+    );
+
+    let mut long_quote = diff_comment();
+    long_quote["anchor"]["quote"] = json!("x".repeat(201));
+    assert_error(
+        &send_back_with(json!([long_quote])),
+        "/comments/0/anchor/quote",
+        "length",
+    );
+
+    let mut extra = diff_comment();
+    extra["anchor"]["color"] = json!("red");
+    assert_error_code(&send_back_with(json!([extra])), "E_VALIDATION");
+
+    let mut unknown = diff_comment();
+    unknown["anchor"]["kind"] = json!("word");
+    assert_error_code(&send_back_with(json!([unknown])), "E_VALIDATION");
+}
+
 #[test]
 fn rule_set_text_and_revision_shape_are_validated() {
     let mut blank = valid_event("rule.set");
@@ -3099,6 +3262,63 @@ fn session_lost_and_delivered_shapes_are_validated() {
     body_mut(&mut bad_session)["session"] = json!("0000000000000000000000010a");
     assert_error_code(&bad_session, "E_VALIDATION");
 
+    let mut no_note = valid_event("plan.dropped");
+    body_mut(&mut no_note).remove("note");
+    expect_ok(&no_note);
+
+    let mut long_note = valid_event("plan.dropped");
+    body_mut(&mut long_note)["note"] = json!("n".repeat(400));
+    assert_error_code(&long_note, "E_VALIDATION");
+
+    let mut by = valid_event("plan.dropped");
+    body_mut(&mut by).insert("agent".to_owned(), agent());
+    assert_error_code(&by, "E_VALIDATION");
+
+    // A snooze: a row id, the row's revision and a time at most seven days
+    // after the event's own. A time at or before it is valid (it ends one).
+    let seven_days = valid_event("need.snoozed");
+    let ts = seven_days["ts"].as_str().expect("ts").to_owned();
+    let after = |ms: i64| {
+        agendar_core::model::UtcTime::parse(&ts)
+            .expect("ts")
+            .add_millis(ms)
+            .canonical()
+    };
+    const WEEK_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+    for (ms, valid) in [
+        (WEEK_MS, true),
+        (WEEK_MS + 1, false),
+        (0, true),
+        (-WEEK_MS * 8, true),
+    ] {
+        let mut snooze = valid_event("need.snoozed");
+        body_mut(&mut snooze)["until"] = json!(after(ms));
+        if valid {
+            expect_ok(&snooze);
+        } else {
+            assert_eq!(expect_err(&snooze).detail(), Some("snooze_too_long"));
+        }
+    }
+    for need in ["", " decide:x", "decide:x\u{0007}"] {
+        let mut blank = valid_event("need.snoozed");
+        body_mut(&mut blank)["need"] = json!(need);
+        assert_error_code(&blank, "E_VALIDATION");
+    }
+    let mut long_need = valid_event("need.snoozed");
+    body_mut(&mut long_need)["need"] = json!("n".repeat(201));
+    assert_error_code(&long_need, "E_VALIDATION");
+    for field in ["need", "revision", "until"] {
+        let mut missing = valid_event("need.snoozed");
+        body_mut(&mut missing).remove(field);
+        assert_error_code(&missing, "E_VALIDATION");
+    }
+    let mut extra = valid_event("need.snoozed");
+    body_mut(&mut extra).insert("note".to_owned(), json!("later"));
+    assert_error_code(&extra, "E_VALIDATION");
+    let mut on_a_step = valid_event("need.snoozed");
+    insert_ref(&mut on_a_step, "node", "x");
+    assert_error_code(&on_a_step, "E_VALIDATION");
+
     let mut itself = valid_event("session.continued");
     body_mut(&mut itself)["previous"] = body_mut(&mut itself)["session"].clone();
     assert_error_code(&itself, "E_VALIDATION");
@@ -3239,5 +3459,141 @@ fn text_a_little_over_its_limit_is_accepted_and_far_over_explains_why() {
             .contains("Shorten /title by 10"),
         "{:?}",
         error.hint()
+    );
+}
+
+fn diff_demo() -> Value {
+    json!({
+        "kind": "diff",
+        "body": {
+            "blob": blob(),
+            "commit": "233cf80".to_owned() + &"0".repeat(33),
+            "files_total": 3,
+            "hunks_total": 5,
+            "added_total": 40,
+            "removed_total": 12,
+            "shown": [{"path": "crates/x/src/a.rs", "hunk": 2, "why": "The receipt becomes optional."}],
+            "omitted": [{"path": "README.md", "added": 1, "removed": 0}],
+        },
+    })
+}
+
+#[test]
+fn a_diff_demo_round_trips_and_is_validated() {
+    let event = expect_ok(&delivery_with_demo(diff_demo()));
+    assert_round_trip(&event);
+
+    for bad in ["233cf80", &"A".repeat(40), &"g".repeat(40)] {
+        let mut demo = diff_demo();
+        demo["body"]["commit"] = json!(bad);
+        assert_error(
+            &delivery_with_demo(demo),
+            "/demos/0/body/commit",
+            "diff_commit",
+        );
+    }
+
+    let mut none = diff_demo();
+    none["body"]["shown"] = json!([]);
+    assert_error(
+        &delivery_with_demo(none),
+        "/demos/0/body/shown",
+        "diff_shown_count",
+    );
+
+    let mut thirteen = diff_demo();
+    let one = thirteen["body"]["shown"][0].clone();
+    thirteen["body"]["shown"] = json!(vec![one; 13]);
+    assert_error(
+        &delivery_with_demo(thirteen),
+        "/demos/0/body/shown",
+        "diff_shown_count",
+    );
+
+    let mut blank_why = diff_demo();
+    blank_why["body"]["shown"][0]["why"] = json!("  ");
+    assert_error(
+        &delivery_with_demo(blank_why),
+        "/demos/0/body/shown/0/why",
+        "blank_string",
+    );
+
+    let mut markdown = diff_demo();
+    markdown["body"]["blob"] = blob_with_ext("md");
+    assert_error(
+        &delivery_with_demo(markdown),
+        "/demos/0/body/blob/ext",
+        "demo_extension_mismatch",
+    );
+
+    let mut extra = diff_demo();
+    extra["body"]["repo"] = json!(".");
+    assert_error_code(&delivery_with_demo(extra), "E_VALIDATION");
+}
+
+#[test]
+fn delivery_replies_need_supersedes_and_one_short_reply_per_target() {
+    let with_replies = |replies: Value, supersedes: bool| {
+        let mut value = valid_event("delivery");
+        body_mut(&mut value).insert("replies".to_owned(), replies);
+        if supersedes {
+            insert_ref(&mut value, "supersedes", "00000000000000000000000001");
+        }
+        value
+    };
+    // A delivery without replies keeps its exact bytes: the field is skipped.
+    let plain = expect_ok(&valid_event("delivery"));
+    let bytes = serde_json::to_value(&plain).expect("json");
+    assert!(bytes["body"].get("replies").is_none(), "{bytes}");
+
+    let good = json!([{"text": "Cached it"}, {"comment": 2, "text": "Renamed"}]);
+    let event = expect_ok(&with_replies(good.clone(), true));
+    let bytes = serde_json::to_value(&event).expect("json");
+    assert_eq!(bytes["body"]["replies"], good);
+
+    assert_error(
+        &with_replies(good, false),
+        "/replies",
+        "delivery_replies_without_supersedes",
+    );
+    assert_error(
+        &with_replies(
+            json!([{"comment": 1, "text": "a"}, {"comment": 1, "text": "b"}]),
+            true,
+        ),
+        "/replies/1",
+        "duplicate_reply",
+    );
+    assert_error(
+        &with_replies(json!([{"text": "a"}, {"text": "b"}]), true),
+        "/replies/1",
+        "duplicate_reply",
+    );
+    assert_error(
+        &with_replies(json!([{"comment": 0, "text": "a"}]), true),
+        "/replies/0/comment",
+        "reply_comment_out_of_range",
+    );
+    assert_error(
+        &with_replies(json!([{"text": "  "}]), true),
+        "/replies/0/text",
+        "blank_string",
+    );
+    assert_error(
+        &with_replies(json!([{"text": "x".repeat(400)}]), true),
+        "/replies/0/text",
+        "length",
+    );
+    let many: Vec<Value> = (1..=22)
+        .map(|n| json!({"comment": n, "text": "ok"}))
+        .collect();
+    assert_error(
+        &with_replies(json!(many), true),
+        "/replies",
+        "too_many_replies",
+    );
+    assert_error_code(
+        &with_replies(json!([{"comment": 1, "text": "a", "extra": true}]), true),
+        "E_VALIDATION",
     );
 }

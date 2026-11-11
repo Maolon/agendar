@@ -3,8 +3,10 @@
 //! Agendar CLI library: argument parsing, JSON envelopes and command dispatch.
 
 pub mod args;
+pub mod board;
 pub mod commands;
 pub mod delivery;
+pub mod diff;
 pub mod hooks;
 pub mod mcp;
 pub mod output;

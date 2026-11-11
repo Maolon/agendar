@@ -6,6 +6,8 @@
 
 use std::fmt;
 
+pub mod details;
+
 /// Stable public error codes
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ErrorCode {

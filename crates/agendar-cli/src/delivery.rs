@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use agendar_core::error::{AgendarError, ErrorCode, Result};
 use agendar_core::model::{
     Agent, BlobExt, BlobRef, CheckResult, Claim, CliTranscriptDemo, CriterionId, CriterionResult,
-    Delivery, Demo, DemoCheck, DemoKind, Disclosure, EventId, ProjectSlug, ScreenshotDemo,
+    Delivery, Demo, DemoCheck, DemoKind, Disclosure, EventId, ProjectSlug, Reply, ScreenshotDemo,
     SessionId,
 };
 use agendar_core::runtime::checks::{CheckProfile, NormalizedProfile, profile_digest};
@@ -123,11 +123,23 @@ impl BlobInput {
     }
 }
 
+/// One demo input. The body shape depends on the kind: a `diff` takes
+/// [`crate::diff::DiffInput`], every other kind a [`BlobInput`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DemoInput {
     pub kind: DemoKind,
-    pub body: BlobInput,
+    pub body: Value,
+}
+
+fn demo_body<T: serde::de::DeserializeOwned>(body: &Value, field: &str, shape: &str) -> Result<T> {
+    serde_json::from_value(body.clone()).map_err(|error| {
+        AgendarError::validation_at(
+            field,
+            "demo_body_shape",
+            format!("This demo body is {shape}: {error}."),
+        )
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -175,10 +187,15 @@ impl CheckProposalInput {
 pub struct DeliveryInput {
     pub name: String,
     pub demos: Vec<DemoInput>,
+    /// The receipt's done_when results; empty for a delivery without a receipt.
+    #[serde(default)]
     pub criteria: Vec<CriterionInput>,
     pub disclosure: DisclosureInput,
     #[serde(default)]
     pub checks: Vec<CheckProposalInput>,
+    /// With `--supersedes`: replies to the send-back's reason and comments.
+    #[serde(default)]
+    pub replies: Vec<Reply>,
 }
 
 /// Publish one local file or verify one existing blob.
@@ -312,7 +329,31 @@ pub fn build_body(
     let mut config: Option<agendar_core::runtime::Config> = None;
     for (index, demo) in input.demos.iter().enumerate() {
         let field = format!("/demos/{index}/body");
-        let check = match &demo.body.check {
+        if demo.kind == DemoKind::Diff {
+            let diff: crate::diff::DiffInput = demo_body(
+                &demo.body,
+                &field,
+                "{\"commit\", \"repo\"?, \"hunks\": [{\"file\", \"hunk\", \"why\"}]}",
+            )?;
+            let cut = crate::diff::cut_commit(&diff, &field)?;
+            let blob = put_blob(
+                service.vault(),
+                service.local(),
+                project,
+                service.host(),
+                BlobExt::Txt,
+                &mut cut.excerpt.as_slice(),
+            )?;
+            uploaded.push(blob.clone());
+            demos.push(Demo::Diff(cut.into_demo(blob)));
+            continue;
+        }
+        let body: BlobInput = demo_body(
+            &demo.body,
+            &field,
+            "{\"file\", \"ext\"} or {\"blob\"}, with optional alt and check",
+        )?;
+        let check = match &body.check {
             Some(raw) => Some(canonical_demo_check(
                 service,
                 project,
@@ -324,8 +365,8 @@ pub fn build_body(
         };
         match demo.kind {
             DemoKind::Screenshot => {
-                let blob = upload_blob(service, project, &demo.body, &field, &IMAGE_EXTS)?;
-                let alt = demo.body.alt.clone().ok_or_else(|| {
+                let blob = upload_blob(service, project, &body, &field, &IMAGE_EXTS)?;
+                let alt = body.alt.clone().ok_or_else(|| {
                     AgendarError::validation_at(
                         format!("/demos/{index}/body/alt"),
                         "screenshot_alt",
@@ -343,25 +384,26 @@ pub fn build_body(
                 demos.push(Demo::Screenshot(ScreenshotDemo { blob, alt, check }));
             }
             DemoKind::CliTranscript => {
-                let blob = upload_blob(service, project, &demo.body, &field, &TRANSCRIPT_EXTS)?;
+                let blob = upload_blob(service, project, &body, &field, &TRANSCRIPT_EXTS)?;
                 uploaded.push(blob.clone());
                 demos.push(Demo::CliTranscript(CliTranscriptDemo { blob, check }));
             }
-            DemoKind::PreviewUrl | DemoKind::Recording => {
+            DemoKind::PreviewUrl | DemoKind::Recording | DemoKind::Diff => {
                 return Err(AgendarError::new(
                     ErrorCode::Unsupported,
                     "This demo kind is not implemented in this version.",
                 )
                 .with_detail("demo_kind_unsupported")
-                .with_hint("Use a screenshot or CLI transcript demo."));
+                .with_hint("Use a screenshot, CLI transcript or diff demo."));
             }
         }
     }
-    if input.criteria.is_empty() || input.criteria.len() > 8 {
+    // Empty criteria are checked against the receipt before this runs.
+    if input.criteria.len() > 8 {
         return Err(AgendarError::validation_at(
             "/criteria",
             "delivery_criteria",
-            "A delivery must contain 1..=8 criteria.",
+            "A delivery must contain at most 8 criteria.",
         ));
     }
     let mut criteria = Vec::new();
@@ -412,6 +454,7 @@ pub fn build_body(
         demos,
         criteria,
         disclosure: input.disclosure.clone().into_disclosure()?,
+        replies: input.replies.clone(),
     };
     Ok((body, uploaded))
 }

@@ -39,8 +39,10 @@ export type Mode = "auto" | "assume" | "ask";
 export type Confidence = "low" | "med" | "high";
 export type Claim = "agent_says" | "seen";
 export type CheckResult = "passed" | "failed" | "not_proven";
-export type DemoKind = "screenshot" | "cli_transcript" | "preview_url" | "recording";
+export type DemoKind = "screenshot" | "cli_transcript" | "preview_url" | "recording" | "diff";
 export type Progress = "planned" | "doing" | "done" | "verified" | "dropped";
+/** A step in progress whose latest work is a delivery: the owner holds it, or sent it back. */
+export type Phase = "in_review" | "sent_back";
 export type Gate = "open" | "awaiting_decision" | "awaiting_upstream";
 export type Basis = "firm" | "assumed" | "tainted";
 export type Liveness = "live" | "quiet" | "lost";
@@ -130,6 +132,36 @@ export interface Demo {
   body: DemoBody;
 }
 
+/** One hunk a diff demo shows (model `DiffShown`), in display order. */
+export interface DiffShown {
+  path: string;
+  /** 1-based index within that file's diff. */
+  hunk: number;
+  why: string;
+}
+
+/** A changed file with no shown hunk (model `DiffFile`). */
+export interface DiffFile {
+  path: string;
+  added: number;
+  removed: number;
+}
+
+/**
+ * The body of a `diff` demo (model `DiffDemo`): `blob` is unified-diff text of
+ * only the shown hunks, cut verbatim from `commit` by the CLI.
+ */
+export interface DiffDemoBody {
+  blob: BlobRef;
+  commit: string;
+  files_total: number;
+  hunks_total: number;
+  added_total: number;
+  removed_total: number;
+  shown: DiffShown[];
+  omitted: DiffFile[];
+}
+
 export interface DecisionOption {
   id: OptionId;
   label: string;
@@ -216,6 +248,8 @@ export interface BudgetUsage {
   speculative_features: number;
   pending_slices: number;
   demo_gap_s: number;
+  /** The started, undelivered step the demo clock runs for; absent with nothing in progress. */
+  demo_gap_node?: string;
   blocked: boolean;
   reasons: string[];
 }
@@ -262,6 +296,44 @@ export interface Calibration {
   ratio_milli: number;
 }
 
+/** Whether an agent still stands behind a step in progress. */
+export type Lease = "held" | "stalled" | "free";
+
+export interface ClaimState {
+  state: Lease;
+  /** held: from the last word; stalled: from the ETA; free: when it was freed. */
+  since: UtcTime;
+  /** The latest event on this attempt by its session. */
+  last_word: UtcTime;
+  /** The open question to the owner that stops the clock. */
+  waiting_on?: EventId;
+}
+
+/** The closed table of corrections. */
+export type CorrectionRule = "accepted" | "sent_back" | "lost" | "silent" | "closed_after_accept";
+
+/** Present exactly when the board shows something other than the agent's last self-report. */
+export interface Correction {
+  rule: CorrectionRule;
+  since: UtcTime;
+  evidence: EventId[];
+}
+
+export interface TakenFrom {
+  attempt: EventId;
+  session: SessionId;
+  at: UtcTime;
+  /** The owner's answer that let it (a takeover the agent asked for). */
+  granted_by?: EventId;
+}
+
+/** The owner let `session` continue a step another agent holds, by `answer`. */
+export interface TakeoverGrant {
+  session: SessionId;
+  ask: EventId;
+  answer: EventId;
+}
+
 export interface FeatureState {
   node: NodePath;
   title: string;
@@ -275,6 +347,13 @@ export interface FeatureState {
   depends_on: NodePath[];
   field_sources: Record<string, EventId>;
   progress: Progress;
+  /** Absent while the agent works and once the step is finished. */
+  phase?: Phase;
+  /** The agent's claim on a step in progress (doing or sent back). */
+  claim?: ClaimState;
+  correction?: Correction;
+  taken_from?: TakenFrom;
+  takeover_grants?: TakeoverGrant[];
   gate: Gate;
   basis: Basis;
   liveness: Liveness;
@@ -289,10 +368,25 @@ export interface FeatureState {
   handoff_event?: EventId;
   handoff_consumed_by?: EventId;
   handoff_pending?: boolean;
+  /**
+   * Only agents wrote this planned step, nobody started it, no question is on
+   * it and nobody touched it for 14 days. Absent when false. Still work left.
+   * The owner's Keep is an `update_feature` patch (see `keepPatch`).
+   */
+  untouched?: boolean;
+  /** Present when the step is dropped and the owner dropped it; an agent's drop has none. */
+  owner_drop?: OwnerDrop;
   /** expected_fields for update_feature. */
   field_revisions: Record<string, Sha256>;
   /** expected_graph_revision for dependency edits. */
   graph_revision: Sha256;
+}
+
+/** The owner's drop a dropped step rests on (`plan.dropped`). */
+export interface OwnerDrop {
+  event: EventId;
+  at: UtcTime;
+  note?: string;
 }
 
 export interface DecisionState {
@@ -343,7 +437,8 @@ export interface DeliveryState {
   id: EventId;
   node: NodePath;
   attempt: EventId;
-  receipt: EventId;
+  /** Absent for finished work no decision asked for; it then has no criteria. */
+  receipt?: EventId;
   name: string;
   demos: Demo[];
   criteria: ProjectedCriterion[];
@@ -354,6 +449,12 @@ export interface DeliveryState {
   review_history: EventId[];
   review_frontier: EventId[];
   review_conflict: boolean;
+  /** The earlier delivery on the same feature this one replaces. */
+  supersedes?: EventId;
+  /** The agent's replies to the send-back of `supersedes`. */
+  replies?: Reply[];
+  /** This delivery's latest send-back, kept after it is superseded. */
+  sent_back?: SentBackNote;
   /**
    * This host's stored check proposals (`checks::proposals`), projected by the
    * app. Local metadata, not Vault truth: another host may propose none.
@@ -393,6 +494,22 @@ export interface NeedsYouItem {
   /** The question as a catalog message when the core wrote it. */
   question_msg?: Msg;
   unblocks: NodePath[];
+  /**
+   * A question still open on a step that was dropped or accepted: when the
+   * step closed, and whether the row folded out of the active list (a day
+   * later). A folded question stays answerable and never notifies.
+   */
+  closed_step?: { since: UtcTime; folded?: boolean };
+  /**
+   * The owner snoozed this row, here or on another device (a Vault event):
+   * it is hidden until then. Absent once the time passed or the row changed.
+   */
+  snoozed_until?: UtcTime;
+  /**
+   * The latest time a snooze may hide this row: 15 minutes before its default
+   * (the core's rule). Absent for a row with no default time.
+   */
+  snooze_limit?: UtcTime;
   /** expected_rescue_revision for resolve_rescue. */
   revision: Sha256;
 }
@@ -409,6 +526,8 @@ export interface ProjectSummary {
   variance: Variance;
   active_agents: number;
   stalled_agents: number;
+  /** Unfinished steps whose agent is lost; omitted when zero. */
+  stopped_steps?: number;
   needs_count: number;
   feature_counts: Partial<Record<Progress, number>>;
   last_demo?: UtcTime;
@@ -468,6 +587,12 @@ export interface TokenUsage {
 
 export interface ProjectForecast {
   open_steps: number;
+  /** Of the open steps: an agent's claim stands. */
+  in_progress?: number;
+  /** Of the open steps: the claim ended (lost or silent). */
+  abandoned?: number;
+  /** Of the open steps: nobody started them. */
+  not_started?: number;
   /** Agents working now; the work is split between them. */
   agents: number;
   /** Remaining agent work [low, high] in ms. */
@@ -496,12 +621,17 @@ export interface ActivityItem {
 }
 
 /** A report: a summary here, the document opened in the person's browser. */
+/** What a report asks of its reader: choose (proposal) or know (finding). */
+export type ReportKind = "proposal" | "finding";
+
 export interface ReportState {
   id: EventId;
   node?: NodePath;
   title: string;
   summary: string;
   report: BlobRef;
+  kind?: ReportKind;
+  domain?: Domain;
   ts: UtcTime;
   session: SessionId;
   harness: Harness;
@@ -611,6 +741,21 @@ export interface LocalStatus {
   notification_actions: { availability: ActionAvailability; reason?: string };
   /** Why the system refused the last notification, when it said so. */
   notification_error?: string;
+  /** This computer's own Vault writes that iCloud has not uploaded yet; absent when none wait or nothing can tell. */
+  upload?: UploadStatus;
+}
+
+/** `late` after two minutes, and for good once the app stops re-reading. */
+export interface UploadStatus {
+  state: "waiting" | "late";
+  /** When the oldest write still waiting was made. */
+  since: UtcTime;
+}
+
+/** `agendar://upload`: the upload line changed. */
+export interface UploadEvent {
+  v: 1;
+  upload: UploadStatus | null;
 }
 
 export interface TestNoticeData {
@@ -621,7 +766,6 @@ export interface TestNoticeData {
 export interface Preferences {
   theme: Theme;
   motion: boolean;
-  snoozed: Record<string, UtcTime>;
   /** Hand-off items closed for good on this computer (their steps are untouched). */
   dismissed?: string[];
   last_looked_at?: UtcTime;
@@ -632,6 +776,8 @@ export interface Preferences {
   notifications?: boolean;
   /** UI language: `auto` follows the system. */
   language?: "auto" | "en" | "zh-Hans" | "zh-Hant";
+  /** Look for newer releases (default on). */
+  update_check?: boolean;
 }
 
 export interface NotificationFocus {
@@ -656,6 +802,44 @@ export interface Snapshot {
   notification_focus?: NotificationFocus;
   /** Agents seen through observe-only hooks (no skill); never questions. */
   presence?: PresenceRow[];
+  /** The last update check, read from the local cache (no network). */
+  update?: UpdateStatus;
+}
+
+/**
+ * Whether a newer public release exists. `available` is only ever true for a
+ * `release` build; a `dev` (local) build may be ahead of every release.
+ */
+export interface UpdateStatus {
+  current: string;
+  channel: "release" | "dev";
+  /** The latest public release version, when known. */
+  latest: string | null;
+  available: boolean;
+  url: string | null;
+  published_at: string | null;
+  checked_at: UtcTime | null;
+  name?: string;
+  /** The "Check for updates" preference. */
+  enabled: boolean;
+  checking?: boolean;
+  /** Why the last check failed, until one succeeds. */
+  error?: string;
+}
+
+/** `agendar://update`: an update check started or finished. */
+export interface UpdateEvent {
+  v: 1;
+  phase: "started" | "finished";
+  update: UpdateStatus;
+}
+
+export interface CheckUpdatesData {
+  update: UpdateStatus;
+}
+
+export interface OpenReleaseData {
+  opened: boolean;
 }
 
 export interface PresenceRow {
@@ -755,6 +939,34 @@ export interface AnswerDecisionData {
   released: NodePath[];
 }
 
+/**
+ * Where a send-back comment points. Integers only; a region is per-mille of
+ * the image. The host re-reads `quote` from the demo blob.
+ */
+export type ReviewAnchor =
+  | { kind: "diff_line"; demo: number; file: string; side: "old" | "new"; line: number; quote: string }
+  | { kind: "transcript_line"; demo: number; line: number; quote: string }
+  | { kind: "region"; demo: number; x: number; y: number; w: number; h: number };
+
+export interface ReviewComment {
+  anchor: ReviewAnchor;
+  text: string;
+}
+
+/** An agent reply to a send-back: to the reason (no `comment`) or to comment n (from 1). */
+export interface Reply {
+  comment?: number;
+  text: string;
+}
+
+/** What a send-back said (model `SentBackNote`). */
+export interface SentBackNote {
+  review: EventId;
+  at: UtcTime;
+  reason?: string;
+  comments?: ReviewComment[];
+}
+
 export interface ReviewDeliveryRequest {
   request_id: Ulid;
   delivery_id: EventId;
@@ -762,6 +974,8 @@ export interface ReviewDeliveryRequest {
   verdict: "accept" | "send_back";
   reason?: string;
   save_rule?: { rule_id: RuleId; text: string };
+  /** Only with `send_back`; at most 20. */
+  comments?: ReviewComment[];
 }
 
 export interface ReviewDeliveryData {
@@ -799,6 +1013,19 @@ export interface UpdateFeatureRequest {
 
 export interface EventResultData {
   event_id: EventId;
+}
+
+/** The owner drops steps: all or none. A retry repeats `request_id` and replays the result. */
+export interface DropStepsRequest {
+  request_id: Ulid;
+  project: ProjectSlug;
+  nodes: NodePath[];
+  note?: string;
+}
+
+/** One event per node, in the request's order. */
+export interface DropStepsData {
+  event_ids: EventId[];
 }
 
 export interface SetPolicyRequest {
@@ -858,24 +1085,35 @@ export interface SetPreferencesRequest {
   expected_revision: Sha256;
   theme?: Theme;
   motion?: boolean;
-  snooze?: { item_id: string; until: UtcTime };
   mark_looked?: boolean;
   /** Explicit local consent before the OS notification permission is requested. */
   notifications?: boolean;
   language?: "auto" | "en" | "zh-Hans" | "zh-Hant";
+  update_check?: boolean;
 }
 
-/** Close one waiting hand-off item for good on this computer. Main window and tray. */
+/** Close one waiting rescue row for good on this computer. Main window and tray. */
 export interface DismissNeedRequest {
   request_id: Ulid;
   item_id: string;
 }
 
-/** One local snooze entry; a time already passed ends it. Main window and tray. */
+/**
+ * Snooze one waiting item on every device (the owner's `need.snoozed` event);
+ * a time already passed ends the snooze. An item is hidden at most until its
+ * `snooze_limit`; once that has passed the snooze is refused
+ * (`snooze_default_near`). Main window and tray.
+ */
 export interface SnoozeNeedRequest {
   request_id: Ulid;
   item_id: string;
   until: UtcTime;
+}
+
+export interface SnoozeNeedData {
+  event_id: EventId;
+  /** When the item really returns: `until`, or the item's `snooze_limit` when that is sooner. */
+  snoozed_until: UtcTime;
 }
 
 export interface SetPreferencesData {
@@ -902,6 +1140,48 @@ export interface LocalConfig {
   codex_bin?: string | null;
   cli_path?: string | null;
   app_version: string;
+}
+
+/** A count of attachments and their size. */
+export interface UsageTally {
+  count: number;
+  /** Logical bytes, as the events record them. */
+  bytes: number;
+  /** Bytes of the files present on this computer. */
+  local_bytes: number;
+}
+
+export type BlobCategory = "delivery" | "evidence" | "decision_image" | "report" | "icon" | "unreferenced";
+
+/** What one project, or the whole shared data folder, holds. */
+export interface UsageNumbers {
+  total_bytes: number;
+  total_local_bytes: number;
+  event_bytes: number;
+  event_local_bytes: number;
+  attachments: UsageTally;
+  categories: Partial<Record<BlobCategory, UsageTally>>;
+  /** What a cleanup could free: delivery attachments of an archived project. */
+  reclaimable: UsageTally;
+  /** Attachments of deliveries superseded for more than 30 days; not part of `reclaimable`. */
+  superseded: UsageTally;
+  /** Files no event cites; not part of `reclaimable`. */
+  unreferenced: UsageTally;
+}
+
+export interface ProjectUsage extends UsageNumbers {
+  project: ProjectSlug;
+  title?: string;
+  archived: boolean;
+}
+
+/** Read-only usage of the shared data folder (get_storage_usage); `agendar prune` prints the same numbers. */
+export interface StorageUsage {
+  evaluated_at: UtcTime;
+  superseded_after_days: number;
+  total: UsageNumbers;
+  /** Largest first. */
+  projects: ProjectUsage[];
 }
 
 export interface GetSetupLocationsData {
@@ -1056,9 +1336,18 @@ export interface UnblockEvent {
   phase: "answered" | "acked";
 }
 
+/** `agendar://navigate`: the tray asks the main window to open a Settings tab. */
+export interface NavigateEvent {
+  view: "settings";
+  tab: "about";
+}
+
 export type EventMap = {
   "agendar://changed": ChangedEvent;
   "agendar://health": HealthEvent;
   "agendar://unblock": UnblockEvent;
   "agendar://notification-focus": NotificationFocus;
+  "agendar://update": UpdateEvent;
+  "agendar://upload": UploadEvent;
+  "agendar://navigate": NavigateEvent;
 };

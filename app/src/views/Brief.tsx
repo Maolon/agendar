@@ -1,190 +1,425 @@
-import { renderMsg } from "../i18n/msg";
-import { tx } from "../i18n";
-import { formatAge } from "../api/format";
-import { useClient } from "../api/store";
-import type { BriefSection, Snapshot } from "../api/types";
-import { indexGraph, ifYouWaitText } from "../graph/traversal";
-import { useProjectGraphs } from "../state/graph";
-import { workingAgents } from "../state/project";
-import { BriefVisual } from "../components/BriefVisual";
-import { Icon, type IconName } from "../components/Icon";
+import { useState, type ReactNode } from "react";
+import { needQuestion } from "../i18n/msg";
+import { shortcut } from "../state/shortcut";
+import { tx, type MessageKey } from "../i18n";
+import { formatAge, formatAgo, formatClockTime } from "../api/format";
+import type { ProjectSummary, Snapshot } from "../api/types";
+import { harnessLabel } from "../components/NowCards";
+import { Icon } from "../components/Icon";
 import { PresenceRows } from "../components/PresenceRows";
-import { activeNeeds, briefWithoutSnoozed } from "../state/snooze";
+import { CorrectionMark } from "../components/CorrectionMark";
+import { ProjectAvatar } from "../components/ProjectAvatar";
+import {
+  DONE_CAP,
+  boardEmpty,
+  dueText,
+  lateText,
+  nowBoard,
+  stalledCount,
+  windowText,
+  type MovingStep,
+  type NeedRow,
+  type StalledStep,
+} from "../state/now";
 import type { Selection } from "../state/ui";
 
-const SECTIONS: { key: BriefSection; icon: IconName }[] = [
-  { key: "delivered", icon: "package" },
-  { key: "coming_up", icon: "clock" },
-  { key: "needs_you", icon: "hand" },
-  { key: "if_you_wait", icon: "pause-circle" },
-  { key: "by_default", icon: "timer" },
-  { key: "at_risk", icon: "gauge" },
-];
+const AGENT_TEXT: Record<StalledStep["agent"], MessageKey> = {
+  quiet: "dash.agent.quiet",
+  lost: "dash.agent.lost",
+  none: "dash.agent.none",
+  paused: "dash.agent.paused",
+  sent_back: "dash.agent.sent_back",
+  silent: "dash.agent.silent",
+  abandoned: "dash.agent.abandoned",
+};
+
+/** "no word for 3h", "abandoned 1d ago", or the plain agent label. */
+export function stalledText(step: StalledStep, anchor: string): string {
+  if ((step.agent === "silent" || step.agent === "abandoned") && step.since) {
+    return tx(AGENT_TEXT[step.agent], { d: formatAge(step.since, anchor) });
+  }
+  return tx(step.agent === "silent" ? "dash.agent.quiet" : step.agent === "abandoned" ? "dash.agent.none" : AGENT_TEXT[step.agent]);
+}
 
 interface BriefProps {
   snapshot: Snapshot;
   onSelect: (selection: Selection) => void;
+  /** Motion allowed now: the live dot breathes. */
+  motion?: boolean;
 }
 
-function targetSelection(
-  snapshot: Snapshot,
-  target: { kind: "need" | "project"; id: string },
-): Selection | null {
-  if (target.kind === "need") {
-    const need = snapshot.needs.find((item) => item.id === target.id);
-    return need ? { kind: "need", id: need.id } : null;
+function Avatar({ project }: { project: ProjectSummary }) {
+  return <ProjectAvatar glyph={project.glyph} project={project} size="sm" />;
+}
+
+function Section({ id, title, hint, children }: { id: string; title: string; hint?: string; children: ReactNode }) {
+  return (
+    <section className="dash-sec" data-dash={id}>
+      <h3 className="dash-h">
+        {title}
+        {hint ? <span className="dash-hint">{hint}</span> : null}
+      </h3>
+      {children}
+    </section>
+  );
+}
+
+function NeedLine({ row, anchor, onSelect }: { row: NeedRow; anchor: string; onSelect: BriefProps["onSelect"] }) {
+  const extra: string[] = [];
+  if (row.holds.length) {
+    const first = row.holds[0]!;
+    extra.push(tx("dash.holds", { what: row.holds.length > 1 ? `${first} +${row.holds.length - 1}` : first }));
   }
-  return snapshot.state.projects[target.id] ? { kind: "project", id: target.id } : null;
+  if (row.waiting.length) {
+    const first = row.waiting[0]!;
+    extra.push(tx("dash.waiting_answer", { what: row.waiting.length > 1 ? `${first} +${row.waiting.length - 1}` : first }));
+  }
+  if (row.defaultAt) {
+    const t = formatClockTime(row.defaultAt);
+    extra.push(row.defaultLabel ? tx("dash.default", { label: row.defaultLabel, t }) : tx("dash.default_rec", { t }));
+  }
+  return (
+    <button
+      type="button"
+      className="dash-li"
+      data-need={row.need.id}
+      onClick={() => onSelect({ kind: "need", id: row.need.id })}
+    >
+      <span className="dash-you" aria-hidden="true">
+        <Icon name="hand" />
+      </span>
+      <span className="dash-main">
+        <span className="dash-t" title={needQuestion(row.need)}>
+          {needQuestion(row.need)}
+        </span>
+        {extra.length ? <span className="dash-sub">{extra.join(" · ")}</span> : null}
+      </span>
+      <span className="dash-meta">
+        {row.project ? `${row.project.title} · ` : ""}
+        {formatAgo(row.need.since, anchor)}
+      </span>
+    </button>
+  );
+}
+
+function MovingCard({
+  step,
+  anchor,
+  motion,
+  onSelect,
+}: {
+  step: MovingStep;
+  anchor: string;
+  motion: boolean;
+  onSelect: BriefProps["onSelect"];
+}) {
+  const { bar } = step;
+  const late = bar ? bar.lateS > 0 : false;
+  const pct = bar ? Math.round(bar.share * 100) : 0;
+  return (
+    <button
+      type="button"
+      className="dash-move"
+      data-feat={`${step.project.slug}/${step.feature.node}`}
+      onClick={() => onSelect({ kind: "project", id: step.project.slug })}
+    >
+      <span className="dash-move-top">
+        <Avatar project={step.project} />
+        <span className="dash-move-t">{step.feature.title}</span>
+        <span className="chip dash-agent">
+          <span className={`dash-dot live${motion ? " breathe" : ""}`} aria-hidden="true" />
+          {harnessLabel(step.harness)}
+        </span>
+      </span>
+      <span className="dash-move-meta">
+        <span>
+          {step.startedAt
+            ? tx("dash.started", { project: step.project.title, ago: formatAgo(step.startedAt, anchor) })
+            : step.project.title}
+        </span>
+        {bar ? (
+          <>
+            <span
+              className={`dash-bar${late ? " late" : ""}${bar.paused ? " paused" : ""}`}
+              role="img"
+              aria-label={tx("dash.bar", { pct })}
+            >
+              <i style={{ width: `${pct}%` }} />
+            </span>
+            {late ? <span className="chip dash-chip red">{tx("dash.late", { d: lateText(bar.lateS) })}</span> : null}
+            {bar.paused ? <span className="chip dash-chip">{tx("dash.paused")}</span> : null}
+            <span className="dash-when">{windowText(bar)}</span>
+          </>
+        ) : null}
+      </span>
+      {step.lastWord || step.hostHeard ? (
+        <span className="dash-aging">
+          {[
+            step.lastWord ? tx("dash.last_word", { ago: formatAgo(step.lastWord, anchor) }) : "",
+            step.hostHeard ? tx("dash.host_heard", { ago: formatAgo(step.hostHeard, anchor) }) : "",
+          ]
+            .filter(Boolean)
+            .join(" · ")}
+        </span>
+      ) : null}
+      {step.note ? <span className="dash-note">{step.note}</span> : null}
+    </button>
+  );
+}
+
+function StalledLine({
+  step,
+  slug,
+  anchor,
+  onSelect,
+}: {
+  step: StalledStep;
+  slug: string;
+  anchor: string;
+  onSelect: BriefProps["onSelect"];
+}) {
+  const correction = step.feature.correction;
+  const dot = step.agent === "lost" || step.agent === "abandoned" ? "lost" : step.agent === "quiet" || step.agent === "silent" ? "quiet" : "none";
+  return (
+    <button
+      type="button"
+      className={`dash-li${step.agent === "abandoned" ? " abandoned" : ""}`}
+      data-feat={`${slug}/${step.feature.node}`}
+      data-agent={step.agent}
+      onClick={() =>
+        onSelect(step.needId ? { kind: "need", id: step.needId } : { kind: "project", id: slug })
+      }
+    >
+      <span className={`dash-dot ${dot}`} aria-hidden="true" />
+      <span className="dash-t" title={step.feature.title}>
+        {step.feature.title}
+      </span>
+      {correction ? <CorrectionMark correction={correction} /> : null}
+      {step.lateS > 0 ? (
+        <span className="chip dash-chip red">{tx("dash.late", { d: lateText(step.lateS) })}</span>
+      ) : step.due ? (
+        <span className="chip dash-chip">{tx("dash.due", { t: dueText(step.due, anchor) })}</span>
+      ) : null}
+      <span className="dash-meta">{stalledText(step, anchor)}</span>
+    </button>
+  );
 }
 
 /**
- * Default view: the six sections in fixed order, each with its projected rows.
- * A section with no row still shows its label and an honest empty line, and
- * "All clear" appears only when every one of the six is empty.
+ * Home: since the last look, by state. Moving steps (a live agent on them) as
+ * cards, stalled steps grouped by project, then what needs the human, what
+ * finished and what is next. A section with nothing in it is not shown.
  */
-export function Brief({ snapshot, onSelect }: BriefProps) {
+export function Brief({ snapshot, onSelect, motion = false }: BriefProps) {
   const { preferences, state, local } = snapshot;
-  const brief = briefWithoutSnoozed(snapshot);
-  const client = useClient();
-  const rowCount = SECTIONS.reduce((total, section) => total + brief[section.key].length, 0);
-  const lookedAge = preferences.last_looked_at
-    ? formatAge(preferences.last_looked_at, state.evaluated_at)
-    : "";
-  const running = Object.values(state.projects).reduce(
-    (total, project) => total + workingAgents(project),
-    0,
+  const anchor = state.evaluated_at;
+  const board = nowBoard(snapshot);
+  const presence = snapshot.presence ?? [];
+  const lookedAge = preferences.last_looked_at ? formatAge(preferences.last_looked_at, anchor) : "";
+  const stalled = stalledCount(board);
+  const accepted = board.done.filter((item) => item.kind === "accepted").length;
+  const finished = board.done.length - accepted;
+  const firstNeed = board.needs[0]?.need;
+  const [closedOpen, setClosedOpen] = useState(false);
+
+  const heading = (
+    <h2 className="h">
+      {tx("brief.since")} {lookedAge ? <span className="sub">{lookedAge}</span> : null}
+    </h2>
   );
-  const firstNeed = activeNeeds(snapshot)[0];
 
-  // “If you wait” counts the graph's reachable blocked steps, not only the
-  // children the row was projected with.
-  const waitProjects = [
-    ...new Set(
-      brief.if_you_wait
-        .map((row) =>
-          row.target.kind === "project"
-            ? row.target.id
-            : snapshot.needs.find((item) => item.id === row.target.id)?.project,
-        )
-        .filter((slug): slug is string => Boolean(slug) && Boolean(state.projects[slug ?? ""])),
-    ),
-  ];
-  const graphs = useProjectGraphs(client, waitProjects, state.evaluated_at);
-
-  function waitText(row: (typeof brief.if_you_wait)[number]): string {
-    const slug =
-      row.target.kind === "project"
-        ? row.target.id
-        : snapshot.needs.find((item) => item.id === row.target.id)?.project;
-    if (!slug) return renderMsg(row.msg, row.text);
-    const project = state.projects[slug];
-    const graph = graphs[slug];
-    // A need-targeted row names its own need; "first need in the project" would
-    // swap in another item's graph reach.
-    const need =
-      row.target.kind === "need"
-        ? snapshot.needs.find((item) => item.id === row.target.id)
-        : snapshot.needs.find((item) => item.project === slug);
-    if (!project || !graph || !need) return renderMsg(row.msg, row.text);
-    return ifYouWaitText(indexGraph(graph), project, need) ?? renderMsg(row.msg, row.text);
-  }
-
-  if (!rowCount) {
+  if (boardEmpty(board) && !presence.length) {
     return (
       <div className="view">
-        <div className="allclear">
-          <Icon name="radar" />
-          <h2>{tx("brief.all_clear")}</h2>
-          <div>
-            {running > 0
-              ? running === 1
-                ? tx("brief.working.one")
-                : tx("brief.working.other", { n: running })
-              : tx("brief.no_agents")}
-          </div>
-          <div style={{ marginTop: 14, fontSize: 12.5 }}>
-            {tx("brief.all_empty")}
-            {local.health !== "healthy" ? tx("brief.local", { health: local.health }) : ""}
-          </div>
-        </div>
+        {heading}
+        <p className="dash-quiet">
+          {tx("dash.all_quiet")}
+          {local.health !== "healthy" ? tx("brief.local", { health: local.health }) : ""}
+        </p>
       </div>
     );
   }
 
+  const parts: ReactNode[] = [];
+  if (board.moving.length) parts.push(<b key="moving">{tx("dash.moving", { n: board.moving.length })}</b>);
+  if (stalled) {
+    parts.push(
+      <span key="stalled">
+        <b>{tx("dash.stalled", { n: stalled })}</b> {tx("dash.stalled_why")}
+      </span>,
+    );
+  }
+  parts.push(
+    <span key="needs">
+      {board.needs.length === 0
+        ? tx("dash.needs.none")
+        : board.needs.length === 1
+          ? tx("dash.needs.one")
+          : tx("dash.needs.other", { n: board.needs.length })}
+    </span>,
+  );
+  if (accepted) parts.push(<span key="accepted">{tx("dash.accepted", { n: accepted })}</span>);
+  if (finished) parts.push(<span key="finished">{tx("dash.finished", { n: finished })}</span>);
+
+  const doneShown = board.done.slice(0, DONE_CAP);
+  const doneMore = board.done.length - doneShown.length;
+
   return (
-    <div className="view">
-      <h2 className="h">
-        {tx("brief.since")}{" "}
-        {lookedAge ? <span className="sub">{lookedAge}</span> : null}
-      </h2>
-      <PresenceRows rows={snapshot.presence ?? []} snapshot={snapshot} anchor={state.evaluated_at} />
-      <div className="brief">
-        {SECTIONS.map((section) => {
-          const rows = brief[section.key];
-          if (!rows.length) {
-            return (
-              <div key={section.key} className="br br-none" data-brief-empty={section.key}>
-                <span className="bi">
-                  <Icon name={section.icon} />
-                </span>
-                <span className="bl">{tx(`brief.${section.key}`)}</span>
-                <span className="bt muted">{tx(`brief.empty.${section.key}`)}</span>
-                <span className="bx" />
-              </div>
-            );
-          }
-          return rows.map((row) => {
-            const target = targetSelection(snapshot, row.target);
-            const text = section.key === "if_you_wait" ? waitText(row) : renderMsg(row.msg, row.text);
-            const content = (
-              <>
-                <span className="bi">
-                  <Icon name={section.icon} />
-                </span>
-                <span className="bl">{tx(`brief.${section.key}`)}</span>
-                <span className="bt">
-                  {text}
-                  {row.detail ? <small>{renderMsg(row.detail_msg, row.detail)}</small> : null}
-                </span>
-                <span className="bx">
-                  <BriefVisual section={section.key} row={row} snapshot={snapshot} />
-                </span>
-              </>
-            );
-            return target ? (
-              <button
-                key={row.id}
-                type="button"
-                className="br"
-                data-brief-section={section.key}
-                data-brief-row={row.id}
-                onClick={() => onSelect(target)}
-              >
-                {content}
-              </button>
-            ) : (
-              <div
-                key={row.id}
-                className="br"
-                data-brief-section={section.key}
-                data-brief-row={row.id}
-              >
-                {content}
-              </div>
-            );
-          });
-        })}
+    <div className="view dash">
+      <div>
+        {heading}
+        <p className="dash-sum" data-testid="dash-summary">
+          {parts.flatMap((part, index) => (index ? [<span key={`sep${index}`}> · </span>, part] : [part]))}
+        </p>
       </div>
-      {firstNeed ? (
-        <div className="acts" style={{ justifyContent: "flex-start" }}>
-          <button
-            type="button"
-            className="btn primary"
-            onClick={() => onSelect({ kind: "need", id: firstNeed.id })}
-          >
-            {tx("brief.start")} <kbd>⌘↵</kbd>
+
+      {board.needs.length ? (
+        <Section id="needs" title={tx("dash.sec.needs")}>
+          <div className="dash-list">
+            {board.needs.map((row) => (
+              <NeedLine key={row.need.id} row={row} anchor={anchor} onSelect={onSelect} />
+            ))}
+          </div>
+          {firstNeed ? (
+            <div className="acts" style={{ justifyContent: "flex-start" }}>
+              <button
+                type="button"
+                className="btn primary"
+                onClick={() => onSelect({ kind: "need", id: firstNeed.id })}
+              >
+                {tx("brief.start")} <kbd>{shortcut("mod+enter")}</kbd>
+              </button>
+            </div>
+          ) : null}
+        </Section>
+      ) : null}
+
+      {board.closed.length ? (
+        <div className="dash-closed">
+          <button type="button" className="more" onClick={() => setClosedOpen((open) => !open)}>
+            {closedOpen ? tx("side.closed_hide") : tx("side.closed", { n: board.closed.length })}
           </button>
+          {closedOpen ? (
+            <div className="dash-list">
+              {board.closed.map((row) => (
+                <NeedLine key={row.need.id} row={row} anchor={anchor} onSelect={onSelect} />
+              ))}
+            </div>
+          ) : null}
         </div>
+      ) : null}
+
+      {board.moving.length ? (
+        <Section id="moving" title={tx("dash.sec.moving")} hint={tx("dash.hint.moving")}>
+          <div className="dash-cards">
+            {board.moving.map((step) => (
+              <MovingCard
+                key={`${step.project.slug}/${step.feature.node}`}
+                step={step}
+                anchor={anchor}
+                motion={motion}
+                onSelect={onSelect}
+              />
+            ))}
+          </div>
+        </Section>
+      ) : null}
+
+      {presence.length ? (
+        <Section id="presence" title={tx("pres.label")}>
+          <PresenceRows rows={presence} snapshot={snapshot} anchor={anchor} />
+        </Section>
+      ) : null}
+
+      {board.stalled.length ? (
+        <Section id="stalled" title={tx("dash.sec.stalled")} hint={tx("dash.hint.stalled")}>
+          <div className="dash-list">
+            {board.stalled.map((group) => (
+              <div key={group.project.slug} className="dash-grp" data-project={group.project.slug}>
+                <button
+                  type="button"
+                  className="dash-grp-h"
+                  onClick={() => onSelect({ kind: "project", id: group.project.slug })}
+                >
+                  <Avatar project={group.project} />
+                  <span className="dash-grp-t">{group.project.title}</span>
+                  {group.risks.map((risk) => (
+                    <span key={risk.text} className={`chip dash-chip ${risk.level}`} title={risk.why}>
+                      {risk.text}
+                    </span>
+                  ))}
+                </button>
+                {group.steps.map((step) => (
+                  <StalledLine
+                    key={step.feature.node}
+                    step={step}
+                    slug={group.project.slug}
+                    anchor={anchor}
+                    onSelect={onSelect}
+                  />
+                ))}
+              </div>
+            ))}
+          </div>
+        </Section>
+      ) : null}
+
+      {board.done.length ? (
+        <Section id="done" title={tx("dash.sec.done")}>
+          <div className="dash-list">
+            {doneShown.map((item) => (
+              <button
+                type="button"
+                key={item.key}
+                className="dash-li"
+                onClick={() => onSelect({ kind: "project", id: item.project.slug })}
+              >
+                <span className="dash-check" aria-hidden="true">
+                  <Icon name="check" />
+                </span>
+                <span className="dash-t" title={item.title}>
+                  {item.title}
+                </span>
+                <span className="dash-meta">
+                  {item.project.title} ·{" "}
+                  {item.kind === "accepted"
+                    ? item.ts
+                      ? tx("dash.accepted_ago", { ago: formatAgo(item.ts, anchor) })
+                      : tx("dash.accepted_plain")
+                    : item.ts
+                      ? tx("dash.finished_ago", { ago: formatAgo(item.ts, anchor) })
+                      : tx("dash.finished_plain")}
+                </span>
+              </button>
+            ))}
+            {doneMore > 0 ? <div className="dash-more">{tx("dash.more", { n: doneMore })}</div> : null}
+          </div>
+        </Section>
+      ) : null}
+
+      {board.next.length ? (
+        <Section id="next" title={tx("dash.sec.next")}>
+          <div className="dash-list">
+            {board.next.map((item) => (
+              <button
+                type="button"
+                key={item.project.slug}
+                className="dash-li"
+                data-feat={`${item.project.slug}/${item.feature.node}`}
+                onClick={() => onSelect({ kind: "project", id: item.project.slug })}
+              >
+                <Avatar project={item.project} />
+                <span className="dash-t" title={item.feature.title}>
+                  {item.feature.title}
+                </span>
+                <span className="dash-meta">
+                  {item.project.title}
+                  {item.more ? ` · +${item.more}` : ""}
+                </span>
+              </button>
+            ))}
+          </div>
+        </Section>
       ) : null}
     </div>
   );

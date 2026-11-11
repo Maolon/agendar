@@ -251,6 +251,80 @@ fn deliver_rejects_criteria_that_do_not_match_the_receipt() {
     );
 }
 
+/// Finished work no decision asked for: no receipt, no criteria, no check.
+fn receipt_free_input(env: &CliEnv) -> PathBuf {
+    let input = delivery_input(env);
+    let mut value: Value = serde_json::from_slice(&fs::read(&input).expect("input")).expect("json");
+    value["demos"][0]["body"]
+        .as_object_mut()
+        .expect("demo body")
+        .remove("check");
+    value.as_object_mut().expect("input").remove("criteria");
+    value["disclosure"]["faked"] = json!(["Sample schedule"]);
+    write_json(&input, &value);
+    input
+}
+
+#[test]
+fn deliver_without_a_receipt_appends_a_delivery_with_no_receipt_ref() {
+    let board = board();
+    let input = receipt_free_input(&board.env);
+    let delivered = expect_success(
+        &board.env.run(&[
+            "deliver",
+            "--node",
+            NODE,
+            "--attempt",
+            &board.attempt,
+            "--json",
+            &input.to_string_lossy(),
+        ]),
+        "deliver",
+    );
+    assert_eq!(delivered["data"]["review"], "pending");
+    let line = board
+        .env
+        .event_lines()
+        .into_iter()
+        .find(|line| line.contains("\"kind\":\"delivery\""))
+        .expect("delivery line");
+    let event: Value = serde_json::from_str(&line).expect("event json");
+    assert!(event["refs"].get("receipt").is_none(), "{event}");
+    assert_eq!(event["body"]["criteria"], json!([]));
+    assert_eq!(
+        event["body"]["disclosure"]["faked_for_now"],
+        json!(["Sample schedule"])
+    );
+}
+
+#[test]
+fn deliver_without_a_receipt_rejects_criteria() {
+    let board = board();
+    let input = receipt_free_input(&board.env);
+    let mut value: Value = serde_json::from_slice(&fs::read(&input).expect("input")).expect("json");
+    value["criteria"] = json!([{"criterion": "continues", "status": "passed"}]);
+    write_json(&input, &value);
+    let error = expect_error(
+        &board.env.run(&[
+            "deliver",
+            "--node",
+            NODE,
+            "--attempt",
+            &board.attempt,
+            "--json",
+            &input.to_string_lossy(),
+        ]),
+        "E_VALIDATION",
+        2,
+    );
+    assert_eq!(error["error"]["field"], "/criteria");
+    assert_eq!(
+        error["error"]["message"],
+        "A delivery without a receipt must list no criteria."
+    );
+    assert_eq!(board.env.count_kind("delivery"), 0);
+}
+
 #[test]
 fn deliver_does_not_append_when_an_upload_fails() {
     let board = board();
@@ -565,4 +639,275 @@ fn ask_publishes_option_images_and_refuses_bad_ones_before_uploading() {
         "no image was published"
     );
     assert_eq!(env.count_kind("decision.ask"), asks + 1);
+}
+
+#[test]
+fn a_sent_back_delivery_reaches_the_agent_through_inbox_with_the_reason() {
+    let board = board();
+    let input = delivery_input(&board.env);
+    let delivered = expect_success(
+        &board.env.run(&[
+            "deliver",
+            "--node",
+            NODE,
+            "--attempt",
+            &board.attempt,
+            "--receipt",
+            &board.receipt,
+            "--json",
+            &input.to_string_lossy(),
+        ]),
+        "deliver",
+    );
+    let delivery = agendar_core::model::EventId::parse(
+        delivered["data"]["event_id"].as_str().expect("event id"),
+    )
+    .expect("delivery id");
+    let reviews = |inbox: &Value| -> Vec<Value> {
+        inbox["data"]["packets"]
+            .as_array()
+            .expect("packets")
+            .iter()
+            .filter(|packet| packet["kind"] == "review")
+            .cloned()
+            .collect()
+    };
+    assert!(reviews(&expect_success(&board.env.run(&["inbox"]), "inbox")).is_empty());
+
+    // The app's Send back button writes this event through the same service.
+    let project = ProjectSlug::parse(PROJECT).expect("project");
+    let node = agendar_core::model::NodePath::parse(NODE).expect("node");
+    let receipt = agendar_core::model::EventId::parse(&board.receipt).expect("receipt");
+    let (review, _) = board
+        .env
+        .service()
+        .review_delivery(
+            &project,
+            &node,
+            &delivery,
+            agendar_core::model::ReviewVerdict::SendBack,
+            Some("The transcript stops before the result".to_owned()),
+            None,
+            vec![agendar_core::model::ReviewComment {
+                anchor: agendar_core::model::ReviewAnchor::TranscriptLine {
+                    demo: 0,
+                    line: 2,
+                    quote: "exit 0".to_owned(),
+                },
+                text: "Show the result line".to_owned(),
+            }],
+            vec![receipt],
+        )
+        .expect("send back");
+
+    let inbox = expect_success(&board.env.run(&["inbox"]), "inbox");
+    let packets = reviews(&inbox);
+    assert_eq!(packets.len(), 1, "{inbox}");
+    assert_eq!(packets[0]["node"], NODE);
+    assert_eq!(packets[0]["source"], review.as_str());
+    assert_eq!(packets[0]["review"]["verdict"], "send_back");
+    assert_eq!(
+        packets[0]["review"]["reason"],
+        "The transcript stops before the result"
+    );
+    assert_eq!(
+        packets[0]["review"]["comments"],
+        serde_json::json!([{
+            "anchor": {"kind": "transcript_line", "demo": 0, "line": 2, "quote": "exit 0"},
+            "text": "Show the result line"
+        }])
+    );
+    assert!(
+        packets[0].get("answer").is_none(),
+        "a review carries no ack"
+    );
+
+    // Reading it leaves a delivered record that names the delivery.
+    let records: Vec<Value> = board
+        .env
+        .event_lines()
+        .iter()
+        .map(|line| serde_json::from_str::<Value>(line).expect("event json"))
+        .filter(|event| event["kind"] == "delivered")
+        .collect();
+    assert!(
+        records.iter().any(|event| {
+            event["refs"]["delivery"] == delivery.as_str()
+                && event["refs"]["causes"][0] == review.as_str()
+        }),
+        "{records:?}"
+    );
+    expect_success(&board.env.run(&["status"]), "status");
+}
+
+// --- Diff demo: hunks cut verbatim from a commit ----------------------------
+
+fn git(env: &CliEnv, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&env.repo)
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.autocrlf=false",
+        ])
+        .args(args)
+        .env("HOME", &env.home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("git runs");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("utf8")
+}
+
+fn numbered(change: &[(usize, &str)]) -> String {
+    (1..=30)
+        .map(|line| {
+            change
+                .iter()
+                .find(|(at, _)| *at == line)
+                .map_or_else(|| format!("line {line}\n"), |(_, text)| format!("{text}\n"))
+        })
+        .collect()
+}
+
+/// A repo with two commits; the second changes a.txt in two far-apart hunks
+/// and adds b.txt. Returns the second commit's sha.
+fn diff_repo(env: &CliEnv) -> String {
+    git(env, &["init", "-q"]);
+    fs::write(env.repo.join("a.txt"), numbered(&[])).expect("a");
+    git(env, &["add", "a.txt"]);
+    git(env, &["commit", "-q", "-m", "first"]);
+    fs::write(
+        env.repo.join("a.txt"),
+        numbered(&[(2, "line two"), (25, "line twenty-five")]),
+    )
+    .expect("a");
+    fs::write(env.repo.join("b.txt"), "new\nfile\n").expect("b");
+    git(env, &["add", "a.txt", "b.txt"]);
+    git(env, &["commit", "-q", "-m", "second"]);
+    git(env, &["rev-parse", "HEAD"]).trim().to_owned()
+}
+
+fn diff_input(env: &CliEnv, body: Value) -> PathBuf {
+    let input = env.root.path().join("diff-delivery.json");
+    write_json(
+        &input,
+        &json!({
+            "name": "Wake delivery",
+            "demos": [{"kind": "diff", "body": body}],
+            "disclosure": {"proven": [], "not_proven": [], "faked": []}
+        }),
+    );
+    input
+}
+
+fn deliver_diff(board: &Board, input: &Path) -> std::process::Output {
+    board.env.run(&[
+        "deliver",
+        "--node",
+        NODE,
+        "--attempt",
+        &board.attempt,
+        "--json",
+        &input.to_string_lossy(),
+    ])
+}
+
+#[test]
+fn deliver_cuts_the_picked_hunk_verbatim_from_the_commit() {
+    let board = board();
+    let sha = diff_repo(&board.env);
+    let short = &sha[..7];
+    let input = diff_input(
+        &board.env,
+        json!({"commit": short, "hunks": [{"file": "a.txt", "hunk": 2, "why": "The late line."}]}),
+    );
+    expect_success(&deliver_diff(&board, &input), "deliver");
+
+    let line = board
+        .env
+        .event_lines()
+        .into_iter()
+        .find(|line| line.contains("\"kind\":\"delivery\""))
+        .expect("delivery line");
+    let event: Value = serde_json::from_str(&line).expect("event json");
+    let demo = &event["body"]["demos"][0];
+    assert_eq!(demo["kind"], "diff");
+    let body = &demo["body"];
+    assert_eq!(body["commit"], sha.as_str());
+    assert_eq!(body["files_total"], 2);
+    assert_eq!(body["hunks_total"], 3);
+    assert_eq!(body["added_total"], 4);
+    assert_eq!(body["removed_total"], 2);
+    assert_eq!(
+        body["shown"],
+        json!([{"path": "a.txt", "hunk": 2, "why": "The late line."}])
+    );
+    assert_eq!(
+        body["omitted"],
+        json!([{"path": "b.txt", "added": 2, "removed": 0}])
+    );
+
+    // The excerpt is a.txt's header plus its second hunk, byte for byte.
+    let shown = git(&board.env, &["show", "--format=", "--no-color", &sha]);
+    let section_start = shown.find("diff --git a/a.txt").expect("a.txt section");
+    let section_end = shown.find("diff --git a/b.txt").expect("b.txt section");
+    let section = &shown[section_start..section_end];
+    let first_hunk = section.find("\n@@ ").expect("first hunk") + 1;
+    let second_hunk = first_hunk + 1 + section[first_hunk + 1..].find("\n@@ ").expect("second") + 1;
+    let expected = format!("{}{}", &section[..first_hunk], &section[second_hunk..]);
+
+    let blob: agendar_core::model::BlobRef =
+        serde_json::from_value(body["blob"].clone()).expect("blob ref");
+    assert_eq!(blob.ext.as_str(), "txt");
+    let bytes = agendar_core::vault::blobs::read_blob(
+        board.env.service().vault(),
+        &ProjectSlug::parse(PROJECT).expect("project"),
+        &blob,
+    )
+    .expect("excerpt blob");
+    assert_eq!(String::from_utf8(bytes).expect("utf8"), expected);
+}
+
+#[test]
+fn deliver_refuses_an_unknown_hunk_and_a_merge_commit() {
+    let board = board();
+    let sha = diff_repo(&board.env);
+    let input = diff_input(
+        &board.env,
+        json!({"commit": sha, "repo": board.env.repo.to_string_lossy(), "hunks": [{"file": "a.txt", "hunk": 3, "why": "x"}]}),
+    );
+    let error = expect_error(&deliver_diff(&board, &input), "E_VALIDATION", 2);
+    assert_eq!(error["error"]["field"], "/demos/0/body/hunks/0/hunk");
+    let message = error["error"]["message"].as_str().expect("message");
+    assert!(message.contains("has 2 hunks"), "{message}");
+
+    // A merge commit: one side branch merged with --no-ff.
+    git(&board.env, &["checkout", "-q", "-b", "side"]);
+    fs::write(board.env.repo.join("c.txt"), "side\n").expect("c");
+    git(&board.env, &["add", "c.txt"]);
+    git(&board.env, &["commit", "-q", "-m", "side"]);
+    git(&board.env, &["checkout", "-q", &sha]);
+    git(
+        &board.env,
+        &["merge", "-q", "--no-ff", "-m", "merge", "side"],
+    );
+    let merge = git(&board.env, &["rev-parse", "HEAD"]).trim().to_owned();
+    let input = diff_input(
+        &board.env,
+        json!({"commit": merge, "hunks": [{"file": "c.txt", "hunk": 1, "why": "x"}]}),
+    );
+    let error = expect_error(&deliver_diff(&board, &input), "E_VALIDATION", 2);
+    assert_eq!(error["error"]["field"], "/demos/0/body/commit");
+    assert_eq!(board.env.count_kind("delivery"), 0);
 }

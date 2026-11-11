@@ -98,8 +98,8 @@ describe("reports", () => {
     await user.click(screen.getByRole("button", { name: "Open report" }));
     const call = client.calls.find((entry) => entry.command === "open_report");
     expect(call?.request).toEqual({ project: "alpha", blob });
-    await user.click(screen.getByRole("button", { name: "Show summary" }));
-    expect(screen.getByText(/Details inside/)).toBeInTheDocument();
+    // One report has nothing to expand into: "Read" shows the full document.
+    expect(screen.queryByRole("button", { name: /Show/ })).toBeNull();
   });
 
   it("shows only the newest report on one line until expanded", async () => {
@@ -139,5 +139,34 @@ describe("reports", () => {
     expect(titles).toEqual(["Newest report", "Middle report", "Older report"]);
     await user.click(screen.getByRole("button", { name: "Show less" }));
     expect(screen.queryByText("Older report")).toBeNull();
+  });
+
+  it("labels each report with its kind and domain; one without a kind reads as a report", async () => {
+    const { ClientContext } = await import("../api/store");
+    const { FakeClient } = await import("./fixtures");
+    const { ReportCards } = await import("../components/Reports");
+    const userEvent = (await import("@testing-library/user-event")).default;
+    const user = userEvent.setup();
+    const blob = { host: "h-01J00000000000000000000001", sha256: "d".repeat(64), bytes: 120, ext: "html" };
+    const base = { summary: "s.", report: blob, session: "01J00000000000000000000101", harness: "claude_code" as const };
+    render(
+      <ClientContext.Provider value={new FakeClient()}>
+        <ReportCards
+          project="alpha"
+          anchor={ANCHOR}
+          reports={[
+            { ...base, id: "01J00000000000000000000995", title: "Audit", ts: "2026-02-10T14:30:00.000Z", kind: "finding", domain: "code" },
+            { ...base, id: "01J00000000000000000000996", title: "Wake design", ts: "2026-02-10T13:00:00.000Z", kind: "proposal", domain: "arch" },
+            { ...base, id: "01J00000000000000000000997", title: "Old note", ts: "2026-02-10T12:00:00.000Z" },
+          ]}
+        />
+      </ClientContext.Provider>,
+    );
+    // Collapsed: the newest one's kind leads its line.
+    expect(document.querySelector(".rline .rkind")?.textContent).toBe("Finding · Code");
+    await user.click(screen.getByRole("button", { name: "Show all 3" }));
+    const labels = [...document.querySelectorAll(".rcard .rkind")].map((node) => node.textContent);
+    expect(labels).toEqual(["Finding · Code", "Proposal · Architecture", "Report"]);
+    expect(document.querySelector(".rcard .rk-proposal")?.textContent).toBe("Proposal · Architecture");
   });
 });

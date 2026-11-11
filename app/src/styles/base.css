@@ -183,21 +183,6 @@ p {
   border-color: var(--fg);
 }
 
-.dots {
-  display: inline-flex;
-  gap: 3px;
-}
-.dots i {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--fg);
-}
-.dots i.e {
-  background: transparent;
-  border: 1.3px solid var(--fg3);
-}
-
 .ring {
   width: 26px;
   height: 26px;

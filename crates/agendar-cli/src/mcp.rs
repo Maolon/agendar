@@ -35,6 +35,7 @@ const INSTRUCTIONS: &str = "Agendar is the human's radar for this project. Keep 
 3. While working, `pulse` at real milestones (new --eta when your estimate changes); `done` when a step is finished, `drop` when you abandon it.\n\
 4. A decision only the human can make: `ask` with a card (shapes and limits: `schema` kind card), then `wait` for the answer; apply the receipt and `ack` it. If the receipt's chose.id is `own`, follow own_answer.\n\
 5. Call `inbox` after long work: it carries answers and reminders (overdue steps, plan changes).\n\
+6. Before you stop, call `settle`: every step you hold is done, dropped, delivered or has a future ETA.\n\
 Never guess a human decision. Never invent progress.";
 
 /// Run the server on stdin/stdout until stdin closes. Returns the exit code.
@@ -252,10 +253,22 @@ fn command_for(name: &str, arguments: &Value) -> Option<(Vec<String>, Option<Str
     let mut args: Vec<String> = Vec::new();
     let mut push = |items: &[&str]| args.extend(items.iter().map(|item| (*item).to_owned()));
     let mut stdin = None;
-    let mutating = !matches!(name, "board" | "inbox" | "wait" | "schema");
+    let mutating = !matches!(name, "board" | "settle" | "inbox" | "wait" | "schema");
     match name {
-        "board" => push(&["board"]),
+        "board" => {
+            push(&["board"]);
+            // An empty milestone is the page of steps without one.
+            if let Some(milestone) = arguments.get("milestone").and_then(Value::as_str) {
+                push(&["--milestone", milestone]);
+            } else if arguments.get("all").and_then(Value::as_bool) == Some(true) {
+                push(&["--all"]);
+            }
+            if let Some(out) = str_arg(arguments, "out") {
+                push(&["--out", out]);
+            }
+        }
         "inbox" => push(&["inbox"]),
+        "settle" => push(&["settle"]),
         "schema" => push(&["schema", str_arg(arguments, "kind").unwrap_or("card")]),
         "declare_project" => {
             push(&["project", "declare", "--json", "-"]);
@@ -357,7 +370,10 @@ fn command_for(name: &str, arguments: &Value) -> Option<(Vec<String>, Option<Str
             } else {
                 timeout
             };
-            push(&["wait", str_arg(arguments, "ask_id")?, "--timeout", timeout]);
+            match str_arg(arguments, "delivery_id") {
+                Some(delivery) => push(&["wait", "--delivery", delivery, "--timeout", timeout]),
+                None => push(&["wait", str_arg(arguments, "ask_id")?, "--timeout", timeout]),
+            }
         }
         "ack" => push(&["ack", str_arg(arguments, "answer_id")?]),
         "report" => {
@@ -372,6 +388,12 @@ fn command_for(name: &str, arguments: &Value) -> Option<(Vec<String>, Option<Str
             ]);
             if let Some(node) = str_arg(arguments, "node") {
                 push(&["--node", node]);
+            }
+            if let Some(kind) = str_arg(arguments, "kind") {
+                push(&["--kind", kind]);
+            }
+            if let Some(domain) = str_arg(arguments, "domain") {
+                push(&["--domain", domain]);
             }
         }
         _ => return None,
@@ -471,7 +493,17 @@ fn tools() -> Vec<Value> {
     vec![
         tool(
             "board",
-            "The project as you need it now: your steps, what you may start, others' work, reminders. Read-only.",
+            "The project as you need it now: open steps, your steps, what you may start, others' work, reminders, and `pages`: one per milestone with its counts. Pass `milestone` for one page (finished steps short), `all` for every step, `out` to save the JSON to a file. Read-only.",
+            json!({
+                "milestone": {"type": "string", "description": "One milestone page; \"\" is the steps without a milestone."},
+                "all": {"type": "boolean", "description": "Every step, finished ones included (default false; ignored with milestone)."},
+                "out": {"type": "string", "description": "Absolute file path (folder must exist, not in the Vault): write the JSON there and return only path, bytes, steps."}
+            }),
+            &[],
+        ),
+        tool(
+            "settle",
+            "What you still owe the board, one line each with the command: steps you hold (past ETA, or when they free), steps you may take, your questions on closed steps, a few planned steps to leave, patch or drop. Read-only; call it before you stop.",
             json!({}),
             &[],
         ),
@@ -507,7 +539,7 @@ fn tools() -> Vec<Value> {
                 "depends_on": {"type": "array", "items": {"type": "string"}},
                 "milestone": {"type": "string", "maxLength": 80},
                 "slice": {"type": "string", "maxLength": 80},
-                "demo_kind": {"type": "string", "enum": ["screenshot", "cli_transcript", "preview_url", "recording"]},
+                "demo_kind": {"type": "string", "enum": ["screenshot", "cli_transcript", "preview_url", "recording", "diff"]},
             }),
             &["node"],
         ),
@@ -551,9 +583,9 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "wait",
-            "Block until the answer to ask_id exists (default 5m, at most 30m); call again if it times out.",
-            json!({"ask_id": {"type": "string"}, "timeout": {"type": "string", "description": "e.g. 5m"}}),
-            &["ask_id"],
+            "Block until the answer to ask_id exists, or with delivery_id until the human accepted or sent back that delivery (default 5m, at most 30m); call again if it times out. After `deliver`, wait here instead of polling.",
+            json!({"ask_id": {"type": "string"}, "delivery_id": {"type": "string", "description": "The event_id deliver returned."}, "timeout": {"type": "string", "description": "e.g. 5m"}}),
+            &[],
         ),
         tool(
             "ack",
@@ -563,8 +595,8 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "report",
-            "Publish a report: a short summary (≤600) and a document (html, md or txt) the human opens in a browser.",
-            json!({"title": {"type": "string", "maxLength": 80}, "summary": {"type": "string", "maxLength": 600}, "file": {"type": "string", "description": "Absolute path."}, "node": node}),
+            "Publish a report: a short summary (≤600) and a document (html, md or txt) the human opens in a browser. kind proposal: read before a choice; finding: an experiment, audit or investigation.",
+            json!({"title": {"type": "string", "maxLength": 80}, "summary": {"type": "string", "maxLength": 600}, "file": {"type": "string", "description": "Absolute path."}, "node": node, "kind": {"type": "string", "enum": ["proposal", "finding"]}, "domain": {"type": "string", "enum": ["arch", "code", "ux"]}}),
             &["title", "summary", "file"],
         ),
     ]
@@ -573,6 +605,53 @@ fn tools() -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn report_passes_its_kind_and_domain() {
+        let (args, _) = command_for(
+            "report",
+            &json!({"title": "Audit", "summary": "s", "file": "/tmp/a.md", "kind": "finding", "domain": "code"}),
+        )
+        .expect("report");
+        let at = |flag: &str| {
+            args.iter()
+                .position(|arg| arg == flag)
+                .map(|index| args[index + 1].as_str())
+        };
+        assert_eq!(at("--kind"), Some("finding"));
+        assert_eq!(at("--domain"), Some("code"));
+        let (args, _) = command_for(
+            "report",
+            &json!({"title": "Audit", "summary": "s", "file": "/tmp/a.md"}),
+        )
+        .expect("report");
+        assert!(!args.iter().any(|arg| arg == "--kind" || arg == "--domain"));
+    }
+
+    #[test]
+    fn board_maps_milestone_all_and_out() {
+        let args = |arguments: Value| command_for("board", &arguments).expect("board").0;
+        assert_eq!(args(json!({})), ["board"]);
+        assert_eq!(args(json!({"all": false})), ["board"]);
+        assert_eq!(args(json!({"all": true})), ["board", "--all"]);
+        assert_eq!(
+            args(json!({"milestone": "Next batch 1"})),
+            ["board", "--milestone", "Next batch 1"]
+        );
+        assert_eq!(args(json!({"milestone": ""})), ["board", "--milestone", ""]);
+        assert_eq!(
+            args(json!({"all": true, "out": "/tmp/b.json"})),
+            ["board", "--all", "--out", "/tmp/b.json"]
+        );
+        let board = tools()
+            .into_iter()
+            .find(|tool| tool["name"] == "board")
+            .expect("board tool");
+        let properties = &board["inputSchema"]["properties"];
+        assert_eq!(properties["all"]["type"], "boolean");
+        assert_eq!(properties["milestone"]["type"], "string");
+        assert_eq!(properties["out"]["type"], "string");
+    }
 
     #[test]
     fn tools_map_onto_cli_commands() {
@@ -607,6 +686,12 @@ mod tests {
         let (args, _) =
             command_for("wait", &json!({"ask_id": "A", "timeout": "5h"})).expect("wait");
         assert_eq!(args, ["wait", "A", "--timeout", "30m"], "capped, read-only");
+        let (args, _) = command_for("wait", &json!({"delivery_id": "D"})).expect("verdict wait");
+        assert_eq!(args, ["wait", "--delivery", "D", "--timeout", "5m"]);
+        assert!(
+            command_for("wait", &json!({})).is_none(),
+            "a target is required"
+        );
         assert!(
             command_for("start", &json!({"node": "core/wake"})).is_none(),
             "eta required"

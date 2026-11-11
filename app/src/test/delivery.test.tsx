@@ -223,6 +223,77 @@ describe("delivery view", () => {
     ).toBeInTheDocument();
   });
 
+  it("never lists the delivered step itself when the review points at it", async () => {
+    // The core graph draws review → its own feature; that feature is what the
+    // delivery delivers, so the unblock set names only its dependents.
+    const client = new FakeClient(makeDeliverySnapshot());
+    const fixture = makeDeliveryProject();
+    const project = fixture.project;
+    const base = project.features["core/one"]!;
+    project.features["core/two"] = {
+      ...base,
+      node: "core/two",
+      title: "Core two",
+      depends_on: ["core/one"],
+    };
+    project.features["core/three"] = {
+      ...base,
+      node: "core/three",
+      title: "Core three",
+      depends_on: ["core/two"],
+    };
+    client.graph = makeGraph({
+      nodes: [
+        {
+          id: "feature:core/one",
+          kind: "feature",
+          label: "CLI ask",
+          feature: "core/one",
+          state: "done",
+          assumed: false,
+        },
+        {
+          id: `review:${fixture.delivery.id}`,
+          kind: "review",
+          label: fixture.delivery.name,
+          feature: "core/one",
+          need_id: fixture.need.id,
+          state: "pending",
+          assumed: false,
+        },
+        {
+          id: "feature:core/two",
+          kind: "feature",
+          label: "Core two",
+          feature: "core/two",
+          state: "planned",
+          assumed: false,
+        },
+        {
+          id: "feature:core/three",
+          kind: "feature",
+          label: "Core three",
+          feature: "core/three",
+          state: "planned",
+          assumed: false,
+        },
+      ],
+      edges: [
+        {
+          from: `review:${fixture.delivery.id}`,
+          to: "feature:core/one",
+          source_event: fixture.delivery.id,
+        },
+        { from: "feature:core/one", to: "feature:core/two", source_event: ulid(184) },
+        { from: "feature:core/two", to: "feature:core/three", source_event: ulid(185) },
+      ],
+    });
+    render(<Harness client={client} project={project} />);
+    expect(
+      await screen.findByText("Accepting it unblocks Core two, Core three"),
+    ).toBeInTheDocument();
+  });
+
   it("says 'None claimed' instead of inventing a success for an empty column", () => {
     const client = new FakeClient(makeDeliverySnapshot());
     const delivery = makeDelivery({
@@ -233,6 +304,22 @@ describe("delivery view", () => {
       <Harness client={client} project={fixture.project} delivery={delivery} need={fixture.need} />,
     );
     expect(screen.getAllByText("None claimed")).toHaveLength(2);
+  });
+
+  it("shows a delivery no decision asked for without an asked line or criteria", () => {
+    const client = new FakeClient(makeDeliverySnapshot());
+    const delivery = makeDelivery({ receipt: undefined, criteria: [] });
+    const fixture = makeDeliveryProject();
+    render(
+      <Harness client={client} project={fixture.project} delivery={delivery} need={fixture.need} />,
+    );
+    expect(screen.queryByText(/You asked for/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "Receipt criteria" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/criteri/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /report/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Proven" })).toBeInTheDocument();
+    expect(screen.getByText("Alias lookup returned the real author")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Accept/ })).toBeEnabled();
   });
 
   it("accepts with the delivery revision that is on screen", async () => {
@@ -545,6 +632,60 @@ describe("delivery navigation", () => {
     const request = client.calls.find((call) => call.command === "review_delivery")
       ?.request as ReviewDeliveryRequest;
     expect(request.verdict).toBe("accept");
+  });
+});
+
+describe("an accept that replies before its snapshot", () => {
+  it("leaves Accepting… on the reply and moves on when the later snapshot lands", async () => {
+    const client = new FakeClient(makeDeliverySnapshot());
+    const fixture = makeDeliveryProject();
+    // The host replies once the review is durable; its snapshot is published
+    // afterwards, so until then reads still show the review.
+    client.reviewDelivery = async (request: ReviewDeliveryRequest) => {
+      client.calls.push({ command: "review_delivery", request });
+      client.order.push("review_delivery");
+      return { event_id: ulid(700), released: [] };
+    };
+    const store = new SnapshotStore(client);
+    render(<App client={client} store={store} surface="main" />);
+    await screen.findByRole("heading", { name: /Since you last looked/ });
+    await userEvent.click(
+      document.querySelector<HTMLElement>('[data-row="need:review-one"]') as HTMLElement,
+    );
+    const question = "search-v2 is ready. Does it do what you asked?";
+    await screen.findByRole("heading", { name: question });
+
+    await userEvent.click(screen.getByRole("button", { name: /Accept search-v2/ }));
+    await waitFor(() => expect(client.order).toContain("review_delivery"));
+    // Not stuck on Accepting…, and the reviewed revision cannot be sent twice.
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /Accept search-v2/ })).toBeDisabled(),
+    );
+    expect(screen.queryByRole("button", { name: /Accepting…/ })).toBeNull();
+    expect(screen.getByRole("button", { name: "Send back…" })).toBeDisabled();
+    expect(client.order.filter((command) => command === "review_delivery")).toHaveLength(1);
+
+    // The publication arrives later: the review leaves and the app moves on.
+    const later = structuredClone(client.snapshot);
+    later.needs = later.needs.filter((item) => item.id !== fixture.need.id);
+    const delivery = later.state.projects.alpha!.deliveries[fixture.delivery.id]!;
+    delivery.review = "accepted";
+    delivery.revision = "e".repeat(64);
+    later.generation += 1;
+    client.setSnapshot(later);
+    client.emit("agendar://changed", {
+      v: 1,
+      epoch: later.epoch,
+      generation: later.generation,
+      event_set_digest: later.state.event_set_digest,
+      as_of: later.state.evaluated_at,
+      projects: ["alpha"],
+      pulses: [],
+      batch: "local",
+    });
+    await waitFor(() =>
+      expect(screen.queryByRole("heading", { name: question })).not.toBeInTheDocument(),
+    );
   });
 });
 

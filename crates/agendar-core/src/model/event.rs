@@ -8,11 +8,12 @@ use serde_json::Value;
 use crate::error::{AgendarError, Result};
 use crate::model::cards::{
     CheckResult, Criterion, CriterionResult, DecisionCard, Demo, DemoKind, Disclosure,
-    ObservationMethod, ReviewVerdict,
+    ObservationMethod, ReviewComment, ReviewVerdict,
 };
 use crate::model::ids::{
     BlobRef, CriterionId, Domain, EtaRange, EventId, Harness, HostId, Mode, NodePath, OptionId,
-    ProjectSlug, Reversibility, RuleId, SessionId, Sha256, UtcTime, WriterId, WriterRole,
+    ProjectSlug, ReportKind, Reversibility, RuleId, SessionId, Sha256, UtcTime, WriterId,
+    WriterRole,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,6 +174,10 @@ pub enum EventPayload {
     ProjectDeclared(ProjectDeclared),
     #[serde(rename = "plan.feature")]
     PlanFeature(PlanFeature),
+    #[serde(rename = "plan.dropped")]
+    PlanDropped(PlanDropped),
+    #[serde(rename = "need.snoozed")]
+    NeedSnoozed(NeedSnoozed),
     #[serde(rename = "work.progress")]
     WorkProgress(WorkProgress),
     #[serde(rename = "pulse")]
@@ -214,6 +219,8 @@ impl EventPayload {
         match self {
             Self::ProjectDeclared(_) => "project.declared",
             Self::PlanFeature(_) => "plan.feature",
+            Self::PlanDropped(_) => "plan.dropped",
+            Self::NeedSnoozed(_) => "need.snoozed",
             Self::WorkProgress(_) => "work.progress",
             Self::Pulse(_) => "pulse",
             Self::DecisionAsk(_) => "decision.ask",
@@ -246,7 +253,9 @@ impl EventPayload {
             Self::DecisionAck(body) => Some(&body.agent),
             Self::Delivery(body) => Some(&body.agent),
             Self::ReportPublished(body) => Some(&body.agent),
-            Self::DecisionAnswer(_)
+            Self::PlanDropped(_)
+            | Self::NeedSnoozed(_)
+            | Self::DecisionAnswer(_)
             | Self::EvidenceObserved(_)
             | Self::ReviewResult(_)
             | Self::RuleSet(_)
@@ -353,6 +362,37 @@ pub struct PlanFeature {
     pub handoff: Option<bool>,
 }
 
+/// The owner drops the step `refs.node` names: it ends as after an agent's
+/// `work.progress dropped`, whoever holds it. Written by the operator only.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanDropped {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// The owner hides one Needs-you row until `until`, on every host. Display
+/// only: nothing an agent reads or waits on changes. `revision` is the row's
+/// revision when the owner snoozed it; once the row's revision differs, the
+/// snooze no longer hides it. `until` is at most [`MAX_SNOOZE_MS`] after the
+/// event's own `ts`; a time at or before `ts` ends the snooze. The latest
+/// `need.snoozed` of a row in the reducer's order is the one in effect.
+/// Written by the operator only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NeedSnoozed {
+    /// The row's id (`decide:<ask>`, `rescue:...`, `review:<delivery>`).
+    pub need: String,
+    pub revision: Sha256,
+    pub until: UtcTime,
+}
+
+/// The longest a snooze lasts: seven days.
+pub const MAX_SNOOZE_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+
+/// The longest id of a Needs-you row a snooze may name.
+pub const MAX_NEED_ID_CHARS: usize = 200;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkStatus {
@@ -419,6 +459,12 @@ pub struct ReportPublished {
     pub summary: String,
     /// The document: html, md or txt.
     pub report: BlobRef,
+    /// Proposal or finding; reports from before kinds have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ReportKind>,
+    /// What it is about, the same vocabulary as a question's domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<Domain>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -458,6 +504,20 @@ pub struct Delivery {
     pub demos: Vec<Demo>,
     pub criteria: Vec<CriterionResult>,
     pub disclosure: Disclosure,
+    /// On a redelivery (`refs.supersedes`), the agent's one-line replies to
+    /// the send-back of the delivery it replaces.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replies: Vec<Reply>,
+}
+
+/// One agent reply to a send-back: to the reason (no `comment`) or to
+/// comment `n`, numbered from 1 in the order the send-back stored them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Reply {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<u8>,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -481,6 +541,9 @@ pub struct ReviewResult {
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub save_rule: Option<RuleSet>,
+    /// Anchored comments on the demos; only with `send_back`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub comments: Vec<ReviewComment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -579,6 +642,10 @@ pub struct BudgetUsage {
     pub speculative_features: u32,
     pub pending_slices: u32,
     pub demo_gap_s: u64,
+    /// The started, undelivered step the demo clock runs for: the one started
+    /// first. Absent while nothing is in progress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub demo_gap_node: Option<NodePath>,
     pub blocked: bool,
     pub reasons: Vec<String>,
 }

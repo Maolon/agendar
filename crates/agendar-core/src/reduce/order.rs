@@ -6,7 +6,7 @@
 //! diagnostics and the Kahn topological order `O`. It performs no filesystem,
 //! clock or database work.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use serde_json::Value;
 
@@ -44,8 +44,8 @@ pub struct Resolution {
     pub ordered: Vec<Event>,
     /// `O` index for every eligible event id.
     pub order_index: BTreeMap<EventId, usize>,
-    /// Transitive causal ancestors within the eligible set.
-    pub ancestors: BTreeMap<EventId, BTreeSet<EventId>>,
+    /// Transitive causal ancestry within the eligible set.
+    pub ancestors: CausalIndex,
     /// Status of every raw variant keyed by `(id, digest)`.
     pub variants: BTreeMap<(EventId, Sha256), VariantState>,
     pub diagnostics: Vec<Diagnostic>,
@@ -56,9 +56,94 @@ impl Resolution {
     /// True when `earlier` is a transitive cause of `later` inside the eligible
     /// set. Mere `O` order (a concurrent timestamp tie-break) is not causality.
     pub fn causally_before(&self, earlier: &EventId, later: &EventId) -> bool {
-        self.ancestors
-            .get(later)
-            .is_some_and(|set| set.contains(earlier))
+        self.ancestors.before(earlier, later)
+    }
+}
+
+/// Causal reachability over the eligible events, answered on demand.
+///
+/// A full ancestor set per event grows with the square of a stream's length
+/// (every event of a writer descends from all of its earlier events). This
+/// keeps only the direct edges: each eligible event's position in `O`, its
+/// stream (`(project, writer)`, a chain linked by sequence edges) and its
+/// direct predecessors. A query walks backwards from the later event and only
+/// visits events between the two in `O`, because `O` is a topological order;
+/// reaching any later event of the earlier event's own stream proves the
+/// relation through the sequence chain.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CausalIndex {
+    position: BTreeMap<EventId, usize>,
+    stream: Vec<usize>,
+    predecessors: Vec<Vec<usize>>,
+}
+
+impl CausalIndex {
+    /// Build from the events in `O` and their direct predecessors (reference
+    /// targets plus the previous eligible event of the same stream).
+    fn new(ordered: &[Event], edges: &BTreeMap<EventId, BTreeSet<EventId>>) -> Self {
+        let position: BTreeMap<EventId, usize> = ordered
+            .iter()
+            .enumerate()
+            .map(|(index, event)| (event.id.clone(), index))
+            .collect();
+        let mut streams: BTreeMap<(&ProjectSlug, String), usize> = BTreeMap::new();
+        let mut stream = Vec::with_capacity(ordered.len());
+        let mut predecessors = Vec::with_capacity(ordered.len());
+        for event in ordered {
+            let next = streams.len();
+            stream.push(
+                *streams
+                    .entry((&event.project, event.writer.to_string()))
+                    .or_insert(next),
+            );
+            predecessors.push(
+                edges
+                    .get(&event.id)
+                    .map(|direct| {
+                        direct
+                            .iter()
+                            .filter_map(|id| position.get(id).copied())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            );
+        }
+        Self {
+            position,
+            stream,
+            predecessors,
+        }
+    }
+
+    /// True when `earlier` is a transitive cause of `later` (never itself).
+    pub fn before(&self, earlier: &EventId, later: &EventId) -> bool {
+        let (Some(&from), Some(&to)) = (self.position.get(earlier), self.position.get(later))
+        else {
+            return false;
+        };
+        if from >= to {
+            return false;
+        }
+        let stream = self.stream[from];
+        if self.stream[to] == stream {
+            return true;
+        }
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut pending = vec![to];
+        while let Some(current) = pending.pop() {
+            for &predecessor in &self.predecessors[current] {
+                if predecessor < from {
+                    continue;
+                }
+                if predecessor == from || self.stream[predecessor] == stream {
+                    return true;
+                }
+                if seen.insert(predecessor) {
+                    pending.push(predecessor);
+                }
+            }
+        }
+        false
     }
 }
 
@@ -259,6 +344,13 @@ pub fn resolve_with_quarantine(
                 .insert(body.session.clone());
         }
     }
+    // The host of the first candidate (in id order) written by each session.
+    let mut first_host: BTreeMap<&SessionId, &HostId> = BTreeMap::new();
+    for (_, event) in candidates.values() {
+        if let Some(session) = event.writer.session() {
+            first_host.entry(session).or_insert(event.writer.host());
+        }
+    }
     let quarantined_ids: BTreeSet<EventId> = variants
         .iter()
         .filter(|(_, state)| state.status == VariantStatus::Quarantined)
@@ -298,9 +390,7 @@ pub fn resolve_with_quarantine(
             && let EventPayload::SessionContinued(body) = &event.payload
         {
             for session in [&body.session, &body.previous] {
-                let host = candidates.values().find_map(|(_, candidate)| {
-                    (candidate.writer.session() == Some(session)).then(|| candidate.writer.host())
-                });
+                let host = first_host.get(session).copied();
                 match host {
                     Some(host) if host == event.writer.host() => {}
                     Some(_) => {
@@ -317,9 +407,7 @@ pub fn resolve_with_quarantine(
         if reason.is_none()
             && let EventPayload::SessionLost(body) = &event.payload
         {
-            let host = candidates.values().find_map(|(_, candidate)| {
-                (candidate.writer.session() == Some(&body.session)).then(|| candidate.writer.host())
-            });
+            let host = first_host.get(&body.session).copied();
             match host {
                 Some(host) if host == event.writer.host() => {}
                 Some(_) => reason = Some("the lost session belongs to another host".to_owned()),
@@ -404,74 +492,8 @@ pub fn resolve_with_quarantine(
     }
 
     // 5. Propagate pending state to every event whose causally required target
-    //    or available same-stream predecessor is not eligible. A later event of
-    //    one stream must never skip a pending predecessor just because that
-    //    predecessor was excluded from the sequence edges.
-    loop {
-        let mut changed = false;
-        let blocked: BTreeSet<EventId> = variants
-            .iter()
-            .filter(|(_, state)| state.status != VariantStatus::Valid)
-            .map(|((id, _), _)| id.clone())
-            .collect();
-        let mut streams: BTreeMap<(ProjectSlug, String), Vec<(u64, EventId)>> = BTreeMap::new();
-        for (id, (digest, event)) in &candidates {
-            if variants
-                .get(&(id.clone(), digest.clone()))
-                .is_some_and(|state| state.status == VariantStatus::Quarantined)
-            {
-                continue;
-            }
-            streams
-                .entry((event.project.clone(), event.writer.to_string()))
-                .or_default()
-                .push((event.seq, id.clone()));
-        }
-        let mut predecessors: BTreeMap<EventId, EventId> = BTreeMap::new();
-        for entries in streams.values_mut() {
-            entries.sort();
-            for window in entries.windows(2) {
-                if let [(_, previous), (_, next)] = window {
-                    predecessors.insert(next.clone(), previous.clone());
-                }
-            }
-        }
-        for (id, (digest, event)) in &candidates {
-            let current = variants
-                .get(&(id.clone(), digest.clone()))
-                .map(|state| state.status)
-                .unwrap_or(VariantStatus::Valid);
-            if current != VariantStatus::Valid {
-                continue;
-            }
-            let reference_blocked = references(event)
-                .iter()
-                .any(|(target, _)| blocked.contains(target));
-            let predecessor_blocked = predecessors
-                .get(id)
-                .is_some_and(|previous| blocked.contains(previous));
-            if reference_blocked || predecessor_blocked {
-                changed = true;
-                variants.insert(
-                    (id.clone(), digest.clone()),
-                    VariantState {
-                        status: VariantStatus::Pending,
-                        reason: Some(
-                            if reference_blocked {
-                                "pending_reference"
-                            } else {
-                                "pending_stream_predecessor"
-                            }
-                            .to_owned(),
-                        ),
-                    },
-                );
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
+    //    or available same-stream predecessor is not eligible.
+    propagate_pending(&candidates, &mut variants);
 
     // Sequence gaps are diagnostics, never blockers. A gap differs from an
     // available-but-ineligible predecessor, which is reported separately.
@@ -575,20 +597,10 @@ pub fn resolve_with_quarantine(
     let ordered = topological_order(&eligible, &lookup, &edges);
 
     let mut order_index = BTreeMap::new();
-    let mut ancestors: BTreeMap<EventId, BTreeSet<EventId>> = BTreeMap::new();
     for (index, event) in ordered.iter().enumerate() {
         order_index.insert(event.id.clone(), index);
-        let mut set = BTreeSet::new();
-        if let Some(direct) = edges.get(&event.id) {
-            for predecessor in direct {
-                set.insert(predecessor.clone());
-                if let Some(inherited) = ancestors.get(predecessor) {
-                    set.extend(inherited.iter().cloned());
-                }
-            }
-        }
-        ancestors.insert(event.id.clone(), set);
     }
+    let ancestors = CausalIndex::new(&ordered, &edges);
 
     // 7. Canonical event-set digest over validated/pending input variants.
     let mut digest_items: Vec<(EventId, Sha256)> = variants
@@ -620,6 +632,106 @@ pub fn resolve_with_quarantine(
         variants,
         diagnostics,
         event_set_digest: Sha256::from_bytes(canonical_json(&payload).as_bytes()),
+    }
+}
+
+/// Propagate pending state to every event whose causally required target
+/// or available same-stream predecessor is not eligible. A later event of
+/// one stream must never skip a pending predecessor just because that
+/// predecessor was excluded from the sequence edges.
+///
+/// Pending spreads in rounds: an event turns pending in the round after
+/// one of its blockers did, and is reported as `pending_reference` when a
+/// reference target was already blocked by then. Walking the rounds as
+/// breadth-first layers visits each event once instead of rescanning the
+/// whole set per round.
+fn propagate_pending(
+    candidates: &BTreeMap<EventId, (Sha256, Event)>,
+    variants: &mut BTreeMap<(EventId, Sha256), VariantState>,
+) {
+    // Every id that is ineligible as of the current round.
+    let mut blocked: BTreeSet<EventId> = variants
+        .iter()
+        .filter(|(_, state)| state.status != VariantStatus::Valid)
+        .map(|((id, _), _)| id.clone())
+        .collect();
+    if blocked.is_empty() {
+        return;
+    }
+    let mut streams: BTreeMap<(ProjectSlug, String), Vec<(u64, EventId)>> = BTreeMap::new();
+    for (id, (digest, event)) in candidates {
+        if variants
+            .get(&(id.clone(), digest.clone()))
+            .is_some_and(|state| state.status == VariantStatus::Quarantined)
+        {
+            continue;
+        }
+        streams
+            .entry((event.project.clone(), event.writer.to_string()))
+            .or_default()
+            .push((event.seq, id.clone()));
+    }
+    let mut predecessors: BTreeMap<EventId, EventId> = BTreeMap::new();
+    for entries in streams.values_mut() {
+        entries.sort();
+        for window in entries.windows(2) {
+            if let [(_, previous), (_, next)] = window {
+                predecessors.insert(next.clone(), previous.clone());
+            }
+        }
+    }
+    let mut dependents: BTreeMap<EventId, Vec<EventId>> = BTreeMap::new();
+    let mut targets: BTreeMap<&EventId, Vec<EventId>> = BTreeMap::new();
+    for (id, (digest, event)) in candidates {
+        if variants
+            .get(&(id.clone(), digest.clone()))
+            .is_some_and(|state| state.status != VariantStatus::Valid)
+        {
+            continue;
+        }
+        let references: Vec<EventId> = references(event)
+            .into_iter()
+            .map(|(target, _)| target)
+            .collect();
+        for target in references.iter().chain(predecessors.get(id)) {
+            dependents
+                .entry(target.clone())
+                .or_default()
+                .push(id.clone());
+        }
+        targets.insert(id, references);
+    }
+    let mut frontier: BTreeSet<EventId> = blocked.clone();
+    while !frontier.is_empty() {
+        let next: BTreeSet<EventId> = frontier
+            .iter()
+            .filter_map(|blocker| dependents.get(blocker))
+            .flatten()
+            .filter(|id| !blocked.contains(*id))
+            .cloned()
+            .collect();
+        for id in &next {
+            let reference_blocked = targets
+                .get(id)
+                .is_some_and(|references| references.iter().any(|target| blocked.contains(target)));
+            let (digest, _) = &candidates[id];
+            variants.insert(
+                (id.clone(), digest.clone()),
+                VariantState {
+                    status: VariantStatus::Pending,
+                    reason: Some(
+                        if reference_blocked {
+                            "pending_reference"
+                        } else {
+                            "pending_stream_predecessor"
+                        }
+                        .to_owned(),
+                    ),
+                },
+            );
+        }
+        blocked.extend(next.iter().cloned());
+        frontier = next;
     }
 }
 
@@ -1114,4 +1226,225 @@ fn strongly_connected(
         }
     }
     components
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(index: usize) -> EventId {
+        EventId::parse(&format!("{index:026}")).expect("test id")
+    }
+
+    /// Random DAGs in topological order: each event continues its stream
+    /// (sequence edge to the stream's previous event) and cites up to three
+    /// earlier events. `before` must equal the naive transitive closure.
+    #[test]
+    fn causal_index_matches_the_full_ancestor_closure() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            usize::try_from(state % bound as u64).expect("small")
+        };
+        for _ in 0..200 {
+            let count = 1 + next(40);
+            let streams = 1 + next(5);
+            let mut stream = Vec::with_capacity(count);
+            let mut predecessors: Vec<Vec<usize>> = Vec::with_capacity(count);
+            let mut last_of: BTreeMap<usize, usize> = BTreeMap::new();
+            for index in 0..count {
+                let own = next(streams);
+                let mut direct = BTreeSet::new();
+                if let Some(previous) = last_of.insert(own, index) {
+                    direct.insert(previous);
+                }
+                if index > 0 {
+                    for _ in 0..next(4) {
+                        direct.insert(next(index));
+                    }
+                }
+                stream.push(own);
+                predecessors.push(direct.into_iter().collect());
+            }
+            let mut closure: Vec<BTreeSet<usize>> = Vec::with_capacity(count);
+            for direct in &predecessors {
+                let mut set = BTreeSet::new();
+                for &predecessor in direct {
+                    set.insert(predecessor);
+                    set.extend(closure[predecessor].iter().copied());
+                }
+                closure.push(set);
+            }
+            let index = CausalIndex {
+                position: (0..count).map(|index| (id(index), index)).collect(),
+                stream,
+                predecessors,
+            };
+            for (later, ancestors) in closure.iter().enumerate() {
+                for earlier in 0..count {
+                    assert_eq!(
+                        index.before(&id(earlier), &id(later)),
+                        ancestors.contains(&earlier),
+                        "{earlier} before {later}"
+                    );
+                }
+            }
+            assert!(!index.before(&id(count + 1), &id(0)), "unknown events");
+        }
+    }
+    /// The round-by-round rescan `propagate_pending` replaced, as the oracle.
+    fn propagate_by_rounds(
+        candidates: &BTreeMap<EventId, (Sha256, Event)>,
+        variants: &mut BTreeMap<(EventId, Sha256), VariantState>,
+    ) {
+        loop {
+            let mut changed = false;
+            let blocked: BTreeSet<EventId> = variants
+                .iter()
+                .filter(|(_, state)| state.status != VariantStatus::Valid)
+                .map(|((id, _), _)| id.clone())
+                .collect();
+            let mut streams: BTreeMap<(ProjectSlug, String), Vec<(u64, EventId)>> = BTreeMap::new();
+            for (id, (digest, event)) in candidates {
+                if variants
+                    .get(&(id.clone(), digest.clone()))
+                    .is_some_and(|state| state.status == VariantStatus::Quarantined)
+                {
+                    continue;
+                }
+                streams
+                    .entry((event.project.clone(), event.writer.to_string()))
+                    .or_default()
+                    .push((event.seq, id.clone()));
+            }
+            let mut predecessors: BTreeMap<EventId, EventId> = BTreeMap::new();
+            for entries in streams.values_mut() {
+                entries.sort();
+                for window in entries.windows(2) {
+                    if let [(_, previous), (_, next)] = window {
+                        predecessors.insert(next.clone(), previous.clone());
+                    }
+                }
+            }
+            for (id, (digest, event)) in candidates {
+                let current = variants
+                    .get(&(id.clone(), digest.clone()))
+                    .map(|state| state.status)
+                    .unwrap_or(VariantStatus::Valid);
+                if current != VariantStatus::Valid {
+                    continue;
+                }
+                let reference_blocked = references(event)
+                    .iter()
+                    .any(|(target, _)| blocked.contains(target));
+                let predecessor_blocked = predecessors
+                    .get(id)
+                    .is_some_and(|previous| blocked.contains(previous));
+                if reference_blocked || predecessor_blocked {
+                    changed = true;
+                    variants.insert(
+                        (id.clone(), digest.clone()),
+                        VariantState {
+                            status: VariantStatus::Pending,
+                            reason: Some(
+                                if reference_blocked {
+                                    "pending_reference"
+                                } else {
+                                    "pending_stream_predecessor"
+                                }
+                                .to_owned(),
+                            ),
+                        },
+                    );
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    fn rule_event(index: usize, host: usize, project: &str, seq: u64, causes: &[usize]) -> Event {
+        let writer = format!("h-{host:026}/operator");
+        let causes: Vec<String> = causes.iter().map(|cause| format!("{cause:026}")).collect();
+        let line = serde_json::json!({
+            "v": 1,
+            "id": format!("{index:026}"),
+            "seq": seq,
+            "writer": writer,
+            "ts": "2026-01-01T00:00:00.000Z",
+            "project": project,
+            "refs": {"causes": causes},
+            "kind": "rule.set",
+            "body": {"rule_id": "r", "text": "Rule.", "enabled": true},
+        })
+        .to_string()
+            + "\n";
+        let source = crate::model::SourcePath::from_relative_path(&format!(
+            "projects/{project}/{writer}.jsonl"
+        ))
+        .expect("source");
+        crate::model::parse_event(line.as_bytes(), &source).expect("rule event")
+    }
+
+    /// Random streams with gaps, missing and cyclic references and mixed
+    /// starting statuses: one breadth-first pass marks the same events pending
+    /// with the same reasons as the round-by-round rescan.
+    #[test]
+    fn pending_propagation_matches_the_round_by_round_rescan() {
+        let mut state = 0x853c_49e6_748f_ea9b_u64;
+        let mut next = move |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            usize::try_from(state % bound as u64).expect("small")
+        };
+        for case in 0..500 {
+            let count = 1 + next(30);
+            let mut candidates: BTreeMap<EventId, (Sha256, Event)> = BTreeMap::new();
+            let mut variants: BTreeMap<(EventId, Sha256), VariantState> = BTreeMap::new();
+            for index in 1..=count {
+                let mut causes = BTreeSet::new();
+                for _ in 0..next(3) {
+                    // `count + 5` stays absent; any other id may point forward.
+                    let cause = 1 + next(count + 5);
+                    if cause != index {
+                        causes.insert(cause);
+                    }
+                }
+                let causes: Vec<usize> = causes.into_iter().collect();
+                let project = if next(4) == 0 { "q" } else { "p" };
+                let event = rule_event(index, 1 + next(3), project, 1 + next(8) as u64, &causes);
+                let digest = event_digest(&event);
+                let status = match next(10) {
+                    0 => VariantStatus::Pending,
+                    1 => VariantStatus::Quarantined,
+                    _ => VariantStatus::Valid,
+                };
+                variants.insert(
+                    (event.id.clone(), digest.clone()),
+                    VariantState {
+                        status,
+                        reason: None,
+                    },
+                );
+                candidates.insert(event.id.clone(), (digest, event));
+            }
+            // A quarantined duplicate variant that is not a candidate.
+            let duplicate = id(count + 3);
+            variants.insert(
+                (duplicate, Sha256::from_bytes(b"other")),
+                VariantState {
+                    status: VariantStatus::Quarantined,
+                    reason: None,
+                },
+            );
+            let mut expected = variants.clone();
+            propagate_by_rounds(&candidates, &mut expected);
+            propagate_pending(&candidates, &mut variants);
+            assert_eq!(variants, expected, "case {case}");
+        }
+    }
 }

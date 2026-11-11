@@ -154,7 +154,7 @@ export function NowCards({
   selected,
   onSelect,
   onOpenNeed,
-  handoffs = {},
+  stoppedRows = {},
   pulseAges = {},
   motion = false,
   observed = [],
@@ -171,8 +171,8 @@ export function NowCards({
   selected: string | null;
   onSelect: (node: string | null) => void;
   onOpenNeed?: (needId: string) => void;
-  /** Stopped steps whose hand-off item was dismissed: node → that item, to reopen it. */
-  handoffs?: Readonly<Record<string, string>>;
+  /** Stopped steps with an information row (or a dismissed one): node → that row, to open it. */
+  stoppedRows?: Readonly<Record<string, string>>;
 }) {
   const moving = Object.values(project.features)
     .filter(isNow)
@@ -236,7 +236,7 @@ export function NowCards({
         const unblocks = unblockLabels(feature, project);
         const id = `feature:${feature.node}`;
         const pulsed = pulseAges[`${project.summary.slug}/${feature.node}`];
-        const handoff = stopped && onOpenNeed ? handoffs[feature.node] : undefined;
+        const details = stopped && onOpenNeed ? stoppedRows[feature.node] : undefined;
         return (
           <button
             type="button"
@@ -244,7 +244,7 @@ export function NowCards({
             className="ncard"
             data-feat={feature.node}
             aria-pressed={selected === id}
-            onClick={() => (handoff ? onOpenNeed?.(handoff) : onSelect(selected === id ? null : id))}
+            onClick={() => (details ? onOpenNeed?.(details) : onSelect(selected === id ? null : id))}
           >
             <span className="ntop">
               <span
@@ -270,9 +270,9 @@ export function NowCards({
               {calibratedLine(feature, project) || "\u00a0"}
             </span>
             <span className="nline">{pulsed ? tx("now.last_pulse", { ago: formatAgo(pulsed, anchor) }) : "\u00a0"}</span>
-            {handoff ? (
+            {details ? (
               <span className="ndeps nopen">
-                {tx("now.handoff")}
+                {tx("now.details")}
                 <Icon name="arrow-right" />
               </span>
             ) : unblocks.length ? (

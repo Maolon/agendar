@@ -245,6 +245,7 @@ pub fn evaluate_with_policy(
             speculative_features: 0,
             pending_slices: 0,
             demo_gap_s: 0,
+            demo_gap_node: None,
             blocked: false,
             reasons: Vec::new(),
         },
@@ -276,7 +277,7 @@ pub fn evaluate_policy(
     evaluate_policy_with_event(card, requested, project, None, now)
 }
 
-/// Slice-1c card validation against derived state.
+/// Card validation against derived state.
 ///
 /// Structural limits (options, labels, tables) are owned by the wire decoder.
 /// Seen facts need a real observation, so a card that claims one is refused as

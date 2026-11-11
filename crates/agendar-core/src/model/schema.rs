@@ -130,7 +130,7 @@ pub fn feature() -> Value {
             "priority": "0..=3",
         },
         "enums": {
-            "demo_kind": ["screenshot", "cli_transcript", "preview_url", "recording"],
+            "demo_kind": ["screenshot", "cli_transcript", "preview_url", "recording", "diff"],
         },
         "notes": [
             "The first declaration needs title, slice and demo_kind; later ones patch single fields.",

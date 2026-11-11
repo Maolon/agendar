@@ -2,7 +2,7 @@
  * Settings: everything Agendar keeps on this computer, in five tabs.
  * General (language, theme, motion), Agents (how each harness is connected,
  * the command line, the skill, observe-only hooks), Notifications, Storage
- * (shared data folder, linked repositories) and About. Nothing here writes to
+ * (shared data folder, usage per project, linked repositories) and About. Nothing here writes to
  * the shared Vault.
  */
 
@@ -12,6 +12,7 @@ import {
   BookOpen,
   Bot,
   Check,
+  Clock,
   Copy,
   Database,
   Eye,
@@ -33,7 +34,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { errorCode } from "../api/client";
-import { formatAgo, newRequestId } from "../api/format";
+import { formatAgo, formatBytes, newRequestId } from "../api/format";
 import { expectedFields, projectFields, projectPatch } from "../state/agenda";
 import { useClient } from "../api/store";
 import type {
@@ -42,8 +43,11 @@ import type {
   Preferences,
   SetupLocation,
   Snapshot,
+  StorageUsage,
   Theme,
   UnlinkRepoData,
+  UsageNumbers,
+  UpdateStatus,
 } from "../api/types";
 import { harnessLabel } from "../components/NowCards";
 import { LANGUAGE_NAMES, LANGUAGE_OPTIONS, detectLanguage, systemLanguages, useT, type Translate } from "../i18n";
@@ -78,6 +82,7 @@ type PreferencePatch = {
   motion?: boolean;
   notifications?: boolean;
   language?: NonNullable<Preferences["language"]>;
+  update_check?: boolean;
 };
 
 function useReducedMotion(): boolean {
@@ -280,7 +285,9 @@ export function Settings({ snapshot, onPreferences, onRefresh, initialTab = "gen
           <NotificationsTab snapshot={snapshot} saving={saving} save={save} />
         ) : null}
         {tab === "storage" ? <StorageTab snapshot={snapshot} onRefresh={onRefresh} /> : null}
-        {tab === "about" ? <AboutTab /> : null}
+        {tab === "about" ? (
+          <AboutTab snapshot={snapshot} saving={saving} save={save} onRefresh={onRefresh} />
+        ) : null}
       </div>
     </div>
   );
@@ -700,6 +707,7 @@ function StorageTab({ snapshot, onRefresh }: { snapshot: Snapshot; onRefresh: ()
   const client = useClient();
   const t = useT();
   const [config, setConfig] = useState<LocalConfig | null | undefined>(undefined);
+  const [usage, setUsage] = useState<StorageUsage | null | undefined>(undefined);
   const [tick, setTick] = useState(0);
   const reload = () => setTick((value) => value + 1);
   const [vaultOpen, setVaultOpen] = useState(false);
@@ -740,6 +748,23 @@ function StorageTab({ snapshot, onRefresh }: { snapshot: Snapshot; onRefresh: ()
       })
       .catch(() => {
         if (!cancelled) setConfig(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [client, tick]);
+
+  // The numbers `agendar prune` prints. The last reading stays up while the
+  // next one is taken.
+  useEffect(() => {
+    let cancelled = false;
+    client
+      .getStorageUsage()
+      .then((data) => {
+        if (!cancelled) setUsage(data);
+      })
+      .catch(() => {
+        if (!cancelled) setUsage(null);
       });
     return () => {
       cancelled = true;
@@ -954,6 +979,24 @@ function StorageTab({ snapshot, onRefresh }: { snapshot: Snapshot; onRefresh: ()
         )}
       </Group>
 
+      {usage === null && !config?.vault ? null : (
+        <Group id="settings-usage" title={t("usage.title")}>
+          {usage === undefined ? (
+            <p className="srow-empty" role="status">
+              {t("usage.reading")}
+            </p>
+          ) : usage === null ? (
+            <p className="srow-empty" role="alert">
+              {t("usage.read_error")}
+            </p>
+          ) : usage.projects.length === 0 ? (
+            <p className="srow-empty">{t("usage.none")}</p>
+          ) : (
+            <UsageTable usage={usage} />
+          )}
+        </Group>
+      )}
+
       <Group
         id="settings-repos"
         title={t("repos.title")}
@@ -1019,10 +1062,88 @@ function StorageTab({ snapshot, onRefresh }: { snapshot: Snapshot; onRefresh: ()
   );
 }
 
+/** The quiet line under a row: only the numbers that are not zero. */
+function usageNotes(numbers: UsageNumbers, t: Translate): string {
+  const notes: string[] = [];
+  if (numbers.superseded.bytes > 0) notes.push(t("usage.superseded", { size: formatBytes(numbers.superseded.bytes) }));
+  if (numbers.unreferenced.bytes > 0)
+    notes.push(t("usage.unreferenced", { size: formatBytes(numbers.unreferenced.bytes) }));
+  if (numbers.total_local_bytes !== numbers.total_bytes)
+    notes.push(t("usage.local", { size: formatBytes(numbers.total_local_bytes) }));
+  return notes.join(" · ");
+}
+
+/** One row per project, largest first: total, attachments, what a cleanup could free. */
+function UsageTable({ usage }: { usage: StorageUsage }) {
+  const t = useT();
+  const cells = (numbers: UsageNumbers) => (
+    <>
+      <td>{formatBytes(numbers.total_bytes)}</td>
+      <td>{formatBytes(numbers.attachments.bytes)}</td>
+      <td className={numbers.reclaimable.bytes > 0 ? "susage-free" : "susage-none"}>
+        {numbers.reclaimable.bytes > 0 ? formatBytes(numbers.reclaimable.bytes) : "—"}
+      </td>
+    </>
+  );
+  const name = (label: ReactNode, numbers: UsageNumbers) => {
+    const notes = usageNotes(numbers, t);
+    return (
+      <th scope="row">
+        <span className="susage-name">{label}</span>
+        {notes ? <span className="susage-notes">{notes}</span> : null}
+      </th>
+    );
+  };
+  return (
+    <table className="susage">
+      <thead>
+        <tr>
+          <th scope="col">{t("usage.project")}</th>
+          <th scope="col">{t("usage.total")}</th>
+          <th scope="col">{t("usage.attachments")}</th>
+          <th scope="col">{t("usage.free")}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {usage.projects.map((project) => (
+          <tr key={project.project}>
+            {name(
+              <>
+                {project.title ?? project.project}
+                {project.archived ? <span className="archived-tag">{t("search.archived")}</span> : null}
+              </>,
+              project,
+            )}
+            {cells(project)}
+          </tr>
+        ))}
+      </tbody>
+      {usage.projects.length > 1 ? (
+        <tfoot>
+          <tr>
+            {name(t("usage.all"), usage.total)}
+            {cells(usage.total)}
+          </tr>
+        </tfoot>
+      ) : null}
+    </table>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // About
 
-function AboutTab() {
+function AboutTab({
+  snapshot,
+  saving,
+  save,
+  onRefresh,
+}: {
+  snapshot: Snapshot;
+  saving: boolean;
+  save: (patch: PreferencePatch) => Promise<void>;
+  onRefresh: () => void;
+}) {
   const client = useClient();
   const t = useT();
   const [config, setConfig] = useState<LocalConfig | null>(null);
@@ -1039,10 +1160,134 @@ function AboutTab() {
     };
   }, [client]);
   return (
-    <Group id="settings-about" title={t("tab.about")}>
-      <Row icon={Info} label={t("about.version")} hint={<Path value={config?.app_version} empty={t("storage.unknown")} />} />
-      <Row icon={Terminal} label={t("about.cli")} hint={<Path value={config?.cli_path} empty={t("about.cli.missing")} />} />
-      <Row icon={ShieldCheck} label={t("about.protocol")} hint={t("about.protocol.value")} />
+    <>
+      <Group id="settings-about" title={t("tab.about")}>
+        <Row
+          icon={Info}
+          label={t("about.version")}
+          hint={<Path value={config?.app_version ?? snapshot.update?.current} empty={t("storage.unknown")} />}
+        />
+        <Row icon={Terminal} label={t("about.cli")} hint={<Path value={config?.cli_path} empty={t("about.cli.missing")} />} />
+        <Row icon={ShieldCheck} label={t("about.protocol")} hint={t("about.protocol.value")} />
+      </Group>
+      {snapshot.update ? (
+        <UpdatesGroup
+          status={snapshot.update}
+          enabled={snapshot.preferences.update_check !== false}
+          saving={saving}
+          save={save}
+          onRefresh={onRefresh}
+        />
+      ) : null}
+    </>
+  );
+}
+
+/** Release channel, latest public release, last check and the switch. */
+function UpdatesGroup({
+  status: cached,
+  enabled,
+  saving,
+  save,
+  onRefresh,
+}: {
+  status: UpdateStatus;
+  enabled: boolean;
+  saving: boolean;
+  save: (patch: PreferencePatch) => Promise<void>;
+  onRefresh: () => void;
+}) {
+  const client = useClient();
+  const t = useT();
+  const [fresh, setFresh] = useState<UpdateStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
+  // A newer cached check (from the snapshot) wins over the last manual result.
+  // A running check (pushed live by the host) always shows.
+  const status = {
+    ...(fresh && (fresh.checked_at ?? "") >= (cached.checked_at ?? "") ? fresh : cached),
+    checking: cached.checking,
+  };
+  const failure = problem ?? (status.error ? t("update.failed", { error: status.error }) : null);
+  async function checkNow(): Promise<void> {
+    setBusy(true);
+    setProblem(null);
+    try {
+      const data = await client.checkUpdates();
+      setFresh(data.update);
+      onRefresh();
+    } catch (cause) {
+      setProblem(t("update.failed", { error: failureOf(cause).message }));
+    } finally {
+      setBusy(false);
+    }
+  }
+  const release = status.channel === "release";
+  return (
+    <Group id="settings-updates" title={t("update.title")}>
+      <Row
+        icon={Package}
+        label={t("update.channel")}
+        hint={release ? t("update.channel.release") : t("update.channel.dev")}
+      />
+      <Row
+        icon={Sparkles}
+        label={t("update.latest")}
+        hint={
+          status.latest
+            ? t("update.latest.value", {
+                version: status.latest,
+                date: (status.published_at ?? "").slice(0, 10) || "—",
+              })
+            : t("update.latest.unknown")
+        }
+      >
+        {release && status.latest ? (
+          status.available ? (
+            <Badge tone="warn">{t("update.available", { version: status.latest })}</Badge>
+          ) : (
+            <Badge tone="ok">{t("update.up_to_date")}</Badge>
+          )
+        ) : null}
+        {status.url ? (
+          <button type="button" className="btn sm" onClick={() => void client.openRelease().catch(() => undefined)}>
+            {t("update.whats_new")}
+          </button>
+        ) : null}
+      </Row>
+      <Row
+        icon={Clock}
+        label={t("update.checked")}
+        hint={
+          status.checked_at
+            ? formatAgo(status.checked_at, new Date().toISOString())
+            : t("update.checked.never")
+        }
+        below={
+          failure ? (
+            <p className="srow-note err" role="alert">
+              {failure}
+            </p>
+          ) : null
+        }
+      >
+        <button
+          type="button"
+          className="btn sm"
+          disabled={!enabled || busy || status.checking === true}
+          onClick={() => void checkNow()}
+        >
+          {busy ? t("update.checking") : t("update.check_now")}
+        </button>
+      </Row>
+      <Row icon={RefreshCw} label={t("update.auto")}>
+        <Switch
+          checked={enabled}
+          label={t("update.auto")}
+          disabled={saving}
+          onChange={(update_check) => void save({ update_check })}
+        />
+      </Row>
     </Group>
   );
 }

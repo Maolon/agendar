@@ -123,7 +123,7 @@ pub fn clamp_ratio(raw: u64) -> u32 {
 /// Build the report for one project.
 ///
 /// `waits` returns the replayed human-wait intervals of one attempt; the caller
-/// owns the causal reconstruction (see `reduce::eta::waits`).
+/// owns the causal reconstruction (see `reduce::waits::by_node`).
 pub fn report(
     features: &BTreeMap<NodePath, FeatureFold>,
     waits: &BTreeMap<EventId, Vec<(UtcTime, Option<UtcTime>)>>,
@@ -139,7 +139,7 @@ pub fn report(
                 // a finished-feature identity.
                 continue;
             }
-            let Some((order, completed_at)) = attempt.first_completion else {
+            let Some((order, completed_at)) = attempt.completion() else {
                 continue;
             };
             finished = true;

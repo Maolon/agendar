@@ -229,6 +229,12 @@ fn classify(project: &ProjectState, event: &Event) -> Option<Entry> {
                 "x",
             ),
         },
+        EventPayload::PlanDropped(_) => (
+            Key::Dropped,
+            format!("{actor} dropped {step}"),
+            Some(with_actor("act.dropped").arg("step", step_arg.clone())),
+            "x",
+        ),
         EventPayload::DecisionAsk(body) => (
             Key::Ask,
             format!("{actor} asked you: {}", body.card.question),
@@ -341,6 +347,7 @@ fn classify(project: &ProjectState, event: &Event) -> Option<Entry> {
         | EventPayload::ReviewResult(_)
         | EventPayload::RuleSet(_)
         | EventPayload::PolicySet(_)
+        | EventPayload::NeedSnoozed(_)
         | EventPayload::Delivered(_) => return None,
     };
     let actor_kind = match &event.payload {
@@ -446,7 +453,13 @@ fn summarize(group: &[Entry]) -> Option<ActivityItem> {
         });
     }
     let tally = |key: Key| group.iter().filter(|entry| entry.key == key).count();
-    let mut plan = tally(Key::Plan);
+    // Plan updates count distinct steps: a step declared and then patched in
+    // one burst is one updated step, not two.
+    let plan_entries = || group.iter().filter(|entry| entry.key == Key::Plan);
+    let plan_steps: std::collections::BTreeSet<_> = plan_entries()
+        .filter_map(|entry| entry.node.as_ref())
+        .collect();
+    let mut plan = plan_steps.len() + plan_entries().filter(|entry| entry.node.is_none()).count();
     let mut started = tally(Key::Started);
     let mut done = tally(Key::Done);
     let dropped = tally(Key::Dropped);
@@ -923,6 +936,18 @@ mod tests {
                 "Claude Code finished 2 steps, updated 1 plan step, sent 2 progress updates in MVP build"
             ]
         );
+    }
+
+    #[test]
+    fn plan_updates_count_distinct_steps_not_declarations() {
+        let w = agent_writer();
+        let burst = feed(vec![
+            event(10, 1_000, &w, on("core/wire"), plan("Wire model", None)),
+            event(11, 1_001, &w, on("core/index"), plan("Local index", None)),
+            event(12, 1_002, &w, on("core/wire"), plan("Wire model v2", None)),
+            event(13, 1_003, &w, on("ui/board"), plan("Board", None)),
+        ]);
+        assert_eq!(texts(&burst), ["Claude Code updated 3 plan steps"]);
     }
 
     #[test]

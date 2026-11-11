@@ -10,62 +10,15 @@ use std::collections::BTreeMap;
 use serde_json::{Value, json};
 
 use agendar_core::model::{
-    Confidence, DecisionCard, DecisionOption, DecisionState, EtaRange, EventId, OptionId,
-    Reversibility, Sha256, UtcTime, canonical_json,
+    DecisionOption, DecisionState, EtaRange, EventId, OptionId, Reversibility, Sha256, UtcTime,
+    canonical_json,
 };
-use agendar_core::reduce::policy::risk_scan;
 
 /// Prepare-token lifetime.
 pub const TOKEN_TTL_S: i64 = 60;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Guard {
-    Easy,
-    Choose,
-    Confirm,
-}
-
-impl Guard {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Easy => "easy",
-            Self::Choose => "choose",
-            Self::Confirm => "confirm",
-        }
-    }
-}
-
-/// Worst-case effective risk of one card, including external effects and the
-/// conservative heuristic floor.
-pub fn effective_risk(card: &DecisionCard) -> Reversibility {
-    let (risk, external, _) = risk_scan(card);
-    if external {
-        Reversibility::Irreversible
-    } else {
-        risk
-    }
-}
-
-/// The guard the backend enforces for one card.
-///
-/// Easy risk is only one-key when the recommendation is at least medium
-/// confidence; an easy card with a low-confidence recommendation needs an
-/// explicit choice, exactly like a costly card.
-pub fn guard_for(card: &DecisionCard) -> Guard {
-    let risk = effective_risk(card);
-    if risk == Reversibility::Easy
-        && matches!(
-            card.recommended.confidence,
-            Confidence::Med | Confidence::High
-        )
-    {
-        Guard::Easy
-    } else if risk == Reversibility::Irreversible {
-        Guard::Confirm
-    } else {
-        Guard::Choose
-    }
-}
+/// The guard itself is shared with every other host.
+pub use agendar_core::guard::{Guard, effective_risk, guard_for};
 
 /// One issued prepare token.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -93,6 +93,133 @@
   flex: none;
 }
 
+.search-clear {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: none;
+  color: var(--fg3);
+}
+.search-clear:hover {
+  background: var(--sel);
+  color: var(--fg);
+}
+
+/* Search results: a popup under the field, over the page (not a page). */
+.search-wrap {
+  justify-self: center;
+  position: relative;
+  z-index: 40;
+  width: 420px;
+  max-width: 52vw;
+}
+.search-wrap .search {
+  width: 100%;
+  max-width: none;
+}
+.search mark,
+.search-panel mark {
+  background: color-mix(in srgb, var(--amber) 26%, transparent);
+  color: inherit;
+  border-radius: 3px;
+  padding: 0 1px;
+}
+.search-panel {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(560px, calc(100vw - 32px));
+  max-height: min(64vh, 540px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 6px;
+  background: var(--win);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow);
+  animation: ag-pop-in 120ms ease-out;
+}
+@keyframes ag-pop-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -4px);
+  }
+}
+.sr-group + .sr-group {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--line);
+}
+.sr-gh {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 6px 8px 3px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg2);
+}
+.sr-n {
+  font-weight: 400;
+  color: var(--fg3);
+}
+.sr-row {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
+  padding: 6px 8px;
+  border-radius: var(--radius-row);
+  cursor: default;
+}
+.sr-row[aria-selected="true"] {
+  background: var(--sel);
+}
+.sr-ic {
+  margin-top: 2px;
+  color: var(--fg3);
+}
+.sr-ic.sr-amber {
+  color: var(--amber);
+}
+.sr-ic.sr-green {
+  color: var(--green);
+}
+.sr-ic.sr-fg {
+  color: var(--fg);
+}
+.sr-text {
+  display: grid;
+  min-width: 0;
+}
+.sr-title,
+.sr-ctx {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sr-ctx {
+  font-size: 11.5px;
+  color: var(--fg2);
+}
+.sr-more {
+  display: block;
+  padding-left: 33px;
+  font-size: 12px;
+  color: var(--fg2);
+}
+.sr-none {
+  padding: 10px 10px;
+  color: var(--fg2);
+}
+
 kbd {
   font-family: var(--mono);
   font-size: 11px;
@@ -358,6 +485,27 @@ kbd {
   overflow: hidden;
 }
 
+/* The state chip of a project that is not simply working. */
+.pvar {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Stopped steps of a project that is still working: the icon and a number. */
+.prow .tr .pstop {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+  color: var(--fg3);
+  font-variant-numeric: tabular-nums;
+}
+.prow .tr .pstop .ic {
+  width: 12px;
+  height: 12px;
+}
+
 /* The finish time never shrinks; the track gives way first. */
 .prow .tr .pe {
   flex: none;
@@ -393,6 +541,13 @@ kbd {
   }
   .foot-item.foot-received {
     display: none;
+  }
+  /* Checking and Update stay, icon only. */
+  .foot-tag .foot-text {
+    display: none;
+  }
+  .foot-pill {
+    padding: 3px 5px;
   }
 }
 
@@ -454,6 +609,9 @@ kbd {
   .foot-item .foot-text {
     display: none;
   }
+  .foot-pill {
+    padding: 3px 5px;
+  }
 }
 
 .prow .t {
@@ -498,14 +656,19 @@ kbd {
   min-width: 0;
 }
 
-/* Status items wrap whole onto a second line when the sidebar is narrow. */
+/* Status items stay on one line: the footer never grows taller. When space
+   runs out the agents label gives way first, all the way to nothing; only a
+   tag wider than the whole row truncates (it never shrinks otherwise, so the
+   Update pill keeps its full version). Weighted shrink factors cannot do
+   "first": they share any shortfall between both labels. */
 .foot-status {
   flex: 1;
   min-width: 0;
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  white-space: nowrap;
   align-items: center;
-  gap: 3px 12px;
+  gap: 12px;
 }
 
 .foot-item {
@@ -513,10 +676,130 @@ kbd {
   align-items: center;
   gap: 6px;
   white-space: nowrap;
+  min-width: 0;
+  flex: none;
+}
+.foot-item.foot-agents {
+  flex: 0 1 auto;
+  overflow: hidden;
+}
+.foot-item.foot-tag {
+  flex: 0 0 auto;
+}
+.foot-item .foot-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .side-foot > .settings-btn {
   flex: none;
+}
+
+/* The footer's status tag: sync label, "checking" or the Update pill. The
+   slot crossfades its faces and morphs its width (an explicit width set from
+   the incoming face), so the neighbours never jump. */
+.foot-tag {
+  position: relative;
+  max-width: 100%;
+  overflow: hidden;
+  border-radius: 999px;
+}
+.foot-tag.foot-morph {
+  transition: width 200ms ease-out;
+}
+.foot-layer {
+  display: inline-flex;
+  align-items: center;
+  width: max-content;
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
+}
+.foot-layer.foot-out {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  pointer-events: none;
+  animation: foot-fade-out 200ms ease-out forwards;
+}
+.foot-layer.foot-in {
+  animation: foot-fade-in 200ms ease-out;
+}
+@keyframes foot-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes foot-fade-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+.foot-face {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  min-width: 0;
+  max-width: 100%;
+}
+.foot-face > .ic {
+  flex: none;
+}
+/* This computer's writes have waited two minutes for their upload. */
+.foot-face[data-upload="late"] {
+  color: var(--amber-ink);
+}
+.foot-pill {
+  margin: 0;
+  padding: 2px 9px 2px 7px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--blue);
+  color: var(--win);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.foot-pill:hover {
+  background: color-mix(in srgb, var(--blue) 86%, var(--fg));
+}
+/* Inset: the slot clips anything drawn outside the pill. */
+.foot-pill:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--win);
+}
+.foot-spin {
+  flex: none;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  border: 1.5px solid color-mix(in srgb, var(--fg2) 35%, transparent);
+  border-top-color: var(--fg2);
+  animation: foot-spin 800ms linear infinite;
+}
+@keyframes foot-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+/* Motion off (app preference or system): a static ring instead. */
+.foot-tag.foot-still .foot-spin {
+  animation: none;
+  border-color: var(--fg2);
+}
+@media (prefers-reduced-motion: reduce) {
+  .foot-spin {
+    border-color: var(--fg2);
+  }
 }
 
 .side-foot .ic {
@@ -844,6 +1127,18 @@ kbd {
   padding: 10px 16px;
   border-top: 1px solid var(--line);
   font-size: 12px;
+}
+/* The sidebar's Update pill, in the popover footer's left slot. */
+.pop-update {
+  flex: 0 1 auto;
+  padding: 4px 11px 4px 8px;
+}
+.pop-update .foot-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pop-update.foot-in {
+  animation: foot-fade-in 200ms ease-out;
 }
 
 .app-logo {

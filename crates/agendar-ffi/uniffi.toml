@@ -1,0 +1,6 @@
+# Swift module names for the generated bindings (scripts/ios-build.sh).
+[bindings.swift]
+module_name = "AgendarCore"
+ffi_module_name = "AgendarCoreFFI"
+ffi_module_filename = "AgendarCoreFFI"
+generate_module_map = true

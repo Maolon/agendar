@@ -39,9 +39,9 @@ describe("core messages", () => {
 
   it("renders the chosen language, with plurals, nested messages and lists", () => {
     inLanguage("zh-Hans");
-    expect(renderMsg(burst, "fallback")).toBe("你在 MVP 中完成了 2 个步骤，开始了 1 个步骤");
+    expect(renderMsg(burst, "fallback")).toBe("你在 MVP 里完成了 2 个步骤，开始了 1 个步骤");
     expect(renderMsg({ key: "need.reason.review", args: { age: { t: "minutes", v: 90 } } }, "x")).toBe(
-      "待审核 · 1小时",
+      "待审阅 · 1小时",
     );
     expect(
       renderMsg(

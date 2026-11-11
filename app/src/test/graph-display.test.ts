@@ -144,6 +144,9 @@ describe("graph node display", () => {
     );
     expect(isRadarCandidate({ ...feature, progress: "doing", basis: "tainted" })).toBe(false);
     expect(isRadarCandidate({ ...feature, progress: "doing", paused: true })).toBe(false);
+    // Delivered and waiting for the owner's review: not moving; sent back: the agent's again.
+    expect(isRadarCandidate({ ...feature, progress: "doing", gate: "open", phase: "in_review" })).toBe(false);
+    expect(isRadarCandidate({ ...feature, progress: "doing", gate: "open", phase: "sent_back" })).toBe(true);
     expect(isRadarCandidate({ ...feature, progress: "done" })).toBe(false);
     expect(isRadarCandidate(undefined)).toBe(false);
   });

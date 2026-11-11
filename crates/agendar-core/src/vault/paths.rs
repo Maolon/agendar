@@ -100,9 +100,12 @@ impl Vault {
     /// Open a Vault from its canonical root and validate the create-once
     /// manifest.
     pub fn open(root: &Path) -> Result<Self> {
-        let canonical = root.canonicalize().map_err(vault_not_found)?;
+        let canonical = root
+            .canonicalize()
+            .map_err(|error| vault_not_found(error, "vault_root_missing"))?;
         let manifest_path = canonical.join(MANIFEST_FILE);
-        let metadata = fs::symlink_metadata(&manifest_path).map_err(vault_not_found)?;
+        let metadata = fs::symlink_metadata(&manifest_path)
+            .map_err(|error| vault_not_found(error, "vault_missing"))?;
         if metadata.file_type().is_symlink() {
             return Err(AgendarError::validation_at(
                 "/vault.json",
@@ -138,7 +141,7 @@ impl Vault {
             .ok_or_else(|| {
                 AgendarError::validation_at(
                     "/vault.json",
-                    "vault_manifest_version",
+                    "vault_manifest_missing_version",
                     "The Vault manifest has no version field.",
                 )
             })?;
@@ -153,7 +156,7 @@ impl Vault {
         let manifest: VaultManifest = serde_json::from_value(value).map_err(|error| {
             AgendarError::validation_at(
                 "/vault.json",
-                "vault_manifest_malformed",
+                "vault_manifest_shape",
                 format!("The Vault manifest has an unexpected shape: {error}."),
             )
         })?;
@@ -197,10 +200,12 @@ pub fn contains_vault_manifest(root: &Path) -> bool {
     fs::symlink_metadata(root.join(MANIFEST_FILE)).is_ok()
 }
 
-fn vault_not_found(error: std::io::Error) -> AgendarError {
+/// `detail` says what is missing: the folder (`vault_root_missing`) or the
+/// manifest in it (`vault_missing`).
+fn vault_not_found(error: std::io::Error, detail: &str) -> AgendarError {
     if error.kind() == std::io::ErrorKind::NotFound {
         AgendarError::new(ErrorCode::NotFound, "Vault was not found.")
-            .with_detail("vault_missing")
+            .with_detail(detail)
             .with_hint(format!(
                 "Run `{} init` or supply an existing Vault path.",
                 crate::service::cli_token()

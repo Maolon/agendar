@@ -64,6 +64,139 @@ pub enum ReviewVerdict {
     SendBack,
 }
 
+/// Which side of a unified diff a commented line is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffSide {
+    Old,
+    New,
+}
+
+/// Where in a delivery's demos a review comment points. Integers only: a
+/// region is in per-mille of the image (0..=1000). `quote` is the exact text
+/// of the commented line, captured by the app from the demo blob.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReviewAnchor {
+    DiffLine {
+        demo: u8,
+        file: String,
+        side: DiffSide,
+        line: u32,
+        quote: String,
+    },
+    TranscriptLine {
+        demo: u8,
+        /// 1-based.
+        line: u32,
+        quote: String,
+    },
+    Region {
+        demo: u8,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+    },
+}
+
+impl ReviewAnchor {
+    /// The index of the demo this anchor points into.
+    pub fn demo(&self) -> u8 {
+        match self {
+            Self::DiffLine { demo, .. }
+            | Self::TranscriptLine { demo, .. }
+            | Self::Region { demo, .. } => *demo,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiffLineAnchor {
+    demo: u8,
+    file: String,
+    side: DiffSide,
+    line: u32,
+    quote: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TranscriptLineAnchor {
+    demo: u8,
+    line: u32,
+    quote: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegionAnchor {
+    demo: u8,
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
+}
+
+impl<'de> Deserialize<'de> for ReviewAnchor {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let map = object(&value, "review anchor").map_err(serde::de::Error::custom)?;
+        let kind = string(map, "kind").map_err(serde::de::Error::custom)?;
+        let mut rest = map.clone();
+        rest.remove("kind");
+        let rest = Value::Object(rest);
+        match kind {
+            "diff_line" => {
+                let body: DiffLineAnchor =
+                    from_value(&rest, "diff line anchor").map_err(serde::de::Error::custom)?;
+                Ok(Self::DiffLine {
+                    demo: body.demo,
+                    file: body.file,
+                    side: body.side,
+                    line: body.line,
+                    quote: body.quote,
+                })
+            }
+            "transcript_line" => {
+                let body: TranscriptLineAnchor = from_value(&rest, "transcript line anchor")
+                    .map_err(serde::de::Error::custom)?;
+                Ok(Self::TranscriptLine {
+                    demo: body.demo,
+                    line: body.line,
+                    quote: body.quote,
+                })
+            }
+            "region" => {
+                let body: RegionAnchor =
+                    from_value(&rest, "region anchor").map_err(serde::de::Error::custom)?;
+                Ok(Self::Region {
+                    demo: body.demo,
+                    x: body.x,
+                    y: body.y,
+                    w: body.w,
+                    h: body.h,
+                })
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "unknown review anchor kind `{other}`"
+            ))),
+        }
+    }
+}
+
+/// One short human comment pinned to a place in a delivery's demos.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewComment {
+    pub anchor: ReviewAnchor,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Criterion {
@@ -114,6 +247,12 @@ pub struct DecisionOption {
 /// The reserved option id for an answer in the human's own words. No card may
 /// declare it; only a human answer may choose it.
 pub const OWN_OPTION: &str = "own";
+
+/// The option id by which the owner lets the asking agent continue a step
+/// another agent holds. It has this meaning only on a question asked by an
+/// agent that is not the step's holder, after the holder's start; chosen by
+/// the owner, it admits that agent's start (`reduce::plan::takeover_answers`).
+pub const TAKEOVER_OPTION: &str = "takeover";
 
 /// Longest own answer, in Unicode characters.
 pub const OWN_ANSWER_MAX: usize = 600;
@@ -257,6 +396,7 @@ pub enum DemoKind {
     CliTranscript,
     PreviewUrl,
     Recording,
+    Diff,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,6 +438,41 @@ pub struct RecordingDemo {
     pub poster: BlobRef,
 }
 
+/// One hunk the agent picked, in display order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiffShown {
+    pub path: String,
+    /// 1-based index of the hunk within that file's diff.
+    pub hunk: u32,
+    pub why: String,
+}
+
+/// A changed file none of whose hunks are shown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiffFile {
+    pub path: String,
+    pub added: u32,
+    pub removed: u32,
+}
+
+/// The core of a commit's diff: the CLI cuts the picked hunks verbatim from
+/// `git show`, so `blob` holds unified-diff text of only those hunks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiffDemo {
+    pub blob: BlobRef,
+    pub commit: String,
+    pub files_total: u32,
+    pub hunks_total: u32,
+    pub added_total: u32,
+    pub removed_total: u32,
+    pub shown: Vec<DiffShown>,
+    #[serde(default)]
+    pub omitted: Vec<DiffFile>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", content = "body", rename_all = "snake_case")]
 pub enum Demo {
@@ -305,6 +480,20 @@ pub enum Demo {
     CliTranscript(CliTranscriptDemo),
     PreviewUrl(PreviewUrlDemo),
     Recording(RecordingDemo),
+    Diff(DiffDemo),
+}
+
+impl Demo {
+    /// Every Vault blob this demo references.
+    pub fn blobs(&self) -> Vec<BlobRef> {
+        match self {
+            Self::Screenshot(value) => vec![value.blob.clone()],
+            Self::CliTranscript(value) => vec![value.blob.clone()],
+            Self::PreviewUrl(_) => Vec::new(),
+            Self::Recording(value) => vec![value.blob.clone(), value.poster.clone()],
+            Self::Diff(value) => vec![value.blob.clone()],
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for Demo {
@@ -331,6 +520,9 @@ impl<'de> Deserialize<'de> for Demo {
                 .map_err(serde::de::Error::custom),
             "recording" => from_value(body, "recording demo")
                 .map(Self::Recording)
+                .map_err(serde::de::Error::custom),
+            "diff" => from_value(body, "diff demo")
+                .map(Self::Diff)
                 .map_err(serde::de::Error::custom),
             other => Err(serde::de::Error::custom(format!(
                 "unknown demo kind `{other}`"

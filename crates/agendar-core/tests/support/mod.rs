@@ -344,6 +344,19 @@ pub fn valid_event(kind: &str) -> Value {
             OPERATOR,
         ),
         "policy.set" => event(wire_kind, policy_set(), json!({}), OPERATOR),
+        "plan.dropped" => event(
+            wire_kind,
+            json!({"note": "Not needed any more."}),
+            json!({"node": "x"}),
+            OPERATOR,
+        ),
+        "need.snoozed" => event(
+            wire_kind,
+            json!({"need": format!("decide:{REF_ID}"), "revision": DIGEST,
+                   "until": "2026-01-01T01:00:00.000Z"}),
+            json!({}),
+            OPERATOR,
+        ),
         "session.lost" => event(
             wire_kind,
             json!({"session": SESSION, "process_start": 1, "reason": "exited"}),

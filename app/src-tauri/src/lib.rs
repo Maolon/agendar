@@ -11,10 +11,12 @@
 //! `Service` with this host's operator writer; the IPC wrappers never accept a
 //! writer, host or caller role from JavaScript.
 
+pub mod anchors;
 pub mod commands;
 pub mod error;
 pub mod guard;
 pub mod host;
+pub mod media;
 pub mod native;
 pub mod notifications;
 pub mod preferences;
@@ -22,6 +24,7 @@ pub mod projection;
 pub mod setup_locations;
 pub mod tray;
 pub mod ui;
+pub mod uploads;
 
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -41,7 +44,16 @@ use crate::native::{NativeSink, TauriUi, action_of};
 pub fn run() {
     let application = tauri::Builder::default()
         .plugin(tauri_plugin_positioner::init())
-        .register_uri_scheme_protocol("agendar-media", media_response)
+        // Asynchronous: the webview calls a protocol handler on the GUI
+        // thread, and a media request reads the Vault.
+        .register_asynchronous_uri_scheme_protocol("agendar-media", |ctx, request, responder| {
+            match ctx.app_handle().try_state::<commands::HostHandle>() {
+                Some(state) => media::serve(Arc::clone(&state.host), request, move |response| {
+                    responder.respond(response)
+                }),
+                None => responder.respond(media::not_found()),
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             commands::get_snapshot,
             commands::get_project,
@@ -52,6 +64,7 @@ pub fn run() {
             commands::resolve_rescue,
             commands::update_project,
             commands::update_feature,
+            commands::drop_steps,
             commands::set_policy,
             commands::set_rule,
             commands::read_report,
@@ -63,6 +76,7 @@ pub fn run() {
             commands::configure_vault,
             commands::get_setup_locations,
             commands::get_local_config,
+            commands::get_storage_usage,
             commands::test_notice,
             commands::open_report,
             commands::get_bindings,
@@ -75,6 +89,8 @@ pub fn run() {
             commands::window_chrome,
             commands::set_glass_regions,
             commands::open_preview,
+            commands::check_updates,
+            commands::open_release,
         ])
         .setup(|app| {
             let data_root = resolve_data_root()?;
@@ -102,8 +118,13 @@ pub fn run() {
                 tray::spawn_animator(app.handle().clone(), move || motion_host.motion());
             }
             spawn_watcher(Arc::clone(&host));
+            spawn_publisher(Arc::clone(&host));
             spawn_steward(Arc::clone(&host));
             spawn_notifications(Arc::clone(&host), receiver);
+            spawn_update_checker(Arc::clone(&host));
+            if host.uploads_supported() {
+                spawn_uploads(Arc::clone(&host));
+            }
             // One early refresh after the notification backend has had a chance
             // to start on the main thread; it also paints the first real state
             // even before the frontend subscribes.
@@ -142,48 +163,6 @@ pub fn run() {
     });
 }
 
-/// The verified `agendar-media` protocol. Only an opaque token path is accepted;
-/// bytes come from a Vault blob referenced by a delivery or observation.
-fn media_response(
-    ctx: tauri::UriSchemeContext<'_, tauri::Wry>,
-    request: tauri::http::Request<Vec<u8>>,
-) -> tauri::http::Response<Vec<u8>> {
-    let not_found = || {
-        tauri::http::Response::builder()
-            .status(tauri::http::StatusCode::NOT_FOUND)
-            .header("Cache-Control", "no-store")
-            .header("X-Content-Type-Options", "nosniff")
-            .body(Vec::new())
-            .unwrap_or_else(|_| tauri::http::Response::new(Vec::new()))
-    };
-    if !matches!(
-        request.method(),
-        &tauri::http::Method::GET | &tauri::http::Method::HEAD
-    ) || request.uri().query().is_some()
-    {
-        return not_found();
-    }
-    let Some(state) = ctx.app_handle().try_state::<commands::HostHandle>() else {
-        return not_found();
-    };
-    let Ok((mime, bytes)) = state.host.media_response(request.uri().path()) else {
-        return not_found();
-    };
-    tauri::http::Response::builder()
-        .status(tauri::http::StatusCode::OK)
-        .header("Content-Type", mime)
-        .header("Content-Length", bytes.len().to_string())
-        .header("Cache-Control", "no-store")
-        .header("X-Content-Type-Options", "nosniff")
-        // An SVG icon opened as a document still cannot run script.
-        .header(
-            "Content-Security-Policy",
-            "default-src 'none'; style-src 'unsafe-inline'; sandbox",
-        )
-        .body(bytes)
-        .unwrap_or_else(|_| not_found())
-}
-
 fn resolve_data_root() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
     if let Some(value) = std::env::var_os("AGENDAR_DATA_DIR") {
         return Ok(std::path::PathBuf::from(value));
@@ -209,7 +188,7 @@ fn install_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .menu(&menu)
         .show_menu_on_left_click(false)
         .tooltip(tray::tooltip(0, 0));
-    if let Some(icon) = tray::icon(0).or_else(|| app.default_window_icon().cloned()) {
+    if let Some(icon) = tray::icon(0, 1).or_else(|| app.default_window_icon().cloned()) {
         builder = builder.icon(icon).icon_as_template(tray::TEMPLATE);
     }
     let tray = builder
@@ -325,9 +304,10 @@ fn spawn_watcher(host: Arc<Host>) {
             };
             // Short wakes let a Vault switch replace the watch without waiting
             // for the 60 s reconciliation interval.
-            match watch.wait(Duration::from_secs(5)) {
+            let (outcome, changes) = watch.wait_changes(Duration::from_secs(5));
+            match outcome {
                 agendar_core::runtime::WaitOutcome::Changed => {
-                    host.watch_tick("sync");
+                    host.watch_changed(&changes);
                     next_reconcile = std::time::Instant::now() + Duration::from_secs(60);
                 }
                 agendar_core::runtime::WaitOutcome::TimedOut => {
@@ -342,11 +322,54 @@ fn spawn_watcher(host: Arc<Host>) {
     });
 }
 
+/// Publish committed writes off the command path: a command replies as soon as
+/// its Vault append is durable and wakes this thread, which converges the index
+/// and emits the change. A refresh that cannot get the index lock (an agent CLI
+/// or another process holds it) is retried shortly; it never fails the command.
+fn spawn_publisher(host: Arc<Host>) {
+    std::thread::spawn(move || {
+        while !host.is_shutdown() {
+            if !host.wait_for_publish(Duration::from_secs(5)) {
+                continue;
+            }
+            if !host.publish_pending() {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+    });
+}
+
+/// Whether this computer's own writes are uploaded: woken by a Vault change
+/// or by the next due re-read, idle otherwise (see `uploads`).
+fn spawn_uploads(host: Arc<Host>) {
+    std::thread::spawn(move || {
+        while !host.is_shutdown() {
+            host.wait_for_uploads(Duration::from_secs(5));
+            host.uploads_tick();
+        }
+    });
+}
+
 fn spawn_steward(host: Arc<Host>) {
     std::thread::spawn(move || {
         while !host.is_shutdown() {
             host.steward_tick();
             std::thread::sleep(Duration::from_secs(30));
+        }
+    });
+}
+
+/// Look for a newer release shortly after launch, then every six hours, only
+/// while the person allows it. Nothing is installed.
+fn spawn_update_checker(host: Arc<Host>) {
+    std::thread::spawn(move || {
+        let mut next = std::time::Instant::now() + Duration::from_secs(15);
+        while !host.is_shutdown() {
+            if std::time::Instant::now() >= next {
+                host.background_update_check();
+                next = std::time::Instant::now() + agendar_core::update::CHECK_INTERVAL;
+            }
+            std::thread::sleep(Duration::from_secs(5));
         }
     });
 }

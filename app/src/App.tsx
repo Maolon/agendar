@@ -2,15 +2,18 @@ import { needQuestion } from "./i18n/msg";
 import { I18nProvider, tx } from "./i18n";
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import type { AgendarClient, Surface } from "./api/client";
-import { cardRisk, guardFor, newRequestId, optionById } from "./api/format";
+import { cardRisk, formatDayClock, guardFor, newRequestId, optionById } from "./api/format";
 import { ClientContext, StoreContext, type SnapshotStore, useStoreState } from "./api/store";
 import type {
   AnswerDecisionData,
   DecisionState,
   NeedsYouItem,
   ProjectState,
+  ReportState,
 } from "./api/types";
 import { ErrorState } from "./components/ErrorState";
+import { graphNodeElementId } from "./components/Graph";
+import { ReportPanel } from "./components/Report";
 import { Setup } from "./components/Setup";
 import { Shell } from "./components/Shell";
 import { sidebarRows } from "./components/Sidebar";
@@ -25,11 +28,12 @@ import {
   SnoozeContext,
   activeNeeds,
   isDismissed,
-  snoozeEnd,
+  snoozeOffers,
   snoozedUntil,
   type SnoozeApi,
   type SnoozeChoice,
 } from "./state/snooze";
+import type { SearchTarget } from "./state/search";
 import { initialUiState, uiReducer, type Selection } from "./state/ui";
 import type { MessageKey } from "./i18n/messages";
 import { Brief } from "./views/Brief";
@@ -52,10 +56,6 @@ interface AppProps {
 }
 
 const SETUP_CODES = new Set(["E_CONTEXT", "E_NOT_CONFIGURED", "E_SETUP_REQUIRED"]);
-
-function matchesFilter(value: string, text: string): boolean {
-  return !text || value.toLowerCase().includes(text);
-}
 
 /**
  * A `decide` need points at its ask; a `confirm` need may point at the assumed
@@ -96,6 +96,10 @@ export function App({ client, store, surface }: AppProps) {
   const previousNeeds = useRef<string[]>([]);
   /** Accept action of the delivery view, for Cmd/Ctrl-Enter. */
   const reviewPrimary = useRef<(() => void) | null>(null);
+  /** A report opened from search, read in the in-app panel over its project. */
+  const [searchReport, setSearchReport] = useState<{ project: string; report: ReportState } | null>(null);
+  /** Pending scroll to a search result once its view has rendered. */
+  const revealFrame = useRef<number | null>(null);
 
   const snapshot = state.snapshot;
   const canMutate = state.phase === "ready" && snapshot !== null;
@@ -152,11 +156,12 @@ export function App({ client, store, surface }: AppProps) {
     setToast((current) => (current?.tone === "warn" ? null : current));
   }, [confirmLabel, showToast]);
 
-  /** Write one snooze entry; it needs no whole-preferences revision. */
+  /** Write one snooze event, then read the state that now carries it. */
   const writeSnooze = useCallback(
-    async (itemId: string, until: string): Promise<void> => {
+    async (itemId: string, until: string): Promise<string> => {
       const data = await client.snoozeNeed({ request_id: newRequestId(), item_id: itemId, until });
-      store.applyPreferences(data.preferences);
+      await store.refresh();
+      return data.snoozed_until;
     },
     [client, store],
   );
@@ -166,11 +171,14 @@ export function App({ client, store, surface }: AppProps) {
         until: (id) => snoozedUntil(snapshot, id),
         open: ui.snooze_dialog,
         setOpen: (id) => dispatch({ type: "set_snooze_dialog", item: id }),
-        snooze: async (id, choice) => {
+        offers: (id) => snoozeOffers(snapshot.needs.find((item) => item.id === id)?.snooze_limit),
+        snooze: async (id, offer) => {
           try {
-            await writeSnooze(id, snoozeEnd(choice));
+            const until = await writeSnooze(id, offer.until);
             dispatch({ type: "set_snooze_dialog", item: null });
-            showToast(tx(SNOOZED_TOAST[choice]));
+            // The host's time is the one that holds: it may have cut the snooze.
+            const cut = offer.cut || Date.parse(until) < Date.parse(offer.until);
+            showToast(cut ? tx("snooze.done.until", { t: formatDayClock(until) }) : tx(SNOOZED_TOAST[offer.choice]));
           } catch (cause) {
             showToast(cause instanceof Error ? cause.message : tx("tray.failed"), { tone: "alert" });
           }
@@ -187,7 +195,7 @@ export function App({ client, store, surface }: AppProps) {
         },
         restore: async (id) => {
           try {
-            // A time already passed ends the snooze; the host drops it.
+            // A time already passed ends the snooze.
             await writeSnooze(id, snapshot.state.evaluated_at);
             showToast(tx("snooze.restored"));
           } catch (cause) {
@@ -269,6 +277,13 @@ export function App({ client, store, surface }: AppProps) {
     store.acknowledgeFocus(focus.sequence);
   }, [setupShown, showToast, snapshot, state.focus, store]);
 
+  // The tray's Update button: open Settings › About here.
+  useEffect(() => {
+    if (setupShown || !state.navigate) return;
+    dispatch({ type: "select", selection: { kind: "settings", id: state.navigate.tab } });
+    store.clearNavigate();
+  }, [setupShown, state.navigate, store]);
+
   useEffect(() => {
     if (!restoreMainFocus.current || setupShown || surface === "popover") return;
     restoreMainFocus.current = false;
@@ -331,18 +346,14 @@ export function App({ client, store, surface }: AppProps) {
       return;
     }
     const index = previousNeeds.current.indexOf(selected);
-    const text = ui.filter.trim().toLowerCase();
-    const visible = active.filter(
-      (item) => matchesFilter(item.question, text) || matchesFilter(item.project, text),
-    );
     const fallback =
-      visible[Math.min(Math.max(index, 0), visible.length - 1)] ?? visible[0] ?? null;
+      active[Math.min(Math.max(index, 0), active.length - 1)] ?? active[0] ?? null;
     previousNeeds.current = ids;
     dispatch({
       type: "select",
       selection: fallback ? { kind: "need", id: fallback.id } : null,
     });
-  }, [snapshot, ui.filter, ui.selection]);
+  }, [snapshot, ui.selection]);
 
   const need: NeedsYouItem | undefined =
     ui.selection?.kind === "need" && snapshot
@@ -364,7 +375,7 @@ export function App({ client, store, surface }: AppProps) {
   const explicit = decision ? (ui.explicit_selection_by_ask[decision.id] ?? false) : false;
   const plainEnter = canMutate && action.canPlainEnter(decision, chosen);
 
-  const rows = snapshot ? sidebarRows(snapshot, ui.filter, ui.quiet_open) : [];
+  const rows = snapshot ? sidebarRows(snapshot, ui.quiet_open) : [];
   const optionCount = decision?.card.options.length ?? 0;
 
   function scrollRowIntoView(selection: Selection | null): void {
@@ -382,6 +393,107 @@ export function App({ client, store, surface }: AppProps) {
     dispatch({ type: "select", selection });
     scrollRowIntoView(selection);
   }
+
+  /**
+   * Scroll the first element found to the middle of the view. The project page
+   * loads its plan and opens the lane after the selection, so look for up to
+   * about two seconds of frames.
+   */
+  function reveal(finders: (() => Element | null | undefined)[]): void {
+    if (revealFrame.current !== null) window.cancelAnimationFrame(revealFrame.current);
+    let frames = 0;
+    const tick = () => {
+      revealFrame.current = null;
+      for (const find of finders) {
+        const element = find();
+        if (element) {
+          element.scrollIntoView?.({ block: "center", behavior: motion ? "smooth" : "auto" });
+          return;
+        }
+      }
+      frames += 1;
+      if (frames < 120) revealFrame.current = window.requestAnimationFrame(tick);
+    };
+    revealFrame.current = window.requestAnimationFrame(tick);
+  }
+
+  function byData(name: string, value: string): () => Element | null {
+    return () =>
+      [...document.querySelectorAll<HTMLElement>(`[data-${name}]`)].find(
+        (element) => element.getAttribute(`data-${name}`) === value,
+      ) ?? null;
+  }
+
+  /** Show one project with a plan node selected (its lane opens) and in view. */
+  function revealInPlan(project: string, node: string, first?: () => Element | null): void {
+    select({ kind: "project", id: project });
+    dispatch({ type: "select_graph_node", project, node });
+    reveal([...(first ? [first] : []), () => document.getElementById(graphNodeElementId(node))]);
+  }
+
+  /**
+   * Each search result opens the best view that already exists: a need its
+   * card, a step its node in the plan, a decision its card while it waits,
+   * else its step in the plan, a report the in-app reader, a delivery its
+   * review while pending, else its card under Activity.
+   */
+  function openSearchResult(target: SearchTarget): void {
+    if (!snapshot) return;
+    switch (target.kind) {
+      case "need":
+        select({ kind: "need", id: target.id });
+        return;
+      case "project":
+        select({ kind: "project", id: target.project });
+        return;
+      case "step":
+        revealInPlan(target.project, `feature:${target.node}`, byData("step-node", target.node));
+        return;
+      case "decision": {
+        const project = snapshot.state.projects[target.project];
+        const need = snapshot.needs.find(
+          (item) => item.project === target.project && decisionForNeed(project, item)?.id === target.id,
+        );
+        if (need) {
+          select({ kind: "need", id: need.id });
+          return;
+        }
+        // The plan draws a decision only while it waits on someone (a need or
+        // an assumption); an answered one shows through the step it decided.
+        const decision = project?.decisions[target.id];
+        if (!decision) select({ kind: "project", id: target.project });
+        else if (decision.mode === "assume") revealInPlan(target.project, `decision:${decision.id}`);
+        else revealInPlan(target.project, `feature:${decision.node}`, byData("step-node", decision.node));
+        return;
+      }
+      case "report":
+        select({ kind: "project", id: target.project });
+        setSearchReport({ project: target.project, report: target.report });
+        return;
+      case "delivery": {
+        const need = snapshot.needs.find(
+          (item) => item.project === target.project && item.kind === "review" && item.source === target.id,
+        );
+        if (need) {
+          select({ kind: "need", id: need.id });
+          return;
+        }
+        // A reviewed delivery is not drawn in the plan: its card under
+        // Activity comes into view and its step is selected in the plan.
+        const delivery = snapshot.state.projects[target.project]?.deliveries[target.id];
+        if (!delivery) select({ kind: "project", id: target.project });
+        else revealInPlan(target.project, `feature:${delivery.node}`, byData("delivery", delivery.id));
+        return;
+      }
+    }
+  }
+
+  useEffect(
+    () => () => {
+      if (revealFrame.current !== null) window.cancelAnimationFrame(revealFrame.current);
+    },
+    [],
+  );
 
   function selectOption(optionId: string): void {
     if (!decision) return;
@@ -491,7 +603,9 @@ export function App({ client, store, surface }: AppProps) {
     if (ui.selection?.kind === "settings") {
       return (
         <Settings
+          key={ui.selection.id}
           snapshot={snapshot}
+          initialTab={ui.selection.id === "about" ? "about" : "general"}
           onPreferences={(preferences) => store.applyPreferences(preferences)}
           onRefresh={() => void store.refresh()}
         />
@@ -638,7 +752,7 @@ export function App({ client, store, surface }: AppProps) {
         />
       );
     }
-    return <Brief snapshot={snapshot} onSelect={select} />;
+    return <Brief snapshot={snapshot} onSelect={select} motion={motion} />;
   }
 
   const setupDetail = (field: string): string | undefined =>
@@ -775,6 +889,7 @@ export function App({ client, store, surface }: AppProps) {
             pulses={pulseFeed.flashes}
             searchRef={searchRef}
             onFilter={(text) => dispatch({ type: "filter", text })}
+            onSearchOpen={openSearchResult}
             onSelect={select}
             onToggleQuiet={() => dispatch({ type: "toggle_quiet" })}
             onOpenSettings={() => select({ kind: "settings", id: "local" })}
@@ -784,6 +899,14 @@ export function App({ client, store, surface }: AppProps) {
           >
             {renderView()}
           </Shell>
+          {searchReport ? (
+            <ReportPanel
+              project={searchReport.project}
+              blob={searchReport.report.report}
+              title={searchReport.report.title}
+              onClose={() => setSearchReport(null)}
+            />
+          ) : null}
           <Toast toast={toast} />
         </div>
       </SnoozeContext.Provider>

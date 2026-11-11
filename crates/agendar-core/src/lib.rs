@@ -9,13 +9,19 @@
 //! runtime and harness hook protocol.
 
 pub mod adapters;
+pub mod anchors;
+pub mod board;
 pub mod error;
+pub mod guard;
 pub mod index;
 pub mod model;
+pub mod owed;
 pub mod reduce;
 pub mod runtime;
 pub mod service;
+pub mod update;
 pub mod vault;
+pub mod verdict;
 
 pub use error::{AgendarError, ErrorCode, Result};
 pub use model::*;

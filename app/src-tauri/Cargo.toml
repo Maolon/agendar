@@ -31,9 +31,18 @@ serde.workspace = true
 serde_json.workspace = true
 ulid.workspace = true
 
+# The iCloud upload flag of this host's own files (`src/uploads/icloud.rs`),
+# through objc2's safe NSURL calls.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "=0.6.5"
+objc2-foundation = { version = "=0.3.2", features = ["NSArray", "NSDictionary", "NSError", "NSString", "NSURL", "NSValue"] }
+
 [dev-dependencies]
 # The delivery input parser itself: a proposed check reaches the app exactly as
 # `agendar deliver --json` writes it (local proposal journal), not a copy.
 agendar-cli = { path = "../../crates/agendar-cli" }
+# The UniFFI facade for mobile clients: a review written through it must be
+# the event this host writes for the same review (`tests/backend.rs`).
+agendar-ffi = { path = "../../crates/agendar-ffi" }
 tempfile.workspace = true
 serde_json.workspace = true

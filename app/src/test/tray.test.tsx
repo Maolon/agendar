@@ -197,7 +197,7 @@ describe("tray popover", () => {
     const user = userEvent.setup();
     const client = new FakeClient();
     const snapshot = makeSnapshot();
-    snapshot.preferences.snoozed = { "need-one": "2026-02-10T16:00:00.000Z" };
+    snapshot.needs.find((need) => need.id === "need-one")!.snoozed_until = "2026-02-10T16:00:00.000Z";
     render(<Harness client={client} snapshot={snapshot} />);
     expect(screen.queryByText("How should answers reach idle agents?")).toBeNull();
     await user.keyboard("{Escape}");
@@ -248,5 +248,53 @@ describe("tray popover", () => {
     render(<Harness client={client} snapshot={makeSnapshot()} onOpen={onOpen} />);
     await user.click(screen.getByRole("button", { name: "Open Agendar" }));
     expect(onOpen).toHaveBeenCalledWith(null);
+  });
+
+  it("puts the Update pill in the footer's left slot and opens Settings › About", async () => {
+    const user = userEvent.setup();
+    const client = new FakeClient();
+    const snapshot = makeSnapshot();
+    snapshot.update = {
+      current: "0.1.0",
+      channel: "release",
+      latest: "0.2.0",
+      available: true,
+      url: "https://github.com/Maolon/agendar/releases/tag/v0.2.0",
+      published_at: "2026-11-01T10:00:00Z",
+      checked_at: "2026-11-09T11:00:00.000Z",
+      enabled: true,
+    };
+    const { container } = render(<Harness client={client} snapshot={snapshot} />);
+    const foot = container.querySelector(".pop-foot")!;
+    expect(foot.textContent).not.toMatch(/Updated \d\d:\d\d/);
+    await user.click(screen.getByRole("button", { name: "Update 0.2.0" }));
+    await waitFor(() =>
+      expect(client.calls.map((call) => call.command)).toEqual(
+        expect.arrayContaining(["show_main", "hide_popover"]),
+      ),
+    );
+    expect(client.calls.find((call) => call.command === "show_main")?.request).toEqual({ view: "about" });
+  });
+
+  it("keeps the Updated time for a local build or when nothing is newer", () => {
+    const client = new FakeClient();
+    for (const patch of [{ channel: "dev" as const }, { available: false }]) {
+      const snapshot = makeSnapshot();
+      snapshot.update = {
+        current: "0.1.0",
+        channel: "release",
+        latest: "0.2.0",
+        available: true,
+        url: "https://github.com/Maolon/agendar/releases/tag/v0.2.0",
+        published_at: "2026-11-01T10:00:00Z",
+        checked_at: "2026-11-09T11:00:00.000Z",
+        enabled: true,
+        ...patch,
+      };
+      const { container, unmount } = render(<Harness client={client} snapshot={snapshot} />);
+      expect(container.querySelector(".pop-update")).toBeNull();
+      expect(container.querySelector(".pop-foot")?.textContent).toMatch(/Updated \d\d:\d\d/);
+      unmount();
+    }
   });
 });

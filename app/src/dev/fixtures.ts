@@ -13,6 +13,7 @@ import type {
   DecisionCard,
   DecisionState,
   DeliveryState,
+  Demo,
   FeatureState,
   Graph,
   GraphEdge,
@@ -23,6 +24,7 @@ import type {
   Receipt,
   Snapshot,
 } from "../api/types";
+import { RECEIPT_FREE_DIFF } from "./diffExcerpt";
 
 const EVALUATED_AT = "2026-02-10T15:00:00.000Z";
 const ASK_SINCE = "2026-02-10T14:22:00.000Z";
@@ -37,6 +39,43 @@ export function sha(n: number): string {
 /** Deterministic 26-char uppercase ULID-shaped token (fixtures only). */
 export function ulid(n: number): string {
   return `01J${String(n).padStart(23, "0")}`;
+}
+
+/**
+ * A ULID-shaped token whose time part encodes `iso`, so the home page can tell
+ * when a fixture delivery was accepted (fixtures only).
+ */
+export function ulidAt(iso: string, n: number): string {
+  const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+  let time = Date.parse(iso);
+  let head = "";
+  for (let index = 0; index < 10; index += 1) {
+    head = alphabet[time % 32]! + head;
+    time = Math.floor(time / 32);
+  }
+  return `${head}${String(n).padStart(16, "0")}`;
+}
+
+/** Accepted since the last look: the home page's "Done since you looked". */
+const ACCEPTED_RELATIONS = ulidAt("2026-02-10T14:30:00.000Z", 1);
+const ACCEPTED_OBJECTS = ulidAt("2026-02-10T13:10:00.000Z", 2);
+
+function acceptedDelivery(id: string, node: string, name: string, n: number): DeliveryState {
+  return {
+    id,
+    node,
+    attempt: ulid(n),
+    name,
+    demos: [],
+    criteria: [],
+    disclosure: { proven: [], not_proven_yet: [], faked_for_now: [] },
+    review: "accepted",
+    review_event: id,
+    review_history: [id],
+    review_frontier: [id],
+    review_conflict: false,
+    revision: sha(0xc0 + (n % 16)),
+  };
 }
 
 export const BALANCED: PolicySet = {
@@ -91,6 +130,14 @@ export function feature(partial: Partial<FeatureState> & Pick<FeatureState, "nod
   };
 }
 
+/** The design note the IPC question links; the project lists it under Reports. */
+const IPC_REPORT_BLOB: BlobRef = {
+  host: "h-01h0000000000000000000000",
+  sha256: sha(0x79),
+  ext: "html",
+  bytes: 6400,
+};
+
 const IPC_CARD: DecisionCard = {
   why_now: "Two agents are blocked in their Stop hook until this is decided.",
   question: "How should answers reach idle agents?",
@@ -140,6 +187,7 @@ const IPC_CARD: DecisionCard = {
     { id: "wakes", text: "A finished session wakes and applies the receipt" },
   ],
   on_timeout: { kind: "proceed_as_assumption", after_s: 14400 },
+  report: IPC_REPORT_BLOB,
 };
 
 const HISTORY_CARD: DecisionCard = {
@@ -260,6 +308,8 @@ const RESCUE_NEED: NeedsYouItem = {
 const SESSION = ulid(201);
 const SECOND_SESSION = ulid(204);
 const THIRD_SESSION = ulid(205);
+/** The agent that stopped mid-way on Meridian while another keeps working. */
+const MERIDIAN_LOST_SESSION = ulid(207);
 /** Session a fixture-simulated start attaches to (see fixtureTransport). */
 export const FIXTURE_STARTED_SESSION = ulid(206);
 
@@ -347,6 +397,7 @@ export function simpleProject(input: {
   glyph: string;
   variance: ProjectState["summary"]["variance"];
   active_agents?: number;
+  stopped_steps?: number;
   features?: Record<string, FeatureState>;
   calibration?: ProjectState["summary"]["calibration"];
   sessions?: ProjectState["sessions"];
@@ -354,6 +405,8 @@ export function simpleProject(input: {
   needs?: NeedsYouItem[];
   decisions?: ProjectState["decisions"];
   receipts?: ProjectState["receipts"];
+  deliveries?: ProjectState["deliveries"];
+  activity?: ProjectState["activity"];
 }): ProjectState {
   const features = input.features ?? {};
   const needsYou = input.needs ?? [];
@@ -367,6 +420,7 @@ export function simpleProject(input: {
       archived: false,
       variance: input.variance,
       active_agents: input.active_agents ?? 0,
+      ...(input.stopped_steps ? { stopped_steps: input.stopped_steps } : {}),
       stalled_agents: needsYou.reduce((total, item) => total + item.stalled_agents, 0),
       needs_count: needsYou.length,
       feature_counts: counts(features),
@@ -385,7 +439,8 @@ export function simpleProject(input: {
     features,
     decisions: input.decisions ?? {},
     receipts: input.receipts ?? {},
-    deliveries: {},
+    deliveries: input.deliveries ?? {},
+    ...(input.activity ? { activity: input.activity } : {}),
     rules: [],
     policy: { value: BALANCED, revision: sha(0x6a) },
     sessions: input.sessions ?? {},
@@ -593,6 +648,192 @@ const ALIAS_DECISION: DecisionState = {
   revision: sha(0x34),
 };
 
+// --- Receipt-free delivery with a core diff --------------------------------
+// Finished work no decision asked for: no receipt, no criteria, one diff demo
+// cut from a real commit of this repository.
+
+const DIFF_DELIVERY = ulid(421);
+
+/** The diff excerpt blob; `fixtureTransport` serves its text. */
+export const DIFF_BLOB: BlobRef = {
+  host: "h-01h0000000000000000000000",
+  sha256: sha(0x8d),
+  ext: "txt",
+  bytes: 2593,
+};
+
+/** `cargo test` output for the receipt-free delivery; `fixtureTransport` serves it. */
+const RECEIPT_FREE_TRANSCRIPT: BlobRef = {
+  host: "h-01h0000000000000000000000",
+  sha256: sha(0x8e),
+  ext: "txt",
+  bytes: 412,
+};
+
+// The version sent back before it: same diff and screenshot, an older
+// transcript. The current one supersedes it and replies to the send-back.
+const DIFF_PREVIOUS = ulid(418);
+
+/** The earlier, failing transcript; `fixtureTransport` serves it. */
+export const RECEIPT_FREE_OLD_TRANSCRIPT: BlobRef = {
+  host: "h-01h0000000000000000000000",
+  sha256: sha(0x8f),
+  ext: "txt",
+  bytes: 236,
+};
+
+const DIFF_PREVIOUS_VALUE: DeliveryState = {
+  id: DIFF_PREVIOUS,
+  node: "core/receipt-free",
+  attempt: ulid(321),
+  name: "receipt-free delivery",
+  demos: [
+    { kind: "diff", body: { blob: DIFF_BLOB, ...RECEIPT_FREE_DIFF } },
+    { kind: "cli_transcript", body: { blob: RECEIPT_FREE_OLD_TRANSCRIPT } },
+    { kind: "screenshot", body: { blob: SCREENSHOT_BLOB, alt: "The delivery under review" } },
+  ],
+  criteria: [],
+  disclosure: {
+    proven: ["A receipt-free delivery reaches review"],
+    not_proven_yet: ["Criteria are rejected without a receipt"],
+    faked_for_now: [],
+  },
+  review: "pending",
+  review_history: [ulid(388)],
+  review_frontier: [],
+  review_conflict: false,
+  superseded_by: DIFF_DELIVERY,
+  sent_back: {
+    review: ulid(388),
+    at: "2026-02-10T13:05:00.000Z",
+    reason: "The criteria check is not tested.",
+    comments: [
+      {
+        anchor: {
+          kind: "diff_line",
+          demo: 0,
+          file: "crates/agendar-core/src/model/validate.rs",
+          side: "new",
+          line: 1272,
+          quote: "    if event.refs.receipt.is_none() && !body.criteria.is_empty() {",
+        },
+        text: "Is this covered by a test?",
+      },
+      {
+        anchor: {
+          kind: "transcript_line",
+          demo: 1,
+          line: 7,
+          quote: "test a_receipt_free_delivery_lists_no_criteria ... FAILED",
+        },
+        text: "This one fails.",
+      },
+      {
+        anchor: { kind: "region", demo: 2, x: 80, y: 120, w: 420, h: 180 },
+        text: "Label is cut off.",
+      },
+    ],
+  },
+  revision: sha(0x96),
+};
+
+const DIFF_DELIVERY_VALUE: DeliveryState = {
+  id: DIFF_DELIVERY,
+  node: "core/receipt-free",
+  attempt: ulid(321),
+  name: "receipt-free delivery",
+  // All three commentable demo kinds on one review page.
+  demos: [
+    { kind: "diff", body: { blob: DIFF_BLOB, ...RECEIPT_FREE_DIFF } },
+    { kind: "cli_transcript", body: { blob: RECEIPT_FREE_TRANSCRIPT } },
+    { kind: "screenshot", body: { blob: SCREENSHOT_BLOB, alt: "The delivery under review" } },
+  ],
+  criteria: [],
+  disclosure: {
+    proven: ["A receipt-free delivery reaches review", "Criteria are rejected without a receipt"],
+    not_proven_yet: [],
+    faked_for_now: [],
+  },
+  review: "pending",
+  review_history: [],
+  review_frontier: [],
+  review_conflict: false,
+  supersedes: DIFF_PREVIOUS,
+  replies: [
+    { text: "Added the missing test; both pass now." },
+    { comment: 2, text: "Fixed: criteria are cleared before the check." },
+  ],
+  revision: sha(0x92),
+};
+
+// Earlier, already reviewed deliveries on the same project, so the Activity
+// cards show their newest-first limit and "Show all". Ids are ULIDs older than
+// the pending diff delivery; demos mix screenshot, diff and transcript.
+const REVIEWED_NAMES: [string, DeliveryState["review"], Demo["kind"][]][] = [
+  ["ask command", "accepted", ["cli_transcript"]],
+  ["answer from the menu bar", "accepted", ["screenshot"]],
+  ["ack round-trip", "accepted", ["diff"]],
+  ["needs-you tray", "accepted", ["cli_transcript", "screenshot"]],
+  ["hook installer", "sent_back", ["cli_transcript"]],
+  ["hook installer, second try", "accepted", ["diff", "cli_transcript"]],
+  ["menu bar badge", "accepted", ["screenshot"]],
+  ["wake via hooks", "accepted", ["diff"]],
+];
+
+function reviewedDemo(kind: Demo["kind"]): Demo {
+  if (kind === "screenshot") {
+    return { kind, body: { blob: SCREENSHOT_BLOB, alt: "The menu bar with one question waiting" } };
+  }
+  if (kind === "diff") return { kind, body: { blob: DIFF_BLOB, ...RECEIPT_FREE_DIFF } };
+  return { kind, body: { blob: TRANSCRIPT_BLOB } };
+}
+
+const REVIEWED_DELIVERIES: DeliveryState[] = REVIEWED_NAMES.map(([name, review, kinds], index) => ({
+  id: ulid(410 + index),
+  node: "core/ask",
+  attempt: ulid(330 + index),
+  name,
+  demos: kinds.map(reviewedDemo),
+  criteria:
+    index % 3 === 1
+      ? [
+          {
+            criterion: { id: "works", text: "It works end to end" },
+            agent_result: "passed",
+            ...(index % 2 ? { seen_result: "passed" as const, observation: ulid(360 + index) } : {}),
+            provenance: index % 2 ? ("seen" as const) : ("agent_says" as const),
+            conflict: false,
+            observation_history: index % 2 ? [ulid(360 + index)] : [],
+            observation_frontier: index % 2 ? [ulid(360 + index)] : [],
+          },
+        ]
+      : [],
+  disclosure: { proven: [], not_proven_yet: [], faked_for_now: [] },
+  review,
+  review_event: ulid(380 + index),
+  review_history: [ulid(380 + index)],
+  review_frontier: [ulid(380 + index)],
+  review_conflict: false,
+  revision: sha(0xa0 + index),
+}));
+
+const DIFF_NEED: NeedsYouItem = {
+  id: "review:agendar-receipt-free",
+  kind: "review",
+  project: "agendar",
+  node: "core/receipt-free",
+  source: DIFF_DELIVERY,
+  question: "Review receipt-free delivery",
+  since: "2026-02-10T14:45:00.000Z",
+  stalled_agents: 0,
+  waiting_minutes: 15,
+  weight_x2: 2,
+  score_x2: 0,
+  reason: "Ready for review · 15m",
+  unblocks: [],
+  revision: sha(0x45),
+};
+
 // --- Assumption fixture ----------------------------------------------------
 // One live, unconfirmed assumption on screen-clips: the agent kept WebM and two
 // features are built on that choice, so the assumptions view can be demoed.
@@ -673,6 +914,8 @@ const LEDGER_FEATURES: Record<string, FeatureState> = Object.fromEntries(
         liveness: progress === "doing" ? "live" : "quiet",
         depends_on: i % 8 ? [`log/step-${String(i).padStart(2, "0")}`] : [],
         ...(i < 89 ? { attempt: ulid(3000 + i) } : {}),
+        // The last three were declared by an agent and never touched since.
+        ...(i >= 93 ? { untouched: true } : {}),
       }),
     ];
   }),
@@ -690,8 +933,8 @@ const PROJECTS: Record<string, ProjectState> = {
       variance: "active",
       active_agents: 2,
       stalled_agents: 2,
-      needs_count: 1,
-      feature_counts: { verified: 2, doing: 1, planned: 1 },
+      needs_count: 2,
+      feature_counts: { verified: 1, doing: 2, planned: 2, done: 1 },
       last_event: "2026-02-10T14:59:00.000Z",
       host_as_of: { "h-01h0000000000000000000000": "2026-02-10T14:59:00.000Z" },
       budget: {
@@ -768,10 +1011,75 @@ const PROJECTS: Record<string, ProjectState> = {
           paused: false,
         },
       }),
+      "core/receipt-free": feature({
+        node: "core/receipt-free",
+        title: "Deliver without a receipt",
+        slice: "Slice 1 · Delivery",
+        // Delivered and waiting for the owner's review: in review, not late.
+        progress: "doing",
+        phase: "in_review",
+        liveness: "quiet",
+        attempt: ulid(321),
+        session: ulid(312),
+      }),
     },
+    activity: [
+      {
+        ts: "2026-02-10T14:52:00.000Z",
+        actor: "Claude Code",
+        actor_kind: "agent",
+        icon: "radio",
+        text: "Claude Code: Wiring the tray list to the ranked needs",
+        msg: {
+          key: "act.pulse",
+          args: {
+            actor: { t: "text", v: "Claude Code" },
+            message: { t: "text", v: "Wiring the tray list to the ranked needs" },
+          },
+        },
+        detail: "Menu bar triage",
+        node: "core/menubar",
+        count: 1,
+      },
+      {
+        ts: "2026-02-10T13:40:00.000Z",
+        actor: "Claude Code",
+        actor_kind: "agent",
+        icon: "check",
+        text: "Claude Code finished Deliver without a receipt",
+        msg: {
+          key: "act.finished",
+          args: {
+            actor: { t: "text", v: "Claude Code" },
+            step: { t: "text", v: "Deliver without a receipt" },
+          },
+        },
+        node: "core/receipt-free",
+        count: 1,
+      },
+    ],
     decisions: { [IPC_DECISION.id]: IPC_DECISION },
     receipts: {},
-    deliveries: {},
+    deliveries: {
+      ...Object.fromEntries(REVIEWED_DELIVERIES.map((delivery) => [delivery.id, delivery])),
+      [DIFF_PREVIOUS]: DIFF_PREVIOUS_VALUE,
+      [DIFF_DELIVERY]: DIFF_DELIVERY_VALUE,
+    },
+    reports: [
+      {
+        id: ulid(953),
+        node: "core/ipc",
+        title: "Waking idle agents: three ways compared",
+        summary:
+          "Harness hooks wake Claude Code and Codex within a second and need no extra process; an inbox waits for the next run; a daemon wakes anything but must be supervised.",
+        report: IPC_REPORT_BLOB,
+        kind: "proposal",
+        domain: "arch",
+        ts: "2026-02-10T14:20:00.000Z",
+        session: SESSION,
+        harness: "claude_code",
+      },
+    ],
     rules: [
       {
         value: { rule_id: "no-sqlite-in-vault", text: "Never put SQLite in the Vault", enabled: true },
@@ -801,7 +1109,7 @@ const PROJECTS: Record<string, ProjectState> = {
         stalled_on: [],
       },
     },
-    needs_you: [IPC_NEED],
+    needs_you: [IPC_NEED, DIFF_NEED],
     field_revisions: { goal: sha(0x7d) },
   },
   panes: {
@@ -988,6 +1296,8 @@ const PROJECTS: Record<string, ProjectState> = {
         summary:
           "Prefix match beats fuzzy for short aliases; fuzzy only helps past 6 characters.\nRecommend prefix first, fuzzy as a fallback.",
         report: { host: "h-01h0000000000000000000000", sha256: sha(0x77), bytes: 4200, ext: "html" },
+        kind: "proposal",
+        domain: "code",
         ts: "2026-02-10T14:40:00.000Z",
         session: ulid(203),
         harness: "codex",
@@ -997,6 +1307,8 @@ const PROJECTS: Record<string, ProjectState> = {
         title: "Download limit audit",
         summary: "No path exceeds the daily limit; the retry loop counts each attempt once.",
         report: { host: "h-01h0000000000000000000000", sha256: sha(0x78), bytes: 1800, ext: "md" },
+        kind: "finding",
+        domain: "code",
         ts: "2026-02-10T13:05:00.000Z",
         session: ulid(203),
         harness: "codex",
@@ -1128,10 +1440,13 @@ const PROJECTS: Record<string, ProjectState> = {
     slug: "meridian",
     title: "Meridian",
     brief: "Model builder from project evidence",
-    goal: "Build M1–M7 from a code tree",
+    goal: "Index cross-file references from a code tree",
     glyph: "circle-dot",
+    // Mixed state: one step is being done by a live agent while another
+    // stopped mid-way. The project stays active and carries the count.
     variance: "active",
     active_agents: 1,
+    stopped_steps: 1,
     features: {
       "model/objects": feature({
         node: "model/objects",
@@ -1183,8 +1498,53 @@ const PROJECTS: Record<string, ProjectState> = {
           paused: false,
         },
       }),
+      "model/report": feature({
+        node: "model/report",
+        title: "Report which relations have no evidence",
+        slice: "Slice 5 · Report",
+        depends_on: ["model/relations"],
+      }),
+      "model/export": feature({
+        node: "model/export",
+        title: "Export the model as JSON",
+        slice: "Slice 5 · Export",
+      }),
+      "model/audit": feature({
+        node: "model/audit",
+        title: "Audit the evidence links",
+        slice: "Slice 4 · Audit",
+        progress: "doing",
+        gate: "open",
+        liveness: "lost",
+        depends_on: ["model/relations"],
+        session: MERIDIAN_LOST_SESSION,
+        attempt: ulid(317),
+      }),
     },
     calibration: [{ harness: "claude_code", samples: 6, ratio_milli: 1500 }],
+    deliveries: {
+      [ACCEPTED_RELATIONS]: acceptedDelivery(ACCEPTED_RELATIONS, "model/relations", "Relation edges", 431),
+      [ACCEPTED_OBJECTS]: acceptedDelivery(ACCEPTED_OBJECTS, "model/objects", "Object inventory", 432),
+    },
+    activity: [
+      {
+        ts: "2026-02-10T14:56:00.000Z",
+        actor: "Claude Code",
+        actor_kind: "agent",
+        icon: "radio",
+        text: "Claude Code: Encoding relations as typed edges, 40 of 112 done",
+        msg: {
+          key: "act.pulse",
+          args: {
+            actor: { t: "text", v: "Claude Code" },
+            message: { t: "text", v: "Encoding relations as typed edges, 40 of 112 done" },
+          },
+        },
+        detail: "Encode the model",
+        node: "model/encode",
+        count: 1,
+      },
+    ],
     sessions: {
       [THIRD_SESSION]: {
         id: THIRD_SESSION,
@@ -1194,6 +1554,17 @@ const PROJECTS: Record<string, ProjectState> = {
         last_event_ts: "2026-02-10T14:56:00.000Z",
         current_node: "model/encode",
         liveness: "live",
+        stalled_on: [],
+      },
+      [MERIDIAN_LOST_SESSION]: {
+        id: MERIDIAN_LOST_SESSION,
+        host: "h-01h0000000000000000000000",
+        harness: "codex",
+        last_event: ulid(317),
+        last_event_ts: "2026-02-10T13:20:00.000Z",
+        current_node: "model/audit",
+        liveness: "lost",
+        lost_event: ulid(318),
         stalled_on: [],
       },
     },
@@ -1232,6 +1603,14 @@ const PROJECTS: Record<string, ProjectState> = {
     goal: "Install hooks without guessing",
     glyph: "box",
     variance: "no_demo",
+    budget: {
+      demo_gap_s: 172800,
+      demo_gap_node: "kit/fixtures",
+      blocked: true,
+      reasons: [
+        "No demo for 48h 0m (limit 4h 0m): Hook fixtures (kit/fixtures) is started, not delivered; agendar deliver on it clears the clock.",
+      ],
+    },
     features: {
       "kit/install": feature({
         node: "kit/install",
@@ -1248,17 +1627,89 @@ const PROJECTS: Record<string, ProjectState> = {
         gate: "open",
         liveness: "quiet",
         depends_on: ["kit/install"],
+        deadline: "2026-02-11T17:00:00.000Z",
+      }),
+      "kit/uninstall": feature({
+        node: "kit/uninstall",
+        title: "Remove every hook the installer added, including the ones a newer version moved",
+        slice: "Slice 3 · Uninstall",
+        progress: "doing",
+        gate: "open",
+        liveness: "lost",
+        depends_on: ["kit/install"],
+        attempt: ulid(341),
+        eta: {
+          agent_range: { min_s: 3600, max_s: 7200 },
+          anchor: "2026-02-08T10:00:00.000Z",
+          paused_s: 0,
+          agent_finish: {
+            earliest: "2026-02-08T11:00:00.000Z",
+            latest: "2026-02-08T12:00:00.000Z",
+          },
+          late_by_s: 183600,
+          paused: false,
+        },
+      }),
+      "kit/docs": feature({
+        node: "kit/docs",
+        title: "Hook reference page",
+        slice: "Slice 4 · Docs",
+        depends_on: ["kit/install"],
       }),
     },
   }),
-  notes: simpleProject({
-    slug: "notes",
-    title: "Notes",
-    brief: "Interview notes pipeline",
-    goal: "Turn transcripts into internal notes",
-    glyph: "file-text",
-    variance: "quiet",
-  }),
+  notes: {
+    ...simpleProject({
+      slug: "notes",
+      title: "Notes",
+      brief: "Interview notes pipeline",
+      goal: "Turn transcripts into internal notes",
+      glyph: "file-text",
+      variance: "quiet",
+      // Chinese titles, so search can be tried with a Chinese query.
+      features: {
+        "notes/transcribe": feature({
+          node: "notes/transcribe",
+          title: "访谈转写",
+          slice: "Slice 1 · 转写",
+          milestone: "访谈整理",
+          progress: "verified",
+          unblocks: ["notes/summary"],
+        }),
+        "notes/summary": feature({
+          node: "notes/summary",
+          title: "访谈要点整理",
+          slice: "Slice 2 · 要点",
+          milestone: "访谈整理",
+          progress: "doing",
+          depends_on: ["notes/transcribe"],
+        }),
+        "notes/review": feature({
+          node: "notes/review",
+          title: "内部笔记审阅",
+          slice: "Slice 3 · 审阅",
+          milestone: "访谈整理",
+          progress: "planned",
+          gate: "awaiting_upstream",
+          depends_on: ["notes/summary"],
+        }),
+      },
+    }),
+    reports: [
+      {
+        id: ulid(961),
+        node: "notes/summary",
+        title: "访谈整理：三种摘要方式对比",
+        summary: "逐段摘要保留细节；主题归纳更短，但会丢掉说话人的原话。",
+        report: REPORT_BLOB,
+        kind: "finding",
+        domain: "ux",
+        ts: "2026-02-10T13:40:00.000Z",
+        session: SESSION,
+        harness: "claude_code",
+      },
+    ],
+  },
   site: simpleProject({
     slug: "site",
     title: "Site",
@@ -1291,15 +1742,22 @@ export function buildFixtureSnapshot(): Snapshot {
       event_set_digest: sha(0x99),
       evaluated_at: EVALUATED_AT,
     },
-    needs: [IPC_NEED, ALIAS_NEED, HISTORY_NEED, RESCUE_NEED],
+    needs: [IPC_NEED, ALIAS_NEED, HISTORY_NEED, RESCUE_NEED, DIFF_NEED],
     brief: {
       delivered: [
         {
-          id: "delivered:alias",
-          text: "bookfinder: search finds books by author alias",
-          detail: "Needs your review",
-          target: { kind: "need", id: ALIAS_NEED.id },
-          source_ids: [ALIAS_DELIVERY],
+          id: `delivered:${ACCEPTED_RELATIONS}`,
+          text: "Relation edges accepted",
+          detail: "Meridian",
+          target: { kind: "project", id: "meridian" },
+          source_ids: [ACCEPTED_RELATIONS],
+        },
+        {
+          id: `delivered:${ACCEPTED_OBJECTS}`,
+          text: "Object inventory accepted",
+          detail: "Meridian",
+          target: { kind: "project", id: "meridian" },
+          source_ids: [ACCEPTED_OBJECTS],
         },
       ],
       coming_up: [
@@ -1381,10 +1839,21 @@ export function buildFixtureSnapshot(): Snapshot {
     preferences: {
       theme: "system",
       motion: true,
-      snoozed: {},
       last_looked_at: LAST_LOOKED,
       last_looked_ids: [],
       revision: sha(0x71),
+    },
+    // A release build with a newer public release: the sidebar row and the
+    // About page both render in the dev server.
+    update: {
+      current: "0.1.0",
+      channel: "release",
+      latest: "0.2.0",
+      available: true,
+      url: "https://github.com/Maolon/agendar/releases/tag/v0.2.0",
+      published_at: "2026-11-01T10:00:00Z",
+      checked_at: LAST_LOOKED,
+      enabled: true,
     },
   } satisfies Snapshot);
 }

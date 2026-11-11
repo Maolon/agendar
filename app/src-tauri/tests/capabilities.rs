@@ -65,7 +65,7 @@ fn build_manifest_invoke_registrations_and_capabilities_agree() {
 
     assert_eq!(build_commands, declared, "build and command list agree");
     assert_eq!(declared, registered, "every command is registered once");
-    assert_eq!(declared.len(), 32);
+    assert_eq!(declared.len(), 36);
 
     let main: Value = serde_json::from_str(&read(&manifest_dir().join("capabilities/main.json")))
         .expect("main capability");
@@ -105,7 +105,7 @@ fn build_manifest_invoke_registrations_and_capabilities_agree() {
         "allow-get-snapshot",
         "allow-prepare-answer",
         "allow-answer-decision",
-        // Quick triage includes setting an item aside: one local snooze entry.
+        // Quick triage includes setting an item aside: the owner's snooze event.
         "allow-snooze-need",
         // ...or closing a hand-off item for good, leaving the step untouched.
         "allow-dismiss-need",

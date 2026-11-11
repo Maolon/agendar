@@ -834,7 +834,7 @@ describe("setup inside the app", () => {
       expect(screen.getByRole("heading", { name: STEP_TWO })).toBeInTheDocument();
 
       await user.click(screen.getByRole("button", { name: "Open Agendar" }));
-      expect(await screen.findByRole("searchbox")).toHaveFocus();
+      expect(await screen.findByRole("combobox", { name: "Search everything" })).toHaveFocus();
       expect(client.order).not.toContain("answer_decision");
       expect(
         client.calls.some(

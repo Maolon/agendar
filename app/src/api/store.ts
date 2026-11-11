@@ -8,6 +8,9 @@ import type {
   Preferences,
   Snapshot,
   UnblockEvent,
+  UpdateEvent,
+  UploadEvent,
+  NavigateEvent,
 } from "./types";
 
 export type StorePhase = "loading" | "ready" | "stale" | "error";
@@ -27,6 +30,8 @@ export interface StoreState {
    * can animate a batch exactly once instead of on every render.
    */
   change: { event: ChangedEvent; seq: number } | null;
+  /** A Settings tab the tray asked this window to open; the shell clears it. */
+  navigate: { tab: NavigateEvent["tab"]; seq: number } | null;
 }
 
 const INITIAL: StoreState = {
@@ -37,6 +42,7 @@ const INITIAL: StoreState = {
   focus: null,
   unblock: null,
   change: null,
+  navigate: null,
 };
 
 const FOCUS_BUFFER_LIMIT = 32;
@@ -66,6 +72,7 @@ export class SnapshotStore {
   private lastAppliedSequence = 0;
   private pendingFocus: NotificationFocus[] = [];
   private changeSeq = 0;
+  private navigateSeq = 0;
 
   constructor(client: AgendarClient) {
     this.client = client;
@@ -103,14 +110,17 @@ export class SnapshotStore {
       this.client.onHealth((event) => this.onHealth(event)),
       this.client.onUnblock((event) => this.onUnblock(event)),
       this.client.onNotificationFocus((event) => this.onFocusEvent(event)),
+      this.client.onUpdate((event) => this.onUpdate(event)),
+      this.client.onUpload((event) => this.onUpload(event)),
+      this.client.onNavigate((event) => this.onNavigate(event)),
     ];
     const results = await Promise.allSettled(subscriptions);
     const cleanups: (() => void)[] = [];
     for (const result of results) {
       if (result.status === "fulfilled") cleanups.push(result.value);
     }
-    // Local state such as snoozes changes without a Vault event, and the main
-    // window and the tray each hold their own copy: re-read on return.
+    // Local state such as dismissed rows changes without a Vault event, and
+    // the main window and the tray each hold their own copy: re-read on return.
     if (typeof window !== "undefined" && typeof document !== "undefined") {
       const onReturn = () => {
         if (document.visibilityState === "visible") void this.refresh();
@@ -157,6 +167,31 @@ export class SnapshotStore {
       },
     });
   }
+
+  /** A check started or finished: the footer tag changes at once. */
+  private onUpdate(event: UpdateEvent): void {
+    const snapshot = this.state.snapshot;
+    if (!snapshot) return;
+    this.set({ snapshot: { ...snapshot, update: event.update } });
+  }
+
+  /** The upload line changed: no Vault event says so, patch it in place. */
+  private onUpload(event: UploadEvent): void {
+    const snapshot = this.state.snapshot;
+    if (!snapshot) return;
+    const { upload: _previous, ...local } = snapshot.local;
+    this.set({ snapshot: { ...snapshot, local: event.upload ? { ...local, upload: event.upload } : local } });
+  }
+
+  private onNavigate(event: NavigateEvent): void {
+    if (event.view !== "settings" || event.tab !== "about") return;
+    this.navigateSeq += 1;
+    this.set({ navigate: { tab: event.tab, seq: this.navigateSeq } });
+  }
+
+  clearNavigate = (): void => {
+    if (this.state.navigate) this.set({ navigate: null });
+  };
 
   private onUnblock(event: UnblockEvent): void {
     this.set({ unblock: event });

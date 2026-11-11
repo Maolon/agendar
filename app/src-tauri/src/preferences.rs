@@ -26,6 +26,10 @@ pub struct Preferences {
     pub revision: u64,
     pub theme: String,
     pub motion: bool,
+    /// Legacy. Snoozes are `need.snoozed` events in the Vault now; what an
+    /// earlier build stored here is dropped on load. The key is still read
+    /// and written (always empty) so that files of either build load in the
+    /// other.
     pub snoozed: BTreeMap<String, UtcTime>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_looked_at: Option<UtcTime>,
@@ -39,6 +43,18 @@ pub struct Preferences {
     /// untouched; only the item stops showing. Pruned to items still waiting.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub dismissed: BTreeSet<String>,
+    /// Look for a newer Agendar release now and then. Default on; written
+    /// only when off, so earlier builds still read the file.
+    #[serde(default = "enabled", skip_serializing_if = "is_enabled")]
+    pub update_check: bool,
+}
+
+const fn enabled() -> bool {
+    true
+}
+
+const fn is_enabled(value: &bool) -> bool {
+    *value
 }
 
 /// At most this many dismissed items are remembered.
@@ -195,6 +211,7 @@ impl Default for Preferences {
             notifications: false,
             language: auto_language(),
             dismissed: BTreeSet::new(),
+            update_check: true,
         }
     }
 }
@@ -219,7 +236,7 @@ impl Preferences {
             )
             .with_detail("preferences_version"));
         }
-        let preferences: Self = serde_json::from_value(value).map_err(|error| {
+        let mut preferences: Self = serde_json::from_value(value).map_err(|error| {
             AgendarError::validation_at(
                 "/preferences",
                 "preferences_malformed",
@@ -227,6 +244,7 @@ impl Preferences {
             )
         })?;
         preferences.validate()?;
+        preferences.snoozed.clear();
         Ok(preferences)
     }
 
@@ -286,6 +304,12 @@ impl Preferences {
         {
             items.push(json!(["dismissed", self.dismissed]));
         }
+        // Turning update checks off joins only then, for the same reason.
+        if !self.update_check
+            && let Value::Array(items) = &mut value
+        {
+            items.push(json!(["update_check", false]));
+        }
         Sha256::from_bytes(canonical_json(&value).as_bytes())
     }
 
@@ -294,13 +318,13 @@ impl Preferences {
         json!({
             "theme": self.theme,
             "motion": self.motion,
-            "snoozed": self.snoozed,
             "last_looked_at": self.last_looked_at,
             "last_looked_ids": self.last_looked_ids,
             "revision": self.wire_revision(),
             "notifications": self.notifications,
             "language": self.language,
             "dismissed": self.dismissed,
+            "update_check": self.update_check,
         })
     }
 

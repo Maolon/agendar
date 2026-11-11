@@ -31,7 +31,7 @@ function renderDelivery(client: FakeClient) {
 }
 
 describe("report panel", () => {
-  it("reads the report blob and renders it as escaped text, never HTML", async () => {
+  it("reads an HTML report blob and shows its plain text, never HTML", async () => {
     const client = new FakeClient(makeDeliverySnapshot());
     client.reports.set(REPORT_DIGEST, { mime: "text/html", text: HOSTILE, sha256: REPORT_DIGEST });
     renderDelivery(client);
@@ -40,11 +40,11 @@ describe("report panel", () => {
     const dialog = await screen.findByRole("dialog");
     expect(dialog).toHaveAccessibleName(/search-v2 report/);
 
-    // The bytes reach the DOM as text children of a <pre>.
-    expect(dialog.querySelector("pre")?.textContent).toBe(HOSTILE);
+    // HTML reaches the DOM only as extracted plain text, never as elements.
+    expect(dialog.querySelector(".report-prose")?.textContent).toBe("bold?");
     expect(dialog.querySelector("img")).toBeNull();
     expect(dialog.querySelector("b")).toBeNull();
-    expect(screen.getByText("HTML source — active rendering unsupported.")).toBeInTheDocument();
+    expect(screen.getByText("Text of an HTML report. Nothing is executed or fetched.")).toBeInTheDocument();
 
     const request = client.calls.find(
       (call) =>

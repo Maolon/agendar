@@ -1,10 +1,12 @@
 import { tx } from "../i18n";
+import { shortcut } from "../state/shortcut";
 import { useContext, useEffect, useRef, useState } from "react";
 import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode, RefObject } from "react";
 import type { ApiError } from "../api/client";
 import type { Snapshot, WindowChrome } from "../api/types";
 import { ClientContext } from "../api/store";
 import { useGlassRegions, useWindowActive } from "../hooks/useWindowChrome";
+import type { SearchTarget } from "../state/search";
 import type { Selection } from "../state/ui";
 import { Icon } from "./Icon";
 import { Search } from "./Search";
@@ -14,6 +16,7 @@ interface ShellProps {
   snapshot: Snapshot | null;
   phase: "loading" | "ready" | "stale" | "error";
   error: ApiError | null;
+  /** Text in the search field. */
   filter: string;
   selection: Selection | null;
   quietOpen: boolean;
@@ -24,6 +27,8 @@ interface ShellProps {
   pulses: ReadonlySet<string>;
   searchRef: RefObject<HTMLInputElement | null>;
   onFilter: (text: string) => void;
+  /** Open one search result. */
+  onSearchOpen?: (target: SearchTarget) => void;
   onSelect: (selection: Selection) => void;
   onToggleQuiet: () => void;
   onOpenSettings?: () => void;
@@ -118,6 +123,7 @@ export function Shell({
   pulses,
   searchRef,
   onFilter,
+  onSearchOpen,
   onSelect,
   onToggleQuiet,
   onOpenSettings,
@@ -164,7 +170,6 @@ export function Shell({
           <Sidebar
             snapshot={snapshot}
             selection={selection}
-            filter={filter}
             quietOpen={quietOpen}
             motion={motion}
             pulses={pulses}
@@ -212,12 +217,18 @@ export function Shell({
               className="icon-btn cap"
               aria-label={pane.collapsed ? tx("shell.show_sidebar") : tx("shell.hide_sidebar")}
               aria-pressed={!pane.collapsed}
-              title={`${pane.collapsed ? tx("shell.show_sidebar") : tx("shell.hide_sidebar")} (⌘\\)`}
+              title={`${pane.collapsed ? tx("shell.show_sidebar") : tx("shell.hide_sidebar")} (${shortcut("mod+\\")})`}
               onClick={() => pane.setCollapsed((value) => !value)}
             >
               <Icon name="columns-2" />
             </button>
-            <Search inputRef={searchRef} value={filter} onChange={onFilter} />
+            <Search
+              inputRef={searchRef}
+              value={filter}
+              onChange={onFilter}
+              snapshot={snapshot}
+              onOpen={(target) => onSearchOpen?.(target)}
+            />
             <div data-tauri-drag-region />
           </div>
           {devFixture ? (

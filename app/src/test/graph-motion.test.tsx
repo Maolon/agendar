@@ -82,6 +82,8 @@ describe("motion eligibility", () => {
     expect(isMotionEligible(liveFeature({ liveness: "quiet" }), ANCHOR)).toBe(false);
     expect(isMotionEligible(liveFeature({ basis: "tainted" }), ANCHOR)).toBe(false);
     expect(isMotionEligible(liveFeature({ paused: true }), ANCHOR)).toBe(false);
+    expect(isMotionEligible(liveFeature({ phase: "in_review" }), ANCHOR)).toBe(false);
+    expect(isMotionEligible(liveFeature({ phase: "sent_back" }), ANCHOR)).toBe(true);
     expect(isMotionEligible(undefined, ANCHOR)).toBe(false);
   });
 

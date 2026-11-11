@@ -51,7 +51,6 @@ function renderSidebar(snapshot: Snapshot, quietOpen = false) {
     <Sidebar
       snapshot={snapshot}
       selection={null}
-      filter=""
       quietOpen={quietOpen}
       onSelect={vi.fn()}
       onToggleQuiet={onToggleQuiet}
@@ -186,6 +185,41 @@ describe("sidebar ordering and rows", () => {
     expect(document.querySelector('[data-row="need:need-review"]')).not.toBeNull();
   });
 
+  it("shows the working state with a stopped count when a project has live work", () => {
+    const running = feature({ progress: "doing", gate: "open", liveness: "live" });
+    const lost = feature({ node: "core/two", progress: "doing", gate: "open", liveness: "lost" });
+    const mixed = project("mixed", "active", {
+      features: { "core/one": running, "core/two": lost },
+      active: 1,
+    });
+    mixed.summary.stopped_steps = 1;
+    const several = project("several", "no_demo", { active: 1 });
+    several.summary.stopped_steps = 3;
+    const stopped = project("only-stopped", "stopped", { features: { "core/two": lost } });
+    stopped.summary.stopped_steps = 1;
+    renderSidebar(snapshotWith([mixed, several, stopped, project("plain", "active")]));
+
+    const mixedRow = document.querySelector<HTMLElement>('[data-row="project:mixed"]')!;
+    // Still the working state: the track, not the Stopped chip.
+    expect(mixedRow.querySelector(".track")).not.toBeNull();
+    expect(mixedRow.querySelector(".pvar")).toBeNull();
+    const mark = mixedRow.querySelector<HTMLElement>(".pstop")!;
+    expect(mark.textContent).toBe("1");
+    expect(mark).toHaveAttribute("aria-label", "1 step stopped");
+
+    const severalRow = document.querySelector<HTMLElement>('[data-row="project:several"]')!;
+    expect(severalRow.querySelector(".pvar")?.textContent).toBe("No demo");
+    expect(severalRow.querySelector(".pstop")).toHaveAttribute("aria-label", "3 steps stopped");
+
+    // A project that is only stopped looks as before: the chip, no count.
+    const stoppedRow = document.querySelector<HTMLElement>('[data-row="project:only-stopped"]')!;
+    expect(stoppedRow.querySelector(".pvar")?.textContent).toBe("Stopped");
+    expect(stoppedRow.querySelector(".pstop")).toBeNull();
+    expect(stoppedRow.querySelector(".track")).toBeNull();
+
+    expect(document.querySelector('[data-row="project:plain"] .pstop')).toBeNull();
+  });
+
   it("orders projects by variance then slug for the same variance", () => {
     const snapshot = snapshotWith([
       project("zeta", "active"),
@@ -225,7 +259,6 @@ describe("motion", () => {
       <Sidebar
         snapshot={snapshotWith([project("alpha", "active")])}
         selection={null}
-        filter=""
         quietOpen={false}
         onSelect={vi.fn()}
         onToggleQuiet={vi.fn()}
@@ -240,7 +273,6 @@ describe("motion", () => {
       <Sidebar
         snapshot={snapshotWith([project("alpha", "active")])}
         selection={null}
-        filter=""
         quietOpen={false}
         onSelect={vi.fn()}
         onToggleQuiet={vi.fn()}

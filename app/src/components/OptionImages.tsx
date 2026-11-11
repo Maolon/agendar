@@ -1,4 +1,5 @@
 import { tx } from "../i18n";
+import { shortcut } from "../state/shortcut";
 import { useEffect, useRef, useState } from "react";
 import type { BlobRef, DecisionOption } from "../api/types";
 import { useBlob } from "../hooks/useBlob";
@@ -251,7 +252,7 @@ export function ImageCompare({
           </div>
           <button type="button" className="btn" onClick={choose}>
             {current.option.id === selected ? tx("oi.keep") : tx("oi.choose", { x: current.option.label })}
-            <kbd>↵</kbd>
+            <kbd>{shortcut("enter")}</kbd>
           </button>
         </footer>
       </section>

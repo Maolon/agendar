@@ -12,6 +12,27 @@ async function fixtureClient() {
   return createClient(createFixtureTransport(), "fixture");
 }
 
+describe("dev fixture transport: a project with live work and a stopped step", () => {
+  it("serves Meridian as active with one stopped step", async () => {
+    const client = await fixtureClient();
+    const snapshot = await client.getSnapshot();
+    const meridian = snapshot.state.projects["meridian"]!;
+    expect(meridian.summary.variance).toBe("active");
+    expect(meridian.summary.stopped_steps).toBe(1);
+    const steps = Object.values(meridian.features);
+    expect(
+      steps.filter((step) => step.progress === "doing" && step.liveness === "lost"),
+    ).toHaveLength(1);
+    expect(
+      steps.filter((step) => step.progress === "doing" && step.liveness === "live"),
+    ).toHaveLength(1);
+    // No other fixture project carries the count.
+    expect(
+      Object.values(snapshot.state.projects).filter((project) => project.summary.stopped_steps),
+    ).toHaveLength(1);
+  });
+});
+
 describe("dev fixture transport: delivery views", () => {
   it("serves a review need, its demos and a report", async () => {
     const client = await fixtureClient();
@@ -37,6 +58,34 @@ describe("dev fixture transport: delivery views", () => {
       blob: { host: "h", sha256: "82".repeat(32), ext: "png", bytes: 1 },
     });
     expect(screenshot.media_token).toBe("82".repeat(32));
+  });
+
+  it("sends the three-demo delivery back with comments only, never accepts with comments", async () => {
+    const client = await fixtureClient();
+    const snapshot = await client.getSnapshot();
+    const need = snapshot.needs.find((item) => item.question === "Review receipt-free delivery")!;
+    const delivery = snapshot.state.projects[need.project]!.deliveries[need.source]!;
+    expect(delivery.demos.map((demo) => demo.kind)).toEqual(["diff", "cli_transcript", "screenshot"]);
+    const comments = [
+      { anchor: { kind: "region" as const, demo: 2, x: 0, y: 0, w: 1000, h: 1000 }, text: "Too dark" },
+    ];
+    await expect(
+      client.reviewDelivery({
+        request_id: "01HZZZZZZZZZZZZZZZZZZZZZZ1",
+        delivery_id: delivery.id,
+        expected_delivery_revision: delivery.revision,
+        verdict: "accept",
+        comments,
+      }),
+    ).rejects.toThrow(/only allowed when sending/);
+    const sent = await client.reviewDelivery({
+      request_id: "01HZZZZZZZZZZZZZZZZZZZZZZ2",
+      delivery_id: delivery.id,
+      expected_delivery_revision: delivery.revision,
+      verdict: "send_back",
+      comments,
+    });
+    expect(sent.event_id).toBeTruthy();
   });
 
   it("observes a criterion only after the profile was approved", async () => {

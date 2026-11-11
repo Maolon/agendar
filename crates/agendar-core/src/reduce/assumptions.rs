@@ -289,27 +289,28 @@ pub fn feature_consumption(
     out
 }
 
-/// Distinct features whose current attempt consumed an assumption receipt of
-/// one ask, sorted lexically and counted once per feature (`built_on`). A
-/// tainted feature still counts: it consumed the choice.
-pub fn built_on(
-    ask: &EventId,
+/// Per ask, the distinct features whose current attempt consumed one of its
+/// assumption receipts (`built_on`), sorted lexically and counted once per
+/// feature. A tainted feature still counts: it consumed the choice.
+pub fn built_on_by_ask(
     consumed: &BTreeMap<crate::model::ids::NodePath, Consumption>,
     receipts: &BTreeMap<EventId, Receipt>,
-) -> Vec<crate::model::ids::NodePath> {
-    let mut nodes: Vec<crate::model::ids::NodePath> = consumed
-        .iter()
-        .filter(|(_, consumption)| {
-            consumption.unconfirmed.iter().any(|receipt| {
-                receipts
-                    .get(receipt)
-                    .is_some_and(|receipt| &receipt.ask == ask)
-            })
-        })
-        .map(|(node, _)| node.clone())
-        .collect();
-    nodes.sort();
-    nodes
+) -> BTreeMap<EventId, Vec<crate::model::ids::NodePath>> {
+    let mut by_ask: BTreeMap<EventId, BTreeSet<crate::model::ids::NodePath>> = BTreeMap::new();
+    for (node, consumption) in consumed {
+        for receipt in &consumption.unconfirmed {
+            if let Some(receipt) = receipts.get(receipt) {
+                by_ask
+                    .entry(receipt.ask.clone())
+                    .or_default()
+                    .insert(node.clone());
+            }
+        }
+    }
+    by_ask
+        .into_iter()
+        .map(|(ask, nodes)| (ask, nodes.into_iter().collect()))
+        .collect()
 }
 
 /// Did a human answer this ask with something other than the recommendation?

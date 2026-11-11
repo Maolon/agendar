@@ -105,6 +105,16 @@ export function featurePatch(edit: FeatureEdit): Record<string, unknown> {
   return patch;
 }
 
+/**
+ * The owner's Keep on an `untouched` step: the step's own priority, patched by
+ * the operator through `update_feature`. Nothing changes but who wrote the
+ * field, which is what clears `untouched` for good. Pass
+ * `featureFields(keepEdit(f))` as the guard.
+ */
+export function keepEdit(feature: { priority: number }): FeatureEdit {
+  return { priority: feature.priority };
+}
+
 export function featureFields(edit: FeatureEdit): string[] {
   const fields: string[] = [];
   if (edit.title !== undefined) fields.push("title");

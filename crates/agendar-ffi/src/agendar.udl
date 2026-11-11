@@ -1,0 +1,860 @@
+// The UniFFI surface of agendar-core for mobile clients. Every type here is
+// implemented by hand-written, `unsafe`-free Rust in `facade/`; UniFFI
+// generates the FFI glue from this file into `scaffolding.rs`.
+//
+// Contract v1 (frozen). Conventions: ids and RFC 3339 UTC times are strings.
+// Only `refresh`, `delivery` (it reads demo files) and the mutations
+// (`answer_checked`, `rescue`, `snooze`, `review`) read or write the Vault,
+// so an iOS client wraps only those in `NSFileCoordinator`; every other v1
+// call reads the cached index.
+// A change to any declaration here is a contract change for generated
+// bindings and mobile clients.
+namespace agendar {
+  // The core version this library was built from.
+  string version();
+};
+
+// ---- Errors ---------------------------------------------------------------
+
+// Why the core refused a request without writing anything.
+enum RefusalCode {
+  // This device has not read enough of the Vault to judge the request (files
+  // still downloading); try again after the next refresh.
+  "NotSynced",
+  // The card or row changed since the caller read it: read it again.
+  "StaleRevision",
+  // The question already has an answer (here, on another host, or by default).
+  "AlreadyAnswered",
+  // The question was withdrawn or replaced by a newer one.
+  "Withdrawn",
+  // The guard does not allow an answer from this surface: use the App surface.
+  "SurfaceNotAllowed",
+  // The bounded refresh before the check did not finish in time.
+  "RefreshTimeout",
+};
+
+// What is wrong with the input of a send-back. The first thirteen are the
+// core's detail codes for the same refusals, in its spelling
+// (`send_back_requires_reason`, `too_many_comments`, ...).
+enum SendBackDetail {
+  // Neither a reason nor a comment.
+  "SendBackRequiresReason",
+  // More than 20 comments.
+  "TooManyComments",
+  // A blank text: the comment's, or `DiffLine.file`.
+  "BlankString",
+  // A text that is too long: the comment's (300) or `DiffLine.file` (300)
+  // when a comment is named, the reason's (500) when none is.
+  "Length",
+  // A newline, tab or control character in a comment's text or
+  // `DiffLine.file`; a NUL in the reason when no comment is named.
+  "ControlCharacter",
+  // `demo` is 3 or more.
+  "DemoOutOfRange",
+  // Line 0.
+  "LineOutOfRange",
+  // `w` or `h` is 0, or `x + w` or `y + h` is over 1000.
+  "RegionOutOfRange",
+  // The delivery has no demo at that index.
+  "NoSuchDemo",
+  // The place does not fit the demo's kind; a preview URL and a recording
+  // take no comment.
+  "AnchorKindMismatch",
+  // The line is not in the diff excerpt (line, side or file).
+  "LineNotInDiff",
+  // The line is past the end of the transcript.
+  "LineNotInTranscript",
+  // The demo file is not UTF-8 text.
+  "DemoNotText",
+  // The demo file a line comment points into is not on this device yet
+  // (`DemoText.NotOnDevice`); try again when it has downloaded.
+  "DemoNotOnDevice",
+};
+
+[Error]
+interface FfiError {
+  // A typed core error: `code` is the stable public code (`E_CONTEXT`,
+  // `E_NOT_FOUND`, ...). Bad input is `E_VALIDATION`; a call that is not
+  // built yet is `E_NOT_IMPLEMENTED`.
+  //
+  // `detail` names the rule that failed (`vault_manifest_malformed`,
+  // `identity_version`, `snooze_too_long`, ...). It is always one of the
+  // codes listed in the core (`agendar_core::error::details`), in that
+  // spelling, or absent: mirror the list as a closed set plus "other" for a
+  // code a newer core adds. A code is never renamed once listed.
+  // `field` is the JSON Pointer of the input or file at fault
+  // (`/vault.json`, `/data-dir`, `/until`, `/choice`, ...), when there is one.
+  // `retryable` is true when the same call can succeed later with nothing
+  // changed by the owner (a file still downloading, a busy lock); false also
+  // when the core cannot tell.
+  // `message` is an English sentence for logs. It no longer ends with the
+  // detail in brackets; only a detail the list does not have stays there.
+  Core(string code, string? detail, string? field, boolean retryable, string message);
+  // A checked request the core refused; nothing was written.
+  Refused(RefusalCode code, string message);
+  // `review` refused the input of a send-back (its reason or its comments);
+  // nothing was written. `comment` is the number of the comment at fault,
+  // 1-based as `RoundComment.n`; absent when the refusal is about the reason
+  // or the comments as a whole. `message` is an English sentence for logs.
+  // Only `review` raises it.
+  SendBackRefused(SendBackDetail detail, u32? comment, string message);
+};
+
+// ---- Enums ----------------------------------------------------------------
+
+// What the owner must do to answer a card: one tap on the recommendation,
+// an explicit choice, or an explicit choice plus a confirmation.
+enum Guard { "Easy", "Choose", "Confirm" };
+
+// Worst-case effective risk of a card or an option.
+enum Risk { "Easy", "Costly", "Irreversible" };
+
+// Where an answer comes from. `App` allows every guard; `Notification` and
+// `Island` allow only `Easy`.
+enum Surface { "App", "Notification", "Island" };
+
+enum NeedKind { "Decide", "Rescue", "Confirm", "Review" };
+
+enum RescueAction { "Handoff", "Pause" };
+
+// How far a written answer got. "Uploaded" sits between the two and is
+// the client's own check (`ubiquitousItemIsUploaded` on `Receipt.writer_file`).
+enum ReceiptStep { "Saved", "AgentHasIt" };
+
+// The ask's mode: who decides when the owner stays silent.
+enum AskMode { "Auto", "Assume", "Ask" };
+
+enum Confidence { "Low", "Med", "High" };
+
+enum StepProgress { "Planned", "Doing", "Done", "Verified", "Dropped" };
+
+// Whether a fact on a card was observed or is the agent's word.
+enum FactClaim { "AgentSays", "Seen" };
+
+// Where a step in progress stands after its delivery.
+enum StepPhase { "InReview", "SentBack" };
+
+// What holds a step back: nothing, an open question, or an earlier step.
+enum StepGate { "Open", "AwaitingDecision", "AwaitingUpstream" };
+
+// What one activity line is about. A burst of several events by one agent
+// is the kind of its most important part (finished, then started, then plan,
+// then dropped, then update), as the desktop picks its icon.
+enum ActivityKind {
+  "SessionStarted", "SessionBack", "SessionEnded", "ProjectDescribed",
+  "PlanUpdated", "Started", "Finished", "Dropped", "Update",
+  "Asked", "Answered", "Applied", "Withdrawn", "Report",
+  // A kind this contract version has no name for; show `text`.
+  "Other",
+};
+
+// The owner's verdict on a delivery so far.
+enum ReviewState { "Pending", "Accepted", "SentBack" };
+
+// Whether the text of a transcript or a diff came with the call.
+enum DemoText {
+  "Loaded",
+  // The file is not on this device, or not whole yet: ask the sync app for
+  // `file.path`, then read the delivery again.
+  "NotOnDevice",
+  // Larger than the call carries (1 MiB): read `file.path` yourself.
+  "TooLarge",
+  // Not UTF-8 text.
+  "Unreadable",
+};
+
+enum DiffLineKind { "Add", "Del", "Context", "Note" };
+
+// Where a criterion's result comes from.
+enum Provenance { "Seen", "AgentSays", "NotProvenYet" };
+
+enum CheckResult { "Passed", "Failed", "NotProven" };
+
+[Enum]
+interface Choice {
+  // One of the card's options.
+  Option(string id);
+  // The owner's own words (1..=`Card.own_max_chars` characters).
+  Own(string text);
+};
+
+// The owner's verdict on a delivery. A send-back says what to change: a
+// `reason` in the owner's own words (1..=500 characters after trimming; null
+// or blank is no reason), comments pointing into the demos (at most 20), or
+// both. At least one of the two is required.
+[Enum]
+interface Verdict {
+  Accept();
+  SendBack(string? reason, sequence<NewComment> comments);
+};
+
+// Where a comment points. `demo` is the index in `Delivery.demos`. Lines are
+// 1-based, numbered as `Transcript.text` and `DiffLine.old_line` /
+// `new_line` number them; a region is in per-mille of the image (0..=1000,
+// `w` and `h` at least 1, `x + w` and `y + h` at most 1000).
+//
+// `quote` is the text of the commented line. On a comment read back it is
+// what the reviewing host read from the demo file. On a new comment it is
+// ignored (pass ""): `review` reads the line from the demo file itself.
+[Enum]
+interface CommentPlace {
+  DiffLine(u8 demo, string file, boolean old_side, u32 line, string quote);
+  TranscriptLine(u8 demo, u32 line, string quote);
+  Region(u8 demo, u16 x, u16 y, u16 w, u16 h);
+};
+
+[Enum]
+interface Demo {
+  Screenshot(Attachment file, string alt);
+  CliTranscript(Transcript transcript);
+  PreviewUrl(string url);
+  // Not shown by the desktop either; the files are there to fetch.
+  Recording(Attachment file, Attachment poster);
+  Diff(DiffDemo diff);
+};
+
+[Enum]
+interface CardStatus {
+  Open();
+  // Answered by this device; `answer_id` opens the receipt.
+  AnsweredHere(string label, string answer_id);
+  // Answered by another host (its host id); `answer_id` opens the receipt.
+  AnsweredElsewhere(string label, string host, string answer_id);
+  // Nobody answered in time and the default went ahead at `at`.
+  Defaulted(string label, string at);
+  Withdrawn();
+  Superseded();
+};
+
+// ---- Records --------------------------------------------------------------
+
+dictionary TimeWindow {
+  string earliest;
+  string latest;
+};
+
+dictionary EtaWindow {
+  u32 min_s;
+  u32 max_s;
+};
+
+dictionary HostSeen {
+  string host;
+  // The newest event this device has read from that host.
+  string last_event_at;
+  boolean is_self;
+};
+
+// What this device has read of the Vault, and how fresh that is.
+dictionary Freshness {
+  string evaluated_at;
+  // Equal on two hosts that read the same events.
+  string? event_set_digest;
+  u64 generation;
+  u32 events;
+  string this_host;
+  // Every host with events, newest first. A host has no name in the Vault:
+  // a nickname is stored locally by the client.
+  sequence<HostSeen> hosts;
+  // Vault-relative writer files the sync app has not downloaded yet.
+  sequence<string> waiting;
+};
+
+// One item that needs the owner.
+dictionary NeedRow {
+  string id;
+  NeedKind kind;
+  string project;
+  string project_title;
+  string? node;
+  string? step_title;
+  // The event the item is about: for `Decide`, the ask's event id (the
+  // `ask_id` of `card` and `answer_checked`).
+  string source;
+  // English text, plus the catalog message as JSON (`{"key":..,"args":..}`)
+  // when the core wrote the text, for client-side localisation.
+  string question;
+  string? question_msg_json;
+  string reason;
+  string? reason_msg_json;
+  string since;
+  u64 waiting_minutes;
+  u32 stalled_agents;
+  // When the default goes ahead if nobody answers.
+  string? default_at;
+  // The revision to pass back as `expected_revision`.
+  string revision;
+  // Present for `Decide` rows only.
+  Guard? guard;
+  string? snoozed_until;
+};
+
+// Why an agent is under Stalled: it waits on a Needs-you row, or the owner
+// sent its step back and nobody is on it.
+enum StallReason { "NeedsYou", "SentBack" };
+
+dictionary AgentRow {
+  string session;
+  string project;
+  // Moving: the step in progress it is on, always present. Stalled: its
+  // current step, or the step sent back.
+  string? step_title;
+  // The harness as the core spells it (`claude_code`, `codex`, ...).
+  string harness;
+  // Moving: since the step's start, or since the send-back while the step is
+  // sent back. Stalled: since when it waits (the oldest row, or the
+  // send-back).
+  string since;
+  // Present on a stalled row, absent on a moving one.
+  StallReason? stall;
+};
+
+dictionary DoneRow {
+  string id;
+  string text;
+  string project;
+  string at;
+};
+
+dictionary NowBoard {
+  // Active needs across projects, most urgent first, snoozed ones left out.
+  sequence<NeedRow> needs;
+  sequence<NeedRow> snoozed;
+  sequence<AgentRow> moving;
+  sequence<AgentRow> stalled;
+  // Delivered since `looked_at`; empty without it.
+  sequence<DoneRow> done_since;
+};
+
+dictionary ProjectRow {
+  string slug;
+  string title;
+  string glyph;
+  u32 needs;
+  u32 moving;
+  u32 stalled;
+  u32 stopped_steps;
+  string? last_event;
+};
+
+dictionary StepRow {
+  string node;
+  string title;
+  StepProgress progress;
+  string? milestone;
+  boolean paused;
+  boolean dropped_by_owner;
+  // The session holding the step, when one does.
+  string? holder;
+  TimeWindow? expected_finish;
+  // Waiting for the owner's review, or sent back; absent otherwise.
+  StepPhase? phase;
+  StepGate gate;
+  string? deadline;
+  // 0..=3, as the plan set it.
+  u8 priority;
+  // Nodes of the steps this one comes after, as the plan declares them.
+  sequence<string> depends_on;
+  // Seconds past the expected finish; 0 when on time or without an estimate.
+  u64 late_by_s;
+};
+
+// When the whole project finishes (`reduce/forecast.rs`).
+dictionary ProjectForecast {
+  u32 open_steps;
+  u32 in_progress;
+  u32 abandoned;
+  u32 not_started;
+  u32 agents;
+  // Remaining agent work, low and high, in milliseconds.
+  u64 work_low_ms;
+  u64 work_high_ms;
+  // Only while an agent is working.
+  TimeWindow? finish;
+  u32 basis_steps;
+};
+
+// One line of a project's activity (`reduce/activity.rs`): one event, or a
+// burst of events by one agent within two minutes.
+dictionary ActivityRow {
+  // The newest event of the line.
+  string at;
+  ActivityKind kind;
+  // The sentence the desktop shows, in English, plus the catalog message as
+  // JSON (`{"key":..,"args":..}`) for client-side localisation.
+  string text;
+  string? msg_json;
+  // A second line: the step of a progress update, the question an answer
+  // was applied to, the first line of an own answer or of a report.
+  string? detail;
+  // The step the line is about, when it is about exactly one.
+  string? node;
+  string? step_title;
+  // Who did it, as the sentence names them: "Claude Code", "You", "Agendar".
+  string actor;
+  // The agent's harness as the core spells it (`claude_code`, `codex`, ...);
+  // absent when the owner or Agendar itself acted.
+  string? harness;
+  boolean by_owner;
+  // How many events the line folds.
+  u32 events;
+  // The line is a published report; the document comes in a later version.
+  boolean has_report;
+};
+
+// The numbers of the desktop's header row (`reduce/stats.rs`), over the same
+// recent events as the activity.
+dictionary ProjectStats {
+  // Live agents with a step in progress.
+  u32 agents_running;
+  // Connected agents with nothing in progress.
+  u32 agents_idle;
+  // Agents with nothing to do until the owner answers.
+  u32 agents_stalled;
+  // Steps finished in the last 24 hours, and their wall time start to finish.
+  u32 finished_24h;
+  u64 agent_ms_24h;
+  // Median wall time of a finished step, and how many steps it rests on.
+  u64? median_step_ms;
+  u32 timed_steps;
+  // Completions under a minute, left out of the numbers above.
+  u32 instant_excluded;
+};
+
+// How one harness's estimates compared with what its steps took: the ratio in
+// thousandths (1500 = one and a half times the estimate).
+dictionary CalibrationRow {
+  string harness;
+  u32 samples;
+  u32 ratio_milli;
+};
+
+// One delivery of the project that no newer delivery replaced.
+dictionary DeliveryRow {
+  // The id to pass to `delivery`.
+  string delivery_id;
+  string name;
+  string node;
+  string step_title;
+  ReviewState review;
+  // The Needs-you row that waits on it, while one does.
+  string? need_id;
+  u32 demos;
+};
+
+dictionary ProjectPage {
+  ProjectRow row;
+  string goal;
+  string brief;
+  sequence<StepRow> steps;
+  ProjectForecast? forecast;
+  sequence<NeedRow> needs;
+  // Newest first, at most 40 lines.
+  sequence<ActivityRow> activity;
+  ProjectStats stats;
+  sequence<CalibrationRow> calibration;
+  // Newest first.
+  sequence<DeliveryRow> deliveries;
+};
+
+dictionary CardOption {
+  string id;
+  string label;
+  string consequence;
+  string? cost;
+  EtaWindow? eta;
+  Risk risk;
+  boolean external;
+  // The option has a picture; the bytes come in a later contract version.
+  boolean has_image;
+};
+
+dictionary CardFact {
+  string text;
+  FactClaim claim;
+};
+
+dictionary DoneCriterion {
+  string id;
+  string text;
+};
+
+// One decision card, open or not.
+dictionary Card {
+  string ask_id;
+  string project;
+  string project_title;
+  string node;
+  string step_title;
+  // The revision to pass back as `expected_revision`.
+  string revision;
+  Guard guard;
+  // Effective risk: external effects count as irreversible.
+  Risk risk;
+  boolean external;
+  // The risky words the heuristic found in the card's text.
+  sequence<string> risk_words;
+  AskMode mode;
+  string question;
+  string why_now;
+  CardStatus status;
+  sequence<CardOption> options;
+  string recommended_option;
+  Confidence recommended_confidence;
+  string recommended_because;
+  // Longest own answer, in Unicode characters (600).
+  u32 own_max_chars;
+  sequence<CardFact> facts;
+  sequence<DoneCriterion> done_when;
+  // Titles of the steps an answer releases.
+  sequence<string> unblocks;
+  u32 stalled_agents;
+  string since;
+  string? default_at;
+  // The option the default takes at `default_at`.
+  string? default_option;
+};
+
+// What became of one answer.
+dictionary Receipt {
+  string answer_id;
+  string ask_id;
+  string project;
+  string chose_label;
+  // The owner's own words when no option fit.
+  string? own_text;
+  string written_at;
+  // Vault-relative path of the file the answer was appended to.
+  string writer_file;
+  ReceiptStep step;
+  string? acked_at;
+  // Titles of the steps the answer released.
+  sequence<string> released;
+  // The next active need, to move on to.
+  string? next_need_id;
+};
+
+// ---- Delivery review ---------------------------------------------------------
+
+// One file of a delivery in the Vault. A mobile client asks the sync app for `path`
+// (Vault-relative), reads it coordinated, and may check `bytes` and `sha256`.
+dictionary Attachment {
+  string path;
+  string sha256;
+  u64 bytes;
+  // `png`, `jpg`, `webp`, `txt`, `mp4`, ...
+  string ext;
+};
+
+dictionary Transcript {
+  Attachment file;
+  DemoText state;
+  // The first lines of the transcript (at most 400 lines, each at most 2000
+  // characters); empty unless `state` is `Loaded`.
+  string text;
+  u32 lines_total;
+  boolean truncated;
+};
+
+dictionary DiffLine {
+  DiffLineKind kind;
+  // Without its `+`, `-` or space; a `Note` line ("\ No newline ...") whole.
+  string text;
+  u32? old_line;
+  u32? new_line;
+};
+
+// One hunk the agent picked, with its reason.
+dictionary DiffHunk {
+  string path;
+  // 1-based index of the hunk within that file's diff.
+  u32 hunk;
+  string why;
+  // The `@@ ... @@` line. Absent with `lines` empty when the text is not
+  // loaded or the excerpt has fewer hunks than the agent listed.
+  string? header;
+  // The first lines of the hunk (at most 400).
+  sequence<DiffLine> lines;
+  u32 lines_total;
+};
+
+// A changed file none of whose hunks are shown.
+dictionary DiffFile {
+  string path;
+  u32 added;
+  u32 removed;
+};
+
+// The core of a commit's diff: only the hunks the agent picked.
+dictionary DiffDemo {
+  Attachment file;
+  DemoText state;
+  string commit;
+  u32 files_total;
+  u32 hunks_total;
+  u32 added_total;
+  u32 removed_total;
+  sequence<DiffHunk> hunks;
+  sequence<DiffFile> omitted;
+};
+
+// One criterion of the answer the delivery was made for.
+dictionary DeliveryCriterion {
+  string id;
+  string text;
+  Provenance provenance;
+  CheckResult agent_result;
+  // What Agendar itself observed, when it ran a check.
+  CheckResult? seen_result;
+  // The agent's result and the observed one disagree.
+  boolean conflict;
+};
+
+// What the agent says about its own delivery.
+dictionary Disclosure {
+  sequence<string> proven;
+  sequence<string> not_proven_yet;
+  sequence<string> faked_for_now;
+};
+
+// One comment of a send-back being written. The place must fit the demo it
+// points into: a `DiffLine` on a `Diff`, a `TranscriptLine` on a
+// `CliTranscript`, a `Region` on a `Screenshot`. `text` is 1..=300 characters
+// on one line.
+dictionary NewComment {
+  CommentPlace place;
+  string text;
+};
+
+// One comment of an earlier send-back, with the agent's reply to it.
+dictionary RoundComment {
+  // 1-based, in the order the owner placed them.
+  u32 n;
+  CommentPlace place;
+  string text;
+  string? reply;
+};
+
+// One send-back: the one a redelivery answers (`Delivery.answers`) or the one
+// a delivery received (`Delivery.sent_back`). The replies are those of the
+// redelivery that answers it; absent while there is none.
+dictionary ReviewRound {
+  // The delivery that was sent back; `delivery` reads it too.
+  string delivery_id;
+  string name;
+  string sent_back_at;
+  string? reason;
+  // The agent's reply to the reason, or its overall note.
+  string? reply;
+  sequence<RoundComment> comments;
+};
+
+// One delivery, waiting for the owner's verdict or already reviewed.
+dictionary Delivery {
+  string delivery_id;
+  string project;
+  string project_title;
+  string node;
+  string step_title;
+  string name;
+  // The revision to pass back as `expected_revision`.
+  string revision;
+  ReviewState review;
+  // A newer delivery replaced this one; it takes no verdict.
+  boolean superseded;
+  // The Needs-you row that waits on it, and since when.
+  string? need_id;
+  string? since;
+  // The label of the answer this delivery was made for ("You asked for ...");
+  // absent for finished work no decision asked for.
+  string? asked;
+  sequence<Demo> demos;
+  sequence<DeliveryCriterion> criteria;
+  Disclosure disclosure;
+  // Titles of the steps a verdict releases.
+  sequence<string> unblocks;
+  // Present on a redelivery after a send-back.
+  ReviewRound? answers;
+  // The send-back this delivery received: the owner's reason and comments,
+  // with the agent's replies once a redelivery answers it (then equal to that
+  // redelivery's `answers`). Present when a send-back of this delivery was
+  // read, whichever way the delivery is opened; absent otherwise.
+  ReviewRound? sent_back;
+};
+
+// What became of one verdict.
+dictionary ReviewReceipt {
+  string review_id;
+  string delivery_id;
+  string project;
+  ReviewState review;
+  string written_at;
+  // Vault-relative path of the file the verdict was appended to.
+  string writer_file;
+  // The next active need, to move on to.
+  string? next_need_id;
+};
+
+// ---- Early probe records: not part of contract v1 --------------------------
+
+dictionary ProjectSummary {
+  string slug;
+  string title;
+  u32 needs;
+  u32 moving;
+  u32 stalled;
+  string? last_event;
+};
+
+dictionary SnapshotSummary {
+  string vault_id;
+  string evaluated_at;
+  sequence<ProjectSummary> projects;
+};
+
+dictionary Need {
+  string id;
+  string kind;
+  string project;
+  // The event the item is about: for `decide`, the ask's event id.
+  string source;
+  string? node;
+  string question;
+  string since;
+  u32 stalled_agents;
+};
+
+// Pure phases of a cold refresh, in milliseconds.
+dictionary ColdSplit {
+  u32 events;
+  u32 files;
+  u64 bytes;
+  f64 read_parse_ms;
+  f64 resolve_ms;
+  f64 reduce_ms;
+};
+
+// What this host has read of the Vault, for the round trip and
+// the sync-app checks.
+dictionary VaultHealth {
+  // This device's host id: it writes only `projects/<p>/<host>/`.
+  string host;
+  string evaluated_at;
+  u32 events;
+  // The event-set digest of the index; equal on two hosts that read the same
+  // events.
+  string? event_set_digest;
+  u64 generation;
+  u32 files;
+  // Writer files whose content the sync app has not downloaded yet
+  // (`source_waiting`): their stored events stand in.
+  sequence<string> waiting;
+  // Files in host folders whose names are not writer files.
+  sequence<string> strays;
+};
+
+interface Session {
+  // Open an existing Vault as one more host. Creates the local host identity
+  // in `data_dir` when missing; never creates a Vault.
+  //
+  // `Core.detail` says whose fault a failed open is. The Vault folder and its
+  // manifest: `vault_root_missing` (no such folder), `vault_missing` (no
+  // `vault.json` in it), `vault_symlink`, `vault_manifest_not_file`,
+  // `vault_manifest_too_large`, `vault_manifest_malformed` (not JSON),
+  // `vault_manifest_missing_version`, `vault_manifest_shape`,
+  // `vault_manifest_version` (`E_UNSUPPORTED`),
+  // `vault_manifest_not_on_device` (`vault.json` is a placeholder of the sync
+  // app; retryable) and `vault_unreadable` (a file error the core cannot
+  // explain). Everything else is about this device's own files in
+  // `data_dir`: `identity_*`, `local_state_*`, `local_data_unreadable`,
+  // `lock_timeout` and the path details (`vault_data_separation`,
+  // `not_a_directory`, ...).
+  [Throws=FfiError, Name=open]
+  constructor(string vault_dir, string data_dir);
+
+  // ---- Contract v1 --------------------------------------------------------
+
+  // Converge the index with the Vault and report what this device has read.
+  // `deadline_ms` bounds the wait for the index locks, not the ingest itself;
+  // past it the call is `Refused(RefreshTimeout)`. Reads the Vault.
+  [Throws=FfiError]
+  Freshness refresh(u32 deadline_ms);
+  // The Now screen. `looked_at` is when the owner last looked (RFC 3339).
+  [Throws=FfiError]
+  NowBoard now(string? looked_at);
+  // Every project that is not archived, most urgent first.
+  [Throws=FfiError]
+  sequence<ProjectRow> projects();
+  [Throws=FfiError]
+  ProjectPage project(string slug);
+  // The card of one ask, whatever its status.
+  [Throws=FfiError]
+  Card card(string ask_id);
+  // Answer an ask after a bounded refresh and the rechecks: lifecycle,
+  // `expected_revision`, guard x surface, and for `Choose` / `Confirm` the
+  // echoed label of the chosen option. Writes the Vault.
+  // `E_VALIDATION` details: `invalid_event_id`, `invalid_revision`,
+  // `invalid_option_id`, `unknown_option`, `own_answer_missing`,
+  // `own_answer_too_long`, `echo_mismatch` (an empty echo is one too), and
+  // `control_character` for an own answer with a character the core does not
+  // write.
+  [Throws=FfiError]
+  Receipt answer_checked(string ask_id, Choice choice, string expected_revision, Surface surface, string echo_label);
+  // Resolve a rescue row. Returns the event id. Writes the Vault.
+  // `E_VALIDATION` details: `invalid_project`, `invalid_revision`,
+  // `not_a_rescue`, `handoff_not_offered`.
+  [Throws=FfiError]
+  string rescue(string project, string need_id, string expected_revision, RescueAction action);
+  // Hide a waiting need until `until` (at most seven days ahead); a time in
+  // the past ends the snooze. Returns the event id. Writes the Vault.
+  // `E_VALIDATION` details: `invalid_time` (`until` is not an RFC 3339 UTC
+  // time), `snooze_too_long`.
+  [Throws=FfiError]
+  string snooze(string need_id, string until);
+  // The receipt of one answer, with how far it got.
+  [Throws=FfiError]
+  Receipt receipt(string answer_id);
+  // One delivery, by its id: the `source` of a `Review` need, or a
+  // `DeliveryRow.delivery_id`. Reads the cached index and, for the text of
+  // transcripts and diffs, the demo files in the Vault.
+  [Throws=FfiError]
+  Delivery delivery(string delivery_id);
+  // Accept a delivery or send it back, after a bounded refresh and the
+  // desktop's rechecks: `expected_revision`, not superseded, its answer still
+  // current. A delivery that changed since it was read (a verdict from any
+  // host is such a change) is `Refused(StaleRevision)`; one this device has
+  // not read is `Refused(NotSynced)`.
+  //
+  // A send-back's comments are checked against the delivery's demos, and
+  // each line comment is written with the line's text read from the demo
+  // file, as the desktop does. A send-back whose input does not pass (no
+  // reason and no comment, a reason too long, a comment that does not fit,
+  // a line comment on a demo file that is not on this device) is
+  // `SendBackRefused` with what is wrong and the comment at fault; nothing
+  // is written. Writes the Vault. `E_VALIDATION` details of the ids:
+  // `invalid_event_id`, `invalid_revision`.
+  [Throws=FfiError]
+  ReviewReceipt review(string delivery_id, string expected_revision, Verdict verdict);
+
+  // ---- Early probe calls ---------------------------------------------------
+
+  [Throws=FfiError]
+  SnapshotSummary snapshot_summary();
+  [Throws=FfiError]
+  sequence<Need> needs();
+  // Converge the index with the Vault (full ingest when the index is empty);
+  // returns the evaluation time.
+  [Throws=FfiError]
+  string spike_refresh();
+  // Answer an open ask with one of its options, written by this host's
+  // operator. Returns the answer's event id. No revision or surface check.
+  [Throws=FfiError]
+  string answer(string ask_id, string option_id);
+  // Converge, then report the local health of the read.
+  [Throws=FfiError]
+  VaultHealth health();
+  // Time reading and parsing every event, then resolving and
+  // reducing them in memory, outside the index. Read-only.
+  [Throws=FfiError]
+  ColdSplit cold_split();
+};

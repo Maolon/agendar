@@ -1,3 +1,4 @@
+import { asksWhoContinues, correctionReason, isInfoNeed } from "../state/claim";
 import { needQuestion, needReason } from "../i18n/msg";
 import { tx } from "../i18n";
 import { useRef, useState } from "react";
@@ -21,8 +22,13 @@ interface RescueProps {
 
 /**
  * Rescue view: same spacing and anatomy as a decision, intent-only actions.
- * Handoff and pause patch the plan; nothing here starts, resumes or kills a
- * process. Evidence stays read-only and local.
+ * They patch the plan; nothing here starts, resumes or kills a process.
+ * Evidence stays read-only and local.
+ *
+ * A free step (its session stopped, or no word for a day) is information:
+ * its own conversation takes it back by itself and any other agent may start
+ * it, so its page asks nothing and offers only Pause. Giving the step to
+ * another agent is offered only where the board asks who continues.
  */
 export function Rescue({ project, need, anchor, canMutate, onResolved, onRefresh }: RescueProps) {
   const client = useClient();
@@ -32,6 +38,9 @@ export function Rescue({ project, need, anchor, canMutate, onResolved, onRefresh
   const feature = need.node ? project.features[need.node] : undefined;
   const session = feature?.session ? project.sessions[feature.session] : undefined;
   const stopped = feature?.liveness === "lost";
+  // A claim freed by silence: its session may still be connected elsewhere.
+  const abandoned = !stopped && feature?.claim?.state === "free";
+  const info = isInfoNeed(need);
 
   async function resolve(action: "handoff" | "pause"): Promise<void> {
     if (!canMutate || pending) return;
@@ -82,21 +91,27 @@ export function Rescue({ project, need, anchor, canMutate, onResolved, onRefresh
         <span className="sep">›</span>
         <Icon name="flag" className="c3" />
         <span>{feature?.slice ?? need.node ?? tx("rs.rescue")}</span>
-        <NeedSnooze id={need.id} />
+        {info ? null : <NeedSnooze id={need.id} />}
       </div>
       <h1 className="h">{needQuestion(need)}</h1>
       <p className="lede">
-        {tx("rs.lede")}
+        {tx(info ? "rs.free_lede" : "rs.lede")}
       </p>
       <div className="strip">
         <div className="l">
           <Icon
             name="alert-triangle"
-            className={stopped ? "cred" : "c2"}
+            className={stopped || abandoned ? "cred" : "c2"}
             strokeWidth={1.9}
           />
           <span>
-            {stopped ? <b>{tx("rs.stopped")}</b> : tx("rs.needs")}
+            {stopped ? (
+              <b>{tx("rs.stopped")}</b>
+            ) : abandoned && feature?.correction ? (
+              <b>{correctionReason(feature.correction)}</b>
+            ) : (
+              tx("rs.needs")
+            )}
             {feature?.session ? tx("rs.session", { id: feature.session }) : ""}
           </span>
         </div>
@@ -132,26 +147,28 @@ export function Rescue({ project, need, anchor, canMutate, onResolved, onRefresh
           </span>
         </div>
       ) : null}
-      <div className="acts">
-        <NeedDismiss id={need.id} />
+      <div className="acts dc-acts">
+        {info ? null : <NeedDismiss id={need.id} />}
         <button
           type="button"
-          className="btn"
+          className={info ? "btn primary" : "btn"}
           onClick={() => void resolve("pause")}
           disabled={!canMutate || pending !== null}
         >
           <Icon name="pause-circle" />
           {tx("rs.pause")}
         </button>
-        <button
-          type="button"
-          className="btn primary"
-          onClick={() => void resolve("handoff")}
-          disabled={!canMutate || pending !== null}
-        >
-          <Icon name="arrow-right" />
-          {pending === "handoff" ? tx("rs.recording") : tx("rs.handoff")}
-        </button>
+        {asksWhoContinues(need) ? (
+          <button
+            type="button"
+            className="btn primary"
+            onClick={() => void resolve("handoff")}
+            disabled={!canMutate || pending !== null}
+          >
+            <Icon name="arrow-right" />
+            {pending === "handoff" ? tx("rs.recording") : tx("rs.release")}
+          </button>
+        ) : null}
       </div>
       {!canMutate ? (
         <p className="muted-note">{tx("dl.disabled")}</p>

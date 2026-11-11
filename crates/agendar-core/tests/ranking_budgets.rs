@@ -961,6 +961,7 @@ fn budget_usage_counts_unconfirmed_assumptions_only() {
         speculative_features: 10,
         pending_slices: 0,
         demo_gap_s: 0,
+        demo_step: None,
     };
     assert!(
         budget::admit_speculation(
@@ -997,6 +998,7 @@ fn budget_usage_and_admission_follow_the_defaults() {
         speculative_features: 10,
         pending_slices: 1,
         demo_gap_s: 3_600,
+        demo_step: None,
     };
     let usage = budget::usage(&DEFAULT_BUDGET, clear);
     assert!(!usage.blocked, "exactly ten is at the cap, not over it");
@@ -1011,6 +1013,7 @@ fn budget_usage_and_admission_follow_the_defaults() {
         speculative_features: 0,
         pending_slices: 2,
         demo_gap_s: 0,
+        demo_step: None,
     };
     assert!(budget::usage(&DEFAULT_BUDGET, pending).blocked);
     assert!(budget::refuse_new_speculation(&DEFAULT_BUDGET, pending, 1).is_some());
@@ -1025,6 +1028,7 @@ fn budget_usage_and_admission_follow_the_defaults() {
         speculative_features: 11,
         pending_slices: 0,
         demo_gap_s: 14_400,
+        demo_step: None,
     };
     let usage = budget::usage(&DEFAULT_BUDGET, stale);
     assert!(usage.blocked);
@@ -1049,6 +1053,7 @@ fn budget_usage_and_admission_follow_the_defaults() {
         speculative_features: 9,
         pending_slices: 0,
         demo_gap_s: 0,
+        demo_step: None,
     };
     assert!(
         budget::admit_speculation(&DEFAULT_BUDGET, full, &node("b"), &speculative).is_ok(),
@@ -1058,6 +1063,7 @@ fn budget_usage_and_admission_follow_the_defaults() {
         speculative_features: 10,
         pending_slices: 0,
         demo_gap_s: 0,
+        demo_step: None,
     };
     assert!(
         budget::admit_speculation(&DEFAULT_BUDGET, at_cap, &node("b"), &speculative).is_err(),
@@ -1101,6 +1107,136 @@ fn a_dropped_attempt_stops_counting_against_the_speculation_cap() {
         &project_state.receipts,
     );
     assert!(speculative.is_empty());
+}
+
+#[test]
+fn the_budget_records_the_doing_step_started_first_as_the_demo_clock_step() {
+    let mut world = World::new();
+    world.declare("gap", "Gap", 0);
+    world.feature("gap", "a", 0);
+    world.feature("gap", "b", 0);
+    world.feature("gap", "c", 0);
+    // Nothing started: no step, and the key is left out of the JSON.
+    let idle = reduce_at(&world.events, at(300));
+    let usage = &project(&idle, "gap").summary.budget;
+    assert_eq!(usage.demo_gap_node, None);
+    let wire = serde_json::to_value(usage).expect("json");
+    assert!(wire.get("demo_gap_node").is_none());
+
+    // `b` starts before `a`: the earliest start wins, not the node order.
+    world.start("gap", "b", "00000000000000000000000101", 600, 600, 1);
+    let later = world.start("gap", "a", "00000000000000000000000102", 600, 600, 2);
+    let state = reduce_at(&world.events, at(300));
+    let usage = &project(&state, "gap").summary.budget;
+    assert_eq!(usage.demo_gap_node, Some(node("b")));
+    assert_eq!(
+        serde_json::to_value(usage).expect("json")["demo_gap_node"],
+        json!("b")
+    );
+    assert_eq!(
+        usage.reasons,
+        vec![
+            "No demo for 4h 59m (limit 4h 0m): b (b) is started, not delivered; agendar deliver on it clears the clock."
+        ]
+    );
+    // Named below the limit too.
+    let early = reduce_at(&world.events, at(30));
+    let usage = &project(&early, "gap").summary.budget;
+    assert!(!usage.blocked);
+    assert_eq!(usage.demo_gap_node, Some(node("b")));
+
+    // A state file written before the field existed still reads.
+    let mut old = serde_json::to_value(usage).expect("json");
+    old.as_object_mut().expect("object").remove("demo_gap_node");
+    let old: agendar_core::BudgetUsage = serde_json::from_value(old).expect("old usage reads");
+    assert_eq!(old.demo_gap_node, None);
+
+    // The brief's catalog message carries the step's title.
+    let brief = agendar_core::reduce::brief::build(&state, &world.events, None);
+    let row = brief
+        .at_risk
+        .iter()
+        .find(|row| row.id == "at_risk:budget:gap")
+        .expect("over budget row");
+    let detail = serde_json::to_value(&row.detail_msg).expect("json");
+    assert_eq!(
+        detail["args"]["reasons"]["v"][0],
+        json!({
+            "key": "budget.demo_gap",
+            "args": {
+                "gap": {"t": "minutes", "v": 299},
+                "limit": {"t": "minutes", "v": 240},
+                "step": {"t": "text", "v": "b"},
+            },
+        })
+    );
+
+    // Finished without a delivery, `a` is no longer in flight; `b` stays.
+    world.done("gap", "a", "00000000000000000000000102", later, 3);
+    let state = reduce_at(&world.events, at(300));
+    assert_eq!(
+        project(&state, "gap").summary.budget.demo_gap_node,
+        Some(node("b"))
+    );
+}
+
+#[test]
+fn the_nudge_and_the_refusal_name_the_step_and_say_to_deliver() {
+    use agendar_core::reduce::policy::DEFAULT_BUDGET;
+
+    let step = node("core/search");
+    let attempt = id(77);
+    let named = budget::Activity {
+        speculative_features: 0,
+        pending_slices: 0,
+        demo_gap_s: 18_000,
+        demo_step: Some(budget::DemoStep {
+            node: &step,
+            title: "Search index",
+            attempt: Some(&attempt),
+        }),
+    };
+    let reason = "No demo for 5h 0m (limit 4h 0m): Search index (core/search) is started, not delivered; agendar deliver on it clears the clock.";
+    let usage = budget::usage(&DEFAULT_BUDGET, named);
+    assert_eq!(usage.reasons, vec![reason]);
+    assert_eq!(usage.demo_gap_node, Some(step.clone()));
+
+    let refused = budget::refuse_new_speculation(&DEFAULT_BUDGET, named, 1).expect("refused");
+    assert_eq!(
+        refused.message(),
+        format!("Speculation budget exceeded: {reason}")
+    );
+    assert_eq!(
+        refused.hint(),
+        Some(
+            format!(
+                "Deliver what works so far: agendar deliver --node core/search --attempt {} --json delivery.json",
+                attempt.as_str()
+            )
+            .as_str()
+        )
+    );
+
+    // No step in progress: the plain reason and the general hint.
+    let unnamed = budget::Activity {
+        demo_step: None,
+        ..named
+    };
+    let usage = budget::usage(&DEFAULT_BUDGET, unnamed);
+    assert_eq!(usage.reasons, vec!["No demo for 5h 0m (limit 4h 0m)."]);
+    assert_eq!(usage.demo_gap_node, None);
+    let general = "Ask the human or work on a feature without unconfirmed choices.";
+    let refused = budget::refuse_new_speculation(&DEFAULT_BUDGET, unnamed, 1).expect("refused");
+    assert_eq!(refused.hint(), Some(general));
+
+    // Refused for another reason while under the demo limit: the deliver hint
+    // would not clear it, so the general hint stays.
+    let under = budget::Activity {
+        demo_gap_s: 60,
+        ..named
+    };
+    let refused = budget::refuse_new_speculation(&DEFAULT_BUDGET, under, 11).expect("refused");
+    assert_eq!(refused.hint(), Some(general));
 }
 
 #[test]
@@ -1276,9 +1412,10 @@ fn brief_projects_rows_for_twelve_projects() {
         default_project(),
         budget_project(),
         active_project(),
+        late_project(),
     ];
-    // Seven quiet projects fill the board to twelve.
-    for index in 5..12 {
+    // Six quiet projects fill the board to twelve.
+    for index in 6..12 {
         let mut world = World::new();
         let project = format!("q{index}");
         world.declare(&project, "Quiet", 0);
@@ -1316,9 +1453,13 @@ fn brief_projects_rows_for_twelve_projects() {
 
     // At risk: over budget, near budget and a late feature.
     let ids: Vec<&str> = before.at_risk.iter().map(|row| row.id.as_str()).collect();
-    assert!(ids.contains(&"at_risk:budget:p01"));
+    assert!(ids.contains(&"at_risk:budget:p06"));
     assert!(ids.contains(&"at_risk:near_budget:p04"));
-    assert!(ids.iter().any(|id| id.starts_with("at_risk:late:p01")));
+    assert!(ids.iter().any(|id| id.starts_with("at_risk:late:p06")));
+    // p01's only step was accepted by the owner: settled, so neither late nor
+    // over its demo budget.
+    assert!(!ids.iter().any(|id| id.starts_with("at_risk:late:p01")));
+    assert!(!ids.contains(&"at_risk:budget:p01"));
 
     // Every row targets a project or an existing need.
     let need_ids: BTreeSet<&str> = before
@@ -1420,6 +1561,15 @@ fn active_project() -> (State, Vec<Event>) {
     world.feature("p05", "ship-it", 0);
     world.start("p05", "ship-it", "00000000000000000000000501", 600, 600, 11);
     (reduce_at(&world.events, at(15)), world.events)
+}
+
+/// p06: one step started long ago, far past its ETA, with no demo since.
+fn late_project() -> (State, Vec<Event>) {
+    let mut world = World::new();
+    world.declare("p06", "Late", 0);
+    world.feature("p06", "slow", 0);
+    world.start("p06", "slow", "00000000000000000000000601", 600, 600, 1);
+    (reduce_at(&world.events, at(600)), world.events)
 }
 
 fn card_with_timeout(after_s: u64) -> Value {

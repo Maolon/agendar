@@ -13,9 +13,49 @@ use crate::model::event::{
 };
 use crate::model::ids::{EtaRange, EventId, Harness, HostId, NodePath, SessionId, UtcTime};
 use crate::model::state::{
-    DecisionLifecycle, DecisionState, EtaState, FeatureState, Gate, GraphNodeId, Liveness, Progress,
+    ClaimState, Correction, CorrectionRule, EtaState, FeatureState, Gate, GraphNodeId, Lease,
+    Liveness, Phase, Progress, TakenFrom,
 };
 use crate::reduce::{CausalView, FoldNote};
+
+/// What touched one step: its latest event and whether the owner wrote any.
+/// "Any event" is any event of the project that refers to the node; "the
+/// owner" is an operator writer. One test for the reducer's `untouched` rule
+/// and for `settle`'s candidates (`owed.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Touch {
+    pub last: UtcTime,
+    pub owner: bool,
+}
+
+impl Touch {
+    pub fn record(touches: &mut BTreeMap<NodePath, Touch>, event: &Event) {
+        let Some(node) = event.refs.node.as_ref() else {
+            return;
+        };
+        let owner = event.writer.is_operator();
+        touches
+            .entry(node.clone())
+            .and_modify(|touch| {
+                touch.last = touch.last.max(event.ts);
+                touch.owner |= owner;
+            })
+            .or_insert(Touch {
+                last: event.ts,
+                owner,
+            });
+    }
+}
+
+/// The steps a human answered: an answer receipt from the owner is theirs.
+pub fn human_decided<'a>(
+    receipts: impl Iterator<Item = &'a crate::model::state::Receipt>,
+) -> BTreeSet<NodePath> {
+    receipts
+        .filter(|receipt| receipt.source == crate::model::state::ReceiptSource::Human)
+        .map(|receipt| receipt.node.clone())
+        .collect()
+}
 
 /// One winning field patch candidate.
 #[derive(Debug, Clone)]
@@ -112,6 +152,14 @@ impl Declaration {
 pub struct AttemptFold {
     pub id: EventId,
     pub session: SessionId,
+    /// The session that wrote the start. `session` moves to a continuation
+    /// (`apply_session_continued`); this never changes.
+    pub started_by: SessionId,
+    /// Every session this attempt has belonged to: the one that started it
+    /// and each continuation. One agent conversation.
+    pub sessions: BTreeSet<SessionId>,
+    /// The deliveries on this attempt.
+    pub deliveries: Vec<EventId>,
     pub harness: Harness,
     pub started_at: UtcTime,
     pub order: usize,
@@ -136,6 +184,80 @@ pub struct AttemptFold {
     /// restart can repair a carried taint, never a later completion that cites
     /// a receipt.
     pub start_basis: BTreeSet<EventId>,
+    /// `O` index and timestamp of every pulse that set an ETA after the start:
+    /// the agent's work signals besides its deliveries.
+    pub eta_signals: Vec<(usize, UtcTime)>,
+    /// What the fold held before a `dropped`, and the drop's `O` index: a drop
+    /// ordered after the accepting review is history only (`reduce::settle`).
+    pub before_drop: Option<DropUndo>,
+    /// The derived settle from this attempt's deliveries and their reviews,
+    /// filled in when the project is finalized.
+    pub settle: crate::reduce::settle::Settle,
+    /// The latest event on this attempt by its session (a pulse, a delivery,
+    /// a progress event or a question on the step): the claim lease runs from
+    /// it (`reduce::claim`).
+    pub last_word: (UtcTime, EventId),
+    /// Every word its own session wrote on this attempt after the start, so
+    /// a takeover can tell whether it saw them (`contested_takeovers`).
+    pub words: Vec<EventId>,
+}
+
+/// The fold state a `dropped` replaced, kept so a drop the owner's accept
+/// outranks can be undone deterministically.
+#[derive(Debug, Clone)]
+pub struct DropUndo {
+    pub order: usize,
+    pub event: EventId,
+    pub status: WorkStatus,
+    pub status_event: Option<EventId>,
+    pub status_ts: Option<UtcTime>,
+}
+
+impl AttemptFold {
+    /// Record a word from the agent on this attempt; the latest one counts.
+    pub fn heard(&mut self, event: &Event) {
+        if event.ts >= self.last_word.0 {
+            self.last_word = (event.ts, event.id.clone());
+        }
+        if event.id != self.id && event.writer.session() == Some(&self.session) {
+            self.words.push(event.id.clone());
+        }
+        if matches!(event.payload, EventPayload::Delivery(_)) {
+            self.deliveries.push(event.id.clone());
+        }
+    }
+
+    /// The latest live delivery the owner's accept closed, when the derived
+    /// settle is done (no work signal after it, every live delivery accepted).
+    pub fn accepted_at(&self) -> Option<(usize, UtcTime)> {
+        if self.status == WorkStatus::Dropped {
+            return None;
+        }
+        (self.settle.phase == Some(crate::reduce::settle::SettlePhase::Accepted))
+            .then_some(self.settle.delivered)
+            .flatten()
+    }
+
+    /// Completion time for calibration and closing waits: the earlier of the
+    /// first done/verified event and the delivery a derived done rests on.
+    pub fn completion(&self) -> Option<(usize, UtcTime)> {
+        match (self.first_completion, self.accepted_at()) {
+            (Some(done), Some(accepted)) => Some(if accepted.1.millis() < done.1.millis() {
+                accepted
+            } else {
+                done
+            }),
+            (done, accepted) => done.or(accepted),
+        }
+    }
+}
+
+/// End `attempt` by the owner's drop.
+fn close_by_owner(attempt: &mut AttemptFold, drop: &OwnerDropFold) {
+    attempt.status = WorkStatus::Dropped;
+    attempt.status_event = Some(drop.event.clone());
+    attempt.status_ts = Some(drop.ts);
+    attempt.before_drop = None;
 }
 
 /// One winning `depends_on` transition, in causal order.
@@ -166,10 +288,23 @@ pub struct FeatureFold {
     pub attempts: BTreeMap<EventId, AttemptFold>,
     pub current_attempt: Option<EventId>,
     pub start_conflicts: Vec<EventId>,
+    /// Every plan patch that asked for a hand-off: a start citing one is the
+    /// owner's choice, never a contested takeover.
+    pub handoff_events: BTreeSet<EventId>,
     pub last_pulse: Option<(usize, EventId)>,
     /// A `dropped` without an attempt: the step left the plan before anyone
     /// started it. A later start brings it back.
     pub unstarted_drop: Option<EventId>,
+    /// The owner's drops of this step (`plan.dropped`), in `O`.
+    pub owner_drops: Vec<OwnerDropFold>,
+}
+
+/// One `plan.dropped` on a step.
+#[derive(Debug, Clone)]
+pub struct OwnerDropFold {
+    pub event: EventId,
+    pub ts: UtcTime,
+    pub note: Option<String>,
 }
 
 impl Default for FeatureFold {
@@ -189,8 +324,10 @@ impl Default for FeatureFold {
             attempts: BTreeMap::new(),
             current_attempt: None,
             start_conflicts: Vec::new(),
+            handoff_events: BTreeSet::new(),
             last_pulse: None,
             unstarted_drop: None,
+            owner_drops: Vec::new(),
         }
     }
 }
@@ -245,6 +382,9 @@ impl FeatureFold {
             offer(&mut self.paused, patch(*value, event, order));
         }
         if let Some(value) = handoff {
+            if *value {
+                self.handoff_events.insert(event.id.clone());
+            }
             offer(&mut self.handoff, patch(*value, event, order));
         }
         if let Some(value) = depends_on {
@@ -284,9 +424,13 @@ impl FeatureFold {
                 // A restart supersedes old work only when it explicitly cites the
                 // attempt it replaces. A causally later start that
                 // silently ignores the current attempt is rejected.
+                // An attempt the owner's drop closes need not be cited: the
+                // board shows another attempt there, and the service cites
+                // the one it shows.
                 if let Some(current) = self.current_attempt.clone()
                     && causal.before(&current, &event.id)
                     && !event.refs.causes.contains(&current)
+                    && self.closed_by(&current, causal).is_none()
                 {
                     return Some(FoldNote::invalid(
                         "a restart must cite the current attempt in refs.causes",
@@ -295,6 +439,9 @@ impl FeatureFold {
                 let attempt = AttemptFold {
                     id: event.id.clone(),
                     session: agent.session.clone(),
+                    started_by: agent.session.clone(),
+                    sessions: BTreeSet::from([agent.session.clone()]),
+                    deliveries: Vec::new(),
                     harness: agent.harness,
                     started_at: event.ts,
                     order,
@@ -315,8 +462,17 @@ impl FeatureFold {
                         .cloned()
                         .collect(),
                     start_basis: event.refs.basis.iter().cloned().collect(),
+                    eta_signals: Vec::new(),
+                    before_drop: None,
+                    settle: crate::reduce::settle::Settle::default(),
+                    last_word: (event.ts, event.id.clone()),
+                    words: Vec::new(),
                 };
+                // A start the owner's drop closes (`settle_owner_drops`) is
+                // no start conflict: the owner settled it.
+                let closed = self.closed_by(&event.id, causal).is_some();
                 if let Some(current) = self.current_attempt.clone()
+                    && !closed
                     && !attempt.causes.contains(&current)
                     && !self.start_conflicts.contains(&current)
                 {
@@ -354,6 +510,7 @@ impl FeatureFold {
                         "dropped is terminal until a new start; the status is history only",
                     ));
                 }
+                attempt.heard(event);
                 attempt.applied.extend(
                     event
                         .refs
@@ -362,6 +519,15 @@ impl FeatureFold {
                         .chain(event.refs.basis.iter())
                         .cloned(),
                 );
+                if *status == WorkStatus::Dropped {
+                    attempt.before_drop = Some(DropUndo {
+                        order,
+                        event: event.id.clone(),
+                        status: attempt.status,
+                        status_event: attempt.status_event.clone(),
+                        status_ts: attempt.status_ts,
+                    });
+                }
                 if matches!(status, WorkStatus::Done | WorkStatus::Verified)
                     && attempt.first_completion.is_none()
                 {
@@ -375,6 +541,119 @@ impl FeatureFold {
         }
     }
 
+    /// Record the owner's `plan.dropped`. Every drop of the project is
+    /// recorded before the fold starts, and none changes the fold: an agent's
+    /// event folds exactly as it would without the drop, so the drop never
+    /// makes it invalid and its place in `O` beside the drop never matters.
+    pub fn record_owner_drop(&mut self, event: &Event) {
+        let EventPayload::PlanDropped(body) = &event.payload else {
+            return;
+        };
+        self.owner_drops.push(OwnerDropFold {
+            event: event.id.clone(),
+            ts: event.ts,
+            note: body.note.clone(),
+        });
+    }
+
+    /// The owner's drop that closes the attempt `start` began: the first one
+    /// in `O` that is not in the start's causal past. Owner > agent: only a
+    /// start that follows every drop is open.
+    pub fn closed_by(&self, start: &EventId, causal: &CausalView<'_>) -> Option<&OwnerDropFold> {
+        self.owner_drops
+            .iter()
+            .find(|drop| !causal.before(&drop.event, start))
+    }
+
+    /// Apply the owner's drops once every event is folded. The step ends as
+    /// after an agent's drop, by the causal relation alone:
+    ///
+    /// - a step nobody started leaves the plan;
+    /// - an attempt a drop closes ends dropped by it, unless it had finished
+    ///   and was replaced before the drop (old history stays as it was). The
+    ///   owner's drop is never undone by an accept and outranks the agent's
+    ///   own drop;
+    /// - the step shows an open attempt when there is one (the fold's
+    ///   current attempt, else the latest open one), else the earliest
+    ///   closed attempt that no other attempt replaced.
+    pub fn settle_owner_drops(&mut self, causal: &CausalView<'_>) {
+        let Some(first) = self.owner_drops.first().cloned() else {
+            return;
+        };
+        if self.attempts.is_empty() {
+            self.unstarted_drop = Some(first.event);
+            return;
+        }
+        let replaced: BTreeSet<EventId> = self
+            .attempts
+            .values()
+            .flat_map(|attempt| attempt.causes.iter().cloned())
+            .filter(|cause| self.attempts.contains_key(cause))
+            .collect();
+        let closing: BTreeMap<EventId, OwnerDropFold> = self
+            .attempts
+            .keys()
+            .filter_map(|id| Some((id.clone(), self.closed_by(id, causal)?.clone())))
+            .collect();
+        // Finished and replaced before the drop: by a start the same drop
+        // does not precede.
+        let history: BTreeSet<EventId> = closing
+            .iter()
+            .filter(|(id, drop)| {
+                self.attempts.values().any(|later| {
+                    later.causes.contains(*id) && !causal.before(&drop.event, &later.id)
+                })
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for attempt in self.attempts.values_mut() {
+            if let Some(drop) = closing.get(&attempt.id)
+                && (attempt.status == WorkStatus::Started || !history.contains(&attempt.id))
+            {
+                close_by_owner(attempt, drop);
+            }
+        }
+        let open = |id: &EventId| !closing.contains_key(id);
+        if self.current_attempt.as_ref().is_some_and(open) {
+            return;
+        }
+        let shown = self
+            .attempts
+            .values()
+            .filter(|attempt| open(&attempt.id))
+            .max_by_key(|attempt| attempt.order)
+            .or_else(|| {
+                self.attempts
+                    .values()
+                    .filter(|attempt| !replaced.contains(&attempt.id))
+                    .min_by_key(|attempt| attempt.order)
+            })
+            .map(|attempt| attempt.id.clone());
+        if shown.is_some() {
+            self.current_attempt = shown;
+        }
+    }
+
+    /// Whether the owner's drop is what ended `attempt`.
+    pub fn dropped_by_owner(&self, attempt: &AttemptFold) -> bool {
+        attempt.status == WorkStatus::Dropped
+            && attempt
+                .status_event
+                .as_ref()
+                .is_some_and(|id| self.owner_drops.iter().any(|drop| &drop.event == id))
+    }
+
+    /// The owner's drop that closed this step, while it is what the step
+    /// shows.
+    pub fn owner_drop(&self) -> Option<&OwnerDropFold> {
+        let closing = match self.current() {
+            None => self.unstarted_drop.as_ref(),
+            Some(attempt) if attempt.status == WorkStatus::Dropped => attempt.status_event.as_ref(),
+            Some(_) => None,
+        }?;
+        self.owner_drops.iter().find(|drop| &drop.event == closing)
+    }
+
     pub fn apply_pulse(&mut self, event: &Event, order: usize) {
         let EventPayload::Pulse(body) = &event.payload else {
             return;
@@ -382,6 +661,7 @@ impl FeatureFold {
         if event.refs.node.as_ref() != Some(&self.node) {
             return;
         }
+        self.heard(event);
         if body.eta.is_some()
             && let Some(attempt_id) = event.refs.attempt.clone()
             && let Some(attempt) = self.attempts.get_mut(&attempt_id)
@@ -391,6 +671,7 @@ impl FeatureFold {
             attempt.eta = eta;
             attempt.eta_ts = event.ts;
             attempt.eta_order = order;
+            attempt.eta_signals.push((order, event.ts));
         }
         if self
             .last_pulse
@@ -398,6 +679,26 @@ impl FeatureFold {
             .is_none_or(|(previous, _)| order > *previous)
         {
             self.last_pulse = Some((order, event.id.clone()));
+        }
+    }
+
+    /// Credit an agent event on this step to the attempt it is on: the one it
+    /// names, else the current attempt when the writer is its session.
+    pub fn heard(&mut self, event: &Event) {
+        if event.writer.is_operator() {
+            return;
+        }
+        let named = event
+            .refs
+            .attempt
+            .clone()
+            .filter(|attempt| self.attempts.contains_key(attempt));
+        let target = named.or_else(|| {
+            let current = self.current()?;
+            (event.writer.session() == Some(&current.session)).then(|| current.id.clone())
+        });
+        if let Some(attempt) = target.and_then(|id| self.attempts.get_mut(&id)) {
+            attempt.heard(event);
         }
     }
 
@@ -530,6 +831,9 @@ pub fn fields(fold: &FeatureFold) -> FeatureFields {
 
 /// Progress contributed by the current attempt only; old attempts never
 /// complete a restart.
+///
+/// A started attempt whose live deliveries are all accepted, with no work
+/// signal after the latest one, is done: derived, never recorded.
 pub fn progress(fold: &FeatureFold, require_human_review: bool) -> Progress {
     let Some(current) = fold.current() else {
         return if fold.unstarted_drop.is_some() {
@@ -539,6 +843,7 @@ pub fn progress(fold: &FeatureFold, require_human_review: bool) -> Progress {
         };
     };
     match current.status {
+        WorkStatus::Started if current.accepted_at().is_some() => Progress::Done,
         WorkStatus::Started => Progress::Doing,
         WorkStatus::Done => Progress::Done,
         WorkStatus::Verified => {
@@ -549,6 +854,61 @@ pub fn progress(fold: &FeatureFold, require_human_review: bool) -> Progress {
             }
         }
         WorkStatus::Dropped => Progress::Dropped,
+    }
+}
+
+/// What the board shows for one step: progress, phase, claim and the
+/// correction when that differs from the agent's last self-report. The one
+/// place a reason is attached to a shown status.
+#[derive(Debug, Clone)]
+pub struct Shown {
+    pub progress: Progress,
+    pub phase: Option<Phase>,
+    pub claim: Option<ClaimState>,
+    pub correction: Option<Correction>,
+}
+
+/// Resolve the shown state of a step from its settle and its claim (`claim`
+/// is the outcome for a started attempt the agent still holds open).
+///
+/// Rule 1b: when the claim on a step whose live deliveries are all accepted
+/// ends (lost or silent), the owner's verdict is the last fact: done.
+pub fn shown(
+    fold: &FeatureFold,
+    require_human_review: bool,
+    claim: Option<crate::reduce::claim::Outcome>,
+) -> Shown {
+    let progress = progress(fold, require_human_review);
+    let current = fold.current();
+    let started = current.filter(|attempt| attempt.status == WorkStatus::Started);
+    let phase = started
+        .and_then(|attempt| attempt.settle.phase)
+        .and_then(crate::reduce::settle::SettlePhase::open_phase);
+    let settled = current.and_then(|attempt| attempt.settle.correction.clone());
+    if let (Some(attempt), Some(outcome), Progress::Doing) = (started, &claim, progress)
+        && outcome.claim.state == Lease::Free
+        && let Some(verdict) = &attempt.settle.accepted
+    {
+        return Shown {
+            progress: Progress::Done,
+            phase: None,
+            claim: None,
+            correction: Some(Correction {
+                rule: CorrectionRule::ClosedAfterAccept,
+                since: outcome.claim.since,
+                evidence: vec![verdict.review.clone(), attempt.last_word.1.clone()],
+            }),
+        };
+    }
+    let (claim, claimed) = match claim {
+        Some(outcome) => (Some(outcome.claim), outcome.correction),
+        None => (None, None),
+    };
+    Shown {
+        progress,
+        phase,
+        claim,
+        correction: settled.or(claimed),
     }
 }
 
@@ -732,6 +1092,8 @@ pub fn apply_session_continued(
         for attempt in feature.attempts.values_mut() {
             if attempt.session == body.previous && attempt.status == WorkStatus::Started {
                 attempt.session = body.session.clone();
+                attempt.sessions.insert(body.session.clone());
+                attempt.heard(event);
             }
         }
     }
@@ -762,32 +1124,144 @@ pub fn attempt_eta(
     crate::reduce::eta::compute(attempt, pauses, as_of, ratio)
 }
 
-/// Decisions targeting one node, open mandatory or otherwise.
-pub fn decisions_for_node(
-    decisions: &BTreeMap<EventId, DecisionState>,
-    node: &NodePath,
-) -> Vec<EventId> {
-    decisions
-        .iter()
-        .filter(|(_, decision)| &decision.node == node)
-        .map(|(ask, _)| ask.clone())
-        .collect()
+/// The owner's answer that lets an agent continue a step another agent
+/// holds: the current answer of the owner to that agent's question on the
+/// step, choosing the `takeover` option. An answer the owner changed, and an
+/// answer to a withdrawn or superseded question, is none.
+#[derive(Debug, Clone)]
+pub struct TakeoverAnswer {
+    pub ask: EventId,
+    /// The session that asked. The grant is its own: a continuation of that
+    /// session asks again.
+    pub session: SessionId,
+    pub answer: EventId,
 }
 
-/// Open mandatory decisions on one node.
-pub fn open_decisions(
-    decisions: &BTreeMap<EventId, DecisionState>,
-    node: &NodePath,
-) -> Vec<EventId> {
-    decisions_for_node(decisions, node)
-        .into_iter()
-        .filter(|ask| {
-            decisions.get(ask).is_some_and(|decision| {
-                decision.lifecycle == DecisionLifecycle::Open
-                    && decision.mode == crate::model::ids::Mode::Ask
-            })
+impl TakeoverAnswer {
+    /// Whether this answer covers `held`: the question came after that
+    /// attempt started, from a session the attempt never belonged to (the
+    /// holder's conversation, under any of its session ids, cannot grant
+    /// itself), so the owner answered about it.
+    pub fn covers(&self, held: &AttemptFold, causal: &CausalView<'_>) -> bool {
+        !held.sessions.contains(&self.session) && causal.before(&held.id, &self.ask)
+    }
+
+    /// Whether `start` replaced `held` by applying this answer: the session
+    /// that asked wrote the start, the start event itself cites the answer
+    /// (a later event of the attempt citing it changes nothing), the answer
+    /// covers `held`, and the start had seen every delivery on `held` (the
+    /// owner did not answer about a delivered step).
+    pub fn lets(&self, start: &AttemptFold, held: &AttemptFold, causal: &CausalView<'_>) -> bool {
+        self.session == start.started_by
+            && (start.causes.contains(&self.answer) || start.start_basis.contains(&self.answer))
+            && causal.before(&self.answer, &start.id)
+            && self.covers(held, causal)
+            && held
+                .deliveries
+                .iter()
+                .all(|delivery| causal.before(delivery, &start.id))
+    }
+}
+
+/// Every takeover answer of a project that is in force, by step.
+pub fn takeover_answers(
+    asks: &BTreeMap<EventId, crate::reduce::decisions::AskFold>,
+    receipts: &BTreeMap<EventId, crate::model::state::Receipt>,
+    decisions: &BTreeMap<EventId, crate::model::state::DecisionState>,
+) -> BTreeMap<NodePath, Vec<TakeoverAnswer>> {
+    let mut answers: BTreeMap<NodePath, Vec<TakeoverAnswer>> = BTreeMap::new();
+    for decision in decisions.values() {
+        if decision.withdrawn_by.is_some() || decision.superseded_by.is_some() {
+            continue;
+        }
+        let Some(receipt) = decision
+            .effective_receipt
+            .as_ref()
+            .and_then(|id| receipts.get(id))
+        else {
+            continue;
+        };
+        if receipt.source != crate::model::state::ReceiptSource::Human
+            || receipt.chose.id.as_str() != crate::model::cards::TAKEOVER_OPTION
+        {
+            continue;
+        }
+        let Some(ask) = asks.get(&decision.id) else {
+            continue;
+        };
+        answers
+            .entry(ask.node.clone())
+            .or_default()
+            .push(TakeoverAnswer {
+                ask: ask.id.clone(),
+                session: ask.session.clone(),
+                answer: receipt.id.clone(),
+            });
+    }
+    answers
+}
+
+/// Contested takeovers on one step: a start that replaced another session's
+/// attempt without a hand-off or the owner's answer, while that session wrote a word on the
+/// attempt the start had not seen (not in its causal past). Two agents
+/// racing, or a host whose file arrived late, both end here; the owner says
+/// who continues. Each is `(replaced attempt, the start that replaced it)`.
+pub fn contested_takeovers(
+    fold: &FeatureFold,
+    causal: &CausalView<'_>,
+    answers: &[TakeoverAnswer],
+) -> Vec<(EventId, EventId)> {
+    let mut contested = Vec::new();
+    for start in fold.attempts.values() {
+        if start
+            .causes
+            .iter()
+            .any(|cause| fold.handoff_events.contains(cause))
+        {
+            continue;
+        }
+        for replaced in fold
+            .attempts
+            .values()
+            .filter(|previous| start.causes.contains(&previous.id))
+            .filter(|previous| previous.session != start.session)
+        {
+            // The owner let this agent continue it: their choice, as a
+            // hand-off is.
+            if answers
+                .iter()
+                .any(|answer| answer.lets(start, replaced, causal))
+            {
+                continue;
+            }
+            if replaced
+                .words
+                .iter()
+                .any(|word| !causal.before(word, &start.id))
+            {
+                contested.push((replaced.id.clone(), start.id.clone()));
+            }
+        }
+    }
+    contested
+}
+
+/// The other session's unfinished attempt the current attempt replaced (by
+/// citing it), for the returning agent's "freed, now with …" nudge.
+pub fn taken_from(fold: &FeatureFold) -> Option<TakenFrom> {
+    let current = fold.current()?;
+    fold.attempts
+        .values()
+        .filter(|previous| current.causes.contains(&previous.id))
+        .filter(|previous| previous.session != current.session)
+        .filter(|previous| previous.status == WorkStatus::Started)
+        .max_by_key(|previous| previous.order)
+        .map(|previous| TakenFrom {
+            attempt: previous.id.clone(),
+            session: previous.session.clone(),
+            at: current.started_at,
+            granted_by: None,
         })
-        .collect()
 }
 
 /// Project a feature fold into its derived state.
@@ -796,7 +1270,7 @@ pub fn build_feature(
     fold: &FeatureFold,
     fields: FeatureFields,
     accepted_depends_on: Vec<NodePath>,
-    progress: Progress,
+    shown: Shown,
     gate: Gate,
     waits_on: Vec<GraphNodeId>,
     unblocks: Vec<NodePath>,
@@ -805,6 +1279,7 @@ pub fn build_feature(
     assumptions: Vec<EventId>,
     taints: Vec<EventId>,
     require_human_review: bool,
+    untouched: bool,
 ) -> FeatureState {
     let current = fold.current();
     let _ = require_human_review;
@@ -832,7 +1307,12 @@ pub fn build_feature(
         accepted_depends_on,
         complete: fields.complete,
         field_sources: fields.field_sources,
-        progress,
+        progress: shown.progress,
+        phase: shown.phase,
+        claim: shown.claim,
+        correction: shown.correction,
+        taken_from: taken_from(fold),
+        takeover_grants: Vec::new(),
         gate,
         basis,
         liveness,
@@ -847,5 +1327,14 @@ pub fn build_feature(
         handoff_event: fields.handoff_event,
         handoff_consumed_by: fields.handoff_consumed_by,
         handoff_pending: fields.handoff_pending,
+        untouched,
+        owner_drop: fold
+            .owner_drop()
+            .filter(|_| shown.progress == Progress::Dropped)
+            .map(|drop| crate::model::state::OwnerDrop {
+                event: drop.event.clone(),
+                at: drop.ts,
+                note: drop.note.clone(),
+            }),
     }
 }

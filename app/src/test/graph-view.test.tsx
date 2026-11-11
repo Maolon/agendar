@@ -91,9 +91,10 @@ describe("dependency graph", () => {
     await userEvent.click(
       document.querySelector<HTMLElement>('[data-row="project:agendar"]') as HTMLElement,
     );
-    // Five features plus the pending call, straight from the dev fixture graph.
+    // Six features, the pending call and the pending review, straight from the
+    // dev fixture graph.
     await waitFor(() =>
-      expect(document.querySelectorAll("[data-graph-node]")).toHaveLength(6),
+      expect(document.querySelectorAll("[data-graph-node]")).toHaveLength(8),
     );
     await userEvent.click(
       screen.getByRole("button", { name: /CLI ask\. .*Trace what it waits on/ }),

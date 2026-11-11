@@ -693,12 +693,12 @@ fn delivery_seen_review_acceptance_opens_the_downstream_gate() {
     let state = reduce_seed(&seed);
     let project = seed_project(&state, &seed);
     let y = &project.features[&NodePath::parse("y").expect("node")];
-    // x never reaches Verified in this seed, so y stays upstream-blocked; the
-    // assertion here is that the review state is projected and does not invent
-    // progress or a start.
-    assert_ne!(y.gate, Gate::Open);
+    // The owner's accept settles x: its only delivery is accepted and no work
+    // signal follows it, so x reads done with no agent echo and y opens.
+    assert_eq!(y.gate, Gate::Open);
     let x = &project.features[&NodePath::parse("x").expect("node")];
-    assert_eq!(x.progress.as_str(), "doing");
+    assert_eq!(x.progress.as_str(), "done");
+    assert!(x.phase.is_none());
 }
 
 fn reviewed_state(fixture: &support::Fixture) -> State {
@@ -1503,6 +1503,124 @@ fn session_loss_sets_lost_liveness_and_stopped_variance() {
         project.summary.variance,
         agendar_core::model::Variance::Stopped
     );
+    assert_eq!(project.summary.stopped_steps, 1);
+}
+
+const S2: &str = "00000000000000000000000102";
+const A2: &str = "h-00000000000000000000000001/s-00000000000000000000000102";
+const S3: &str = "00000000000000000000000103";
+const A3: &str = "h-00000000000000000000000001/s-00000000000000000000000103";
+
+fn lost(event: u64, seq: u64, minute: u64, session: &str) -> Event {
+    ev(
+        event,
+        seq,
+        ST1,
+        minute,
+        "session.lost",
+        json!({}),
+        json!({"session": session, "process_start": 7, "reason": "exited"}),
+    )
+}
+
+#[test]
+fn a_stopped_step_beside_live_work_leaves_the_project_active_with_a_count() {
+    let events = vec![
+        declared(1, 0),
+        plan(2, 2, 0, feature_body()),
+        feature_y(3, 3, 0, "y"),
+        start(4, 1, S1, A1, 1),
+        lost(5, 1, 2, S1),
+        start_on(6, 1, "y", S2, A2, 3),
+    ];
+    // The other agent is live.
+    let state = state_at(events.clone(), 10);
+    let summary = &example(&state).summary;
+    assert_eq!(summary.variance, agendar_core::model::Variance::Active);
+    assert_eq!(summary.stopped_steps, 1);
+    assert_eq!(
+        serde_json::to_value(summary).expect("summary")["stopped_steps"],
+        json!(1)
+    );
+    // Its holder went quiet but is not lost: the step is still being done.
+    let state = state_at(events.clone(), 60);
+    let project = example(&state);
+    assert_eq!(project.summary.active_agents, 0);
+    assert_eq!(
+        project.summary.variance,
+        agendar_core::model::Variance::Active
+    );
+    assert_eq!(project.summary.stopped_steps, 1);
+    // The other agent is lost too: nothing is live, the project is stopped.
+    let mut events = events;
+    events.push(lost(7, 2, 4, S2));
+    let state = state_at(events, 10);
+    let summary = &example(&state).summary;
+    assert_eq!(summary.variance, agendar_core::model::Variance::Stopped);
+    assert_eq!(summary.stopped_steps, 2);
+}
+
+#[test]
+fn a_live_agent_without_a_step_keeps_a_project_with_a_stopped_step_active() {
+    let events = vec![
+        declared(1, 0),
+        plan(2, 2, 0, feature_body()),
+        feature_y(3, 3, 0, "y"),
+        start(4, 1, S1, A1, 1),
+        lost(5, 1, 2, S1),
+        start_on(6, 1, "y", S2, A2, 3),
+        done_on(7, 2, "y", S2, A2, 6, 4),
+    ];
+    let state = state_at(events.clone(), 10);
+    let project = example(&state);
+    assert_eq!(project.summary.active_agents, 1);
+    assert_eq!(
+        project.summary.variance,
+        agendar_core::model::Variance::Active
+    );
+    assert_eq!(project.summary.stopped_steps, 1);
+    // Once that agent is quiet nothing is live any more.
+    let state = state_at(events, 60);
+    let summary = &example(&state).summary;
+    assert_eq!(summary.variance, agendar_core::model::Variance::Stopped);
+    assert_eq!(summary.stopped_steps, 1);
+}
+
+#[test]
+fn rework_still_wins_over_live_work_with_a_stopped_step() {
+    let events = vec![
+        declared(1, 0),
+        plan(2, 2, 0, feature_body()),
+        feature_y(3, 3, 0, "y"),
+        feature_y(4, 4, 0, "z"),
+        start(5, 1, S1, A1, 1),
+        ask(6, 2, 2),
+        answer(7, 5, OP1, 3, 6, "adapters"),
+        ack(8, 3, 4, 6, 7, vec![]),
+        answer(9, 1, OP2, 5, 6, "inbox"),
+        start_on(10, 1, "y", S2, A2, 5),
+        lost(11, 1, 6, S2),
+        start_on(12, 1, "z", S3, A3, 7),
+    ];
+    let state = state_at(events, 10);
+    let summary = &example(&state).summary;
+    assert_eq!(summary.variance, agendar_core::model::Variance::Rework);
+    assert_eq!(summary.stopped_steps, 1);
+}
+
+#[test]
+fn the_stopped_count_is_omitted_when_no_step_is_stopped() {
+    let events = vec![
+        declared(1, 0),
+        plan(2, 2, 0, feature_body()),
+        start(3, 1, S1, A1, 1),
+    ];
+    let state = state_at(events, 10);
+    let summary = &example(&state).summary;
+    assert_eq!(summary.variance, agendar_core::model::Variance::Active);
+    assert_eq!(summary.stopped_steps, 0);
+    let value = serde_json::to_value(summary).expect("summary");
+    assert!(value.get("stopped_steps").is_none());
 }
 
 #[test]

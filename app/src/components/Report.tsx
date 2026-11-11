@@ -1,9 +1,12 @@
 import { tx } from "../i18n";
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
+import { createPortal } from "react-dom";
 import type { BlobRef } from "../api/types";
 import { useBlob } from "../hooks/useBlob";
 import { isHtmlBlob } from "../state/delivery";
+import { htmlToText } from "../state/reportText";
 import { Icon } from "./Icon";
+import { useReturnFocus } from "./MediaViewer";
 
 interface ReportPanelProps {
   project: string;
@@ -13,21 +16,32 @@ interface ReportPanelProps {
 }
 
 /**
- * Report source panel. The bytes are escaped text children
- * in `<pre>`: no HTML rendering, no `innerHTML`, no iframe, no Markdown
- * extension and no automatic fetch of links or images.
+ * Report panel. Text reports are escaped text children in `<pre>`; an HTML
+ * report is shown as plain text extracted from an inert parse. No HTML
+ * rendering, no `innerHTML`, no iframe, no Markdown extension and no
+ * automatic fetch of links or images.
  */
 export function ReportPanel({ project, blob, title, onClose }: ReportPanelProps) {
   const view = useBlob(project, blob);
+  const html = isHtmlBlob(blob);
+  // HTML reads as plain text derived from an inert parse; never rendered.
+  const prose = useMemo(
+    () => (html && view.text !== undefined ? htmlToText(view.text) : undefined),
+    [html, view.text],
+  );
   const closeRef = useRef<HTMLButtonElement | null>(null);
+  useReturnFocus();
 
   useEffect(() => {
     closeRef.current?.focus();
   }, []);
 
-  return (
+  return createPortal(
     <div
       className="report-backdrop"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
       onKeyDown={(event) => {
         if (event.key === "Escape") {
           // Keep the window policy from also clearing the selected need.
@@ -80,7 +94,7 @@ export function ReportPanel({ project, blob, title, onClose }: ReportPanelProps)
           </button>
         </div>
         <p className="ghint">
-          {isHtmlBlob(blob)
+          {html
             ? tx("rp.html")
             : tx("rp.source")}
         </p>
@@ -96,10 +110,13 @@ export function ReportPanel({ project, blob, title, onClose }: ReportPanelProps)
           </p>
         ) : view.text === undefined ? (
           <p className="muted-note">{tx("rp.no_text")}</p>
+        ) : prose !== undefined ? (
+          <div className="report-body report-prose">{prose}</div>
         ) : (
           <pre className="report-body">{view.text}</pre>
         )}
       </section>
-    </div>
+    </div>,
+    document.body,
   );
 }

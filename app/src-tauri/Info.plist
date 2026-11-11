@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Agendar works in the background: it refreshes the board under a lock
+	     that agent commands share. Throttled by App Nap on a busy machine, a
+	     sub-second refresh stretched past a minute and agents failed E_BUSY. -->
+	<key>NSAppSleepDisabled</key>
+	<true/>
+</dict>
+</plist>

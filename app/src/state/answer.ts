@@ -10,6 +10,7 @@
  */
 
 import { tx } from "../i18n";
+import { shortcut } from "./shortcut";
 import { useEffect, useMemo, useRef, useSyncExternalStore } from "react";
 import { errorCode, isApiError, type AgendarClient } from "../api/client";
 import {
@@ -329,7 +330,7 @@ export class AnswerAction {
           pending: false,
           error: {
             message: tx("ans.deliberate"),
-            hint: tx("ans.deliberate_hint"),
+            hint: tx("ans.deliberate_hint", { key: shortcut("mod+enter") }),
           },
         });
         return;

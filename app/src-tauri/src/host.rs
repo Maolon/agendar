@@ -6,12 +6,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 use agendar_core::error::{AgendarError, ErrorCode};
+use agendar_core::guard::{
+    AnswerDenial, AnswerRequest, Choice, Refusal, ReviewDenial, Surface, check_answer,
+    check_review, current_receipt, find_decision,
+};
 use agendar_core::index::Index;
 use agendar_core::index::query::recent_project_events;
 use agendar_core::model::{
@@ -41,6 +46,9 @@ use crate::notifications::{self, Availability, NoticeSink, NoticeSpec};
 use crate::preferences::Preferences;
 use crate::projection;
 use crate::ui::Ui;
+
+mod updates;
+mod uploads;
 
 /// Wall clock injection so a test can prove the 60 s token TTL.
 pub trait WallClock: Send + Sync {
@@ -172,7 +180,39 @@ pub struct Host {
     shutdown: AtomicBool,
     /// Token counts from the agents' local logs, refreshed once a minute.
     usage: Mutex<agendar_core::runtime::usage::UsageScanner>,
+    /// One update check at a time, and the last one's failure (if any).
+    update_checking: AtomicBool,
+    update_error: Mutex<Option<String>>,
+    /// Whether this host's own Vault writes have been uploaded (display only).
+    uploads: uploads::Uploads,
+    /// Test seam: runs right after a command's durable Vault append, so a test
+    /// can take the ingest lock exactly where another process could.
+    after_append: Mutex<Option<AppendHook>>,
+    /// Test seam: runs after a tick takes `tick_gate`, before it takes the due
+    /// flag, so a test can prove publisher/watcher coalescing deterministically.
+    before_tick: Mutex<Option<TickHook>>,
+    /// Test seam: runs after the publisher sees a due write, before it waits
+    /// for `tick_gate`.
+    before_publish: Mutex<Option<TickHook>>,
+    /// A committed write whose publication has not run yet. A command never
+    /// refreshes after its append: it sets this and the publisher thread (or
+    /// the next watch tick) converges the index and publishes.
+    publish_due: Mutex<bool>,
+    publish_wake: Condvar,
+    /// Serializes refresh+publish so publications never go back in time,
+    /// without holding `inner` while the index lock is awaited.
+    tick_gate: Mutex<()>,
 }
+
+/// How long one background publication waits for the index lock before it
+/// gives up and lets the publisher retry.
+const PUBLISH_LOCK_WAIT: Duration = Duration::from_secs(1);
+
+/// See [`Host::set_after_append`].
+pub type AppendHook = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+/// See [`Host::set_before_tick`].
+pub type TickHook = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 impl Host {
     pub fn new(
@@ -230,11 +270,103 @@ impl Host {
             }),
             shutdown: AtomicBool::new(false),
             usage: Mutex::new(agendar_core::runtime::usage::UsageScanner::default()),
+            update_checking: AtomicBool::new(false),
+            update_error: Mutex::new(None),
+            uploads: uploads::Uploads::new(),
+            after_append: Mutex::new(None),
+            before_tick: Mutex::new(None),
+            before_publish: Mutex::new(None),
+            publish_due: Mutex::new(false),
+            publish_wake: Condvar::new(),
+            tick_gate: Mutex::new(()),
         };
         if host.notifications_consented() {
             host.sink.start();
         }
         Ok(host)
+    }
+
+    /// Test seam: run `hook` right after every durable Vault append a command
+    /// makes, before anything else the command does.
+    #[doc(hidden)]
+    pub fn set_after_append(&self, hook: Option<AppendHook>) {
+        *self
+            .after_append
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+    }
+
+    /// Test seam: pause one tick while it owns `tick_gate` and before it
+    /// consumes `publish_due`.
+    #[doc(hidden)]
+    pub fn set_before_tick(&self, hook: Option<TickHook>) {
+        *self
+            .before_tick
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+    }
+
+    /// Test seam: mark the publisher's initial due check before it enters the
+    /// serialized tick.
+    #[doc(hidden)]
+    pub fn set_before_publish(&self, hook: Option<TickHook>) {
+        *self
+            .before_publish
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+    }
+
+    fn appended(&self) {
+        let hook = self
+            .after_append
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Hand a committed write's refresh and publication to the publisher.
+    fn request_publish(&self) {
+        *self.due() = true;
+        self.publish_wake.notify_all();
+        self.uploads_committed();
+    }
+
+    fn due(&self) -> std::sync::MutexGuard<'_, bool> {
+        self.publish_due
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Block until a committed write wants publishing (true), the timeout
+    /// passes or the host shuts down (false unless a write is due).
+    pub fn wait_for_publish(&self, timeout: Duration) -> bool {
+        let due = self.due();
+        let (due, _) = self
+            .publish_wake
+            .wait_timeout_while(due, timeout, |due| !*due && !self.is_shutdown())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *due && !self.is_shutdown()
+    }
+
+    /// Converge and publish what committed writes left due. False when the
+    /// refresh failed (another process kept the index lock); the write then
+    /// stays due for the next attempt or tick. Never fails a command.
+    pub fn publish_pending(&self) -> bool {
+        if self.is_shutdown() || !*self.due() {
+            return true;
+        }
+        let hook = self
+            .before_publish
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+        self.tick("local", Some(Instant::now() + PUBLISH_LOCK_WAIT))
     }
 
     pub fn data_root(&self) -> &Path {
@@ -272,10 +404,7 @@ impl Host {
         let changed = changed_event(inner, state, events, generation, now, hint);
         remember(inner, state, events, false);
         self.ui.emit_changed(&changed);
-        self.ui.attention(
-            needs_count(state, &inner.preferences, now),
-            working_count(state),
-        );
+        self.report_attention(inner, state);
         for unblock in unblocks {
             self.ui.emit_unblock(&unblock);
         }
@@ -285,10 +414,16 @@ impl Host {
     /// Initial hydration: remember what exists so nothing old animates.
     fn hydrate(&self, inner: &mut Inner, state: &State, events: &[Event]) {
         remember(inner, state, events, true);
-        let now = self.clock.now();
+        self.report_attention(inner, state);
+    }
+
+    /// Hand the menu bar what it shows: items that need the person, projects
+    /// at work and projects on the board.
+    fn report_attention(&self, inner: &Inner, state: &State) {
         self.ui.attention(
-            needs_count(state, &inner.preferences, now),
+            needs_count(state, &inner.preferences),
             working_count(state),
+            project_count(state),
         );
     }
 
@@ -298,6 +433,9 @@ impl Host {
         inner.tokens.clear();
         inner.media_tokens.clear();
         self.sink.shutdown();
+        drop(inner);
+        let _due = self.due();
+        self.publish_wake.notify_all();
     }
 
     pub fn is_shutdown(&self) -> bool {
@@ -335,14 +473,20 @@ impl Host {
     /// need event timestamps (the Brief's Delivered rows).
     fn fresh_state_with_events(
         &self,
-        inner: &Inner,
+        inner: &mut Inner,
         now: UtcTime,
     ) -> ApiResult<(State, Vec<agendar_core::model::Event>, u64)> {
         let service = inner
             .service
             .as_ref()
-            .ok_or_else(|| not_configured(inner))?;
-        let fresh = service.refresh(now, false).map_err(AppError::from)?;
+            .ok_or_else(|| not_configured(inner))?
+            .clone();
+        // An unchanged committed read returns before any lock wait. If the
+        // source changed, keep the pre-write guard non-blocking on contention.
+        let deadline = service.has_committed_read().then(Instant::now);
+        let fresh = service
+            .refresh_until(now, false, deadline)
+            .map_err(AppError::from)?;
         Ok((fresh.state, fresh.events, fresh.generation))
     }
 
@@ -374,6 +518,8 @@ impl Host {
             .unwrap_or_default();
         let tokens = self.tokens_lookup(&inner.config, now);
         let activity = project_extras_all(&index, &state, now, &waiting, &tokens);
+        let source_notes =
+            agendar_core::index::query::source_diagnostics(&index).unwrap_or_default();
         drop(index);
         inner.open_error = None;
         // Hydration never animates: only the first read seeds the current facts.
@@ -387,9 +533,18 @@ impl Host {
         let mut state_value = projection::state_value(&state)?;
         projection::attach_check_proposals(&mut state_value, &self.local_proposals(&inner));
         projection::attach_activity(&mut state_value, &activity);
-        let local = self.local_status(&inner, now);
+        let mut local = self.local_status(&inner, now);
+        // A Vault file the sync app has not downloaded yet, or a stray file
+        // name, degrades local health and is named in its diagnostics.
+        if !source_notes.is_empty()
+            && let Value::Object(object) = &mut local
+        {
+            object.insert("health".to_owned(), json!("degraded"));
+            object.insert("diagnostics".to_owned(), json!(source_notes));
+        }
         let presence = self.presence_rows(&inner, now);
         let preferences = inner.preferences.view();
+        let update = self.update_view(inner.preferences.update_check);
         let navigation_epoch = inner.navigation.epoch.clone();
         let epoch = inner.epoch.clone();
         let notification_focus = inner.navigation.focus.clone();
@@ -404,6 +559,7 @@ impl Host {
             "local": local,
             "presence": presence,
             "preferences": preferences,
+            "update": update,
         });
         if let Some(focus) = notification_focus
             && let Value::Object(object) = &mut snapshot
@@ -413,12 +569,23 @@ impl Host {
         Ok(snapshot)
     }
 
+    /// The Host lock is held only to take the service and the local config:
+    /// the Vault read and the projection run without it, so the page's other
+    /// reads (and the media route) never queue behind this one.
     pub fn get_project(&self, request: &Value) -> ApiResult<Value> {
         let project =
             ProjectSlug::parse(required_str(request, "project")?).map_err(AppError::from)?;
-        let inner = self.lock();
+        let (service, config) = {
+            let inner = self.lock();
+            let service = inner
+                .service
+                .as_ref()
+                .ok_or_else(|| not_configured(&inner))?
+                .clone();
+            (service, inner.config.clone())
+        };
         let now = self.clock.now();
-        let fresh = self.fresh_read(&inner, now)?;
+        let fresh = service.refresh(now, false).map_err(AppError::from)?;
         let project_state = fresh.state.projects.get(&project).ok_or_else(|| {
             AppError::new(ErrorCode::NotFound.as_str(), "Project was not found.")
                 .with_hint("Check the project slug.")
@@ -426,14 +593,10 @@ impl Host {
         let mut project_value = projection::project_value(project_state)?;
         projection::attach_project_check_proposals(
             &mut project_value,
-            &self.local_proposals(&inner),
+            &check_runtime::proposals(service.local(), service.vault()).unwrap_or_default(),
         );
-        let waiting = inner
-            .service
-            .as_ref()
-            .map(|service| service.waiting_asks(now))
-            .unwrap_or_default();
-        let tokens = self.tokens_lookup(&inner.config, now)(&project);
+        let waiting = service.waiting_asks(now);
+        let tokens = self.tokens_lookup(&config, now)(&project);
         let extras = project_extras(&fresh.index, project_state, now, &waiting, tokens);
         projection::attach_project_activity(&mut project_value, &extras);
         Ok(json!({
@@ -565,6 +728,12 @@ impl Host {
             && let Value::Object(object) = &mut status
         {
             object.insert("notification_error".to_owned(), json!(error));
+        }
+        // This host's writes that the sync folder has not uploaded yet.
+        if let Some(upload) = self.upload_view()
+            && let Value::Object(object) = &mut status
+        {
+            object.insert("upload".to_owned(), upload);
         }
         status
     }
@@ -866,94 +1035,90 @@ impl Host {
         if token.used || token.surface != surface || token.is_expired(now) {
             return Err(stale_answer());
         }
-        let (state, _) = self.fresh_state(inner, now)?;
-        let (project, decision) = find_decision(&state, &token.ask).ok_or_else(stale_answer)?;
-        let project = project.clone();
-        let policy = state.projects[&project].policy.revision.clone();
-        let revision = projection::decision_revision(&project, decision, &policy);
-        if revision != token.revision || decide_receipt(decision) != token.receipt {
+        let (state, before_events, _) = self.fresh_state_with_events(inner, now)?;
+        // The token binds the receipt, guard and risk it was prepared for. All
+        // three are part of the revision the shared check compares next, so a
+        // mismatch here is the same stale answer.
+        let (_, decision) = find_decision(&state, &token.ask).ok_or_else(stale_answer)?;
+        if decide_receipt(decision) != token.receipt
+            || guard::guard_for(&decision.card) != token.guard
+            || effective_risk(&decision.card) != token.risk
+        {
             return Err(stale_answer());
         }
-        if decision.lifecycle != DecisionLifecycle::Open {
+        // The desktop decides at prepare time what each of its surfaces may
+        // offer (the token carries it), so the shared check runs as the app.
+        let checked = check_answer(
+            &state,
+            &AnswerRequest {
+                ask: &token.ask,
+                choice: match &token.own_answer {
+                    Some(text) => Choice::Own(text),
+                    None => Choice::Option(&token.option),
+                },
+                expected_revision: &token.revision,
+                surface: Surface::App,
+                echo_label: Some(echo),
+            },
+        )
+        .map_err(answer_denied)?;
+        let project = checked.project;
+        // Only the one-key path is recommendation-only. A token prepared for a
+        // main-window explicit alternative carries that classification into
+        // the commit, so a deliberately chosen other option still answers the
+        // human's real question.
+        if checked.guard == Guard::Easy
+            && !token.explicit_choice
+            && (checked.chosen.id != decision.card.recommended.option
+                || !matches!(
+                    decision.card.recommended.confidence,
+                    Confidence::Med | Confidence::High
+                ))
+        {
             return Err(AppError::new(
-                ErrorCode::StaleAnswer.as_str(),
-                "This decision is no longer open.",
+                ErrorCode::Validation.as_str(),
+                "This decision needs an explicit choice; the recommendation is not eligible for one-key approval.",
             )
-            .with_hint("Refresh the current card."));
-        }
-        let chosen = match &token.own_answer {
-            Some(text) => decision.card.own_option(text),
-            None => decision
-                .card
-                .options
-                .iter()
-                .find(|option| option.id == token.option)
-                .cloned()
-                .ok_or_else(stale_answer)?,
-        };
-        let current_guard = guard::guard_for(&decision.card);
-        if current_guard != token.guard || effective_risk(&decision.card) != token.risk {
-            return Err(stale_answer());
-        }
-        if echo.trim() != chosen.label.trim() {
-            return Err(AppError::validation(
-                "/echo_label",
-                "The echoed label does not match the current chosen option.",
-            )
-            .with_hint("Review the refreshed card and choose again."));
-        }
-        match current_guard {
-            Guard::Easy => {
-                // Only the one-key path is recommendation-only. A token
-                // prepared for a main-window explicit alternative carries that
-                // classification into the commit, so a deliberately chosen
-                // other option still answers the human's real question.
-                if !token.explicit_choice
-                    && (chosen.id != decision.card.recommended.option
-                        || !matches!(
-                            decision.card.recommended.confidence,
-                            Confidence::Med | Confidence::High
-                        ))
-                {
-                    return Err(AppError::new(
-                        ErrorCode::Validation.as_str(),
-                        "This decision needs an explicit choice; the recommendation is not eligible for one-key approval.",
-                    )
-                    .with_hint("Open Agendar and choose an option."));
-                }
-            }
-            Guard::Confirm | Guard::Choose => {
-                if echo.trim().is_empty() {
-                    return Err(AppError::validation(
-                        "/echo_label",
-                        "Echo the chosen option label before answering.",
-                    ));
-                }
-            }
+            .with_hint("Open Agendar and choose an option."));
         }
         let before = state.projects[&project].clone();
         let service = inner
             .service
             .as_ref()
             .ok_or_else(|| not_configured(inner))?;
-        let event_id = match &token.own_answer {
-            Some(text) => {
-                service.answer_own(&project, &token.ask, text.clone(), done_when, expected_eta)
-            }
-            None => service.answer_decision(
+        let answer = service
+            .answer_decision_event(
                 &project,
                 &token.ask,
                 &token.option,
                 done_when,
                 expected_eta,
-                None,
-            ),
+                token.own_answer.clone(),
+            )
+            .map_err(AppError::from)?;
+        self.appended();
+        // The answer is durable: the reply depends on nothing else. The index
+        // refresh and publication run on the publisher, so another process
+        // holding the index lock never keeps this command waiting.
+        self.request_publish();
+        let event_id = answer.id.clone();
+        if let Some(stored) = inner.tokens.get_mut(token_id) {
+            stored.used = true;
         }
-        .map_err(AppError::from)?;
-        // Re-evaluate after the append with the current clock: the event's own
-        // timestamp may be a millisecond later than the pre-append read.
-        let after_now = self.clock.now();
-        let (after_state, events, generation) = self.fresh_state_with_events(inner, after_now)?;
+        for binding in inner.notices.values_mut() {
+            if binding
+                .choices
+                .iter()
+                .any(|choice| choice.token == token_id)
+            {
+                binding.answered = true;
+            }
+        }
+        // Receipt and released set come from folding the answer into the
+        // event set read before the write: no index, no lock. Evaluate with
+        // the current clock: the event's own timestamp may be a millisecond
+        // later than the pre-append read.
+        let after_state = fold_appended(&before_events, &[answer], self.clock.now());
         let after = after_state
             .projects
             .get(&project)
@@ -971,30 +1136,12 @@ impl Host {
                 .retryable(true)
             })?;
         let released = released_nodes(&before, after, &decision.node);
-        if let Some(stored) = inner.tokens.get_mut(token_id) {
-            stored.used = true;
-        }
-        for binding in inner.notices.values_mut() {
-            if binding
-                .choices
-                .iter()
-                .any(|choice| choice.token == token_id)
-            {
-                binding.answered = true;
-            }
-        }
-        let data = json!({
+        Ok(json!({
             "event_id": event_id,
             "receipt": receipt,
             "awaiting_ack": true,
             "released": released,
-        });
-        // Emit after the state is committed. UI calls never write the Vault.
-        self.publish(inner, &after_state, &events, generation, after_now, "local");
-        if inner.preferences.notifications {
-            self.reconcile_notifications(inner, &after_state, after_now);
-        }
-        Ok(data)
+        }))
     }
 
     // -----------------------------------------------------------------
@@ -1024,10 +1171,17 @@ impl Host {
             .map(str::trim)
             .filter(|reason| !reason.is_empty())
             .map(str::to_owned);
-        if verdict == ReviewVerdict::SendBack && reason.is_none() {
+        let mut comments = crate::anchors::parse_comments(request.get("comments"))?;
+        if !comments.is_empty() && verdict != ReviewVerdict::SendBack {
+            return Err(AppError::validation(
+                "/comments",
+                "Comments are only allowed when sending a delivery back.",
+            ));
+        }
+        if verdict == ReviewVerdict::SendBack && reason.is_none() && comments.is_empty() {
             return Err(AppError::validation(
                 "/reason",
-                "Sending a delivery back requires a reason.",
+                "Sending a delivery back requires a reason or a comment.",
             ));
         }
         let save_rule = parse_save_rule(request.get("save_rule"))?;
@@ -1050,87 +1204,80 @@ impl Host {
             return Err(request_conflict());
         }
         let now = self.clock.now();
-        let (state, _) = self.fresh_state(&inner, now)?;
-        let (slug, project, delivery) = find_delivery(&state, &delivery_id).ok_or_else(|| {
-            AppError::new(ErrorCode::NotFound.as_str(), "Delivery was not found.")
-                .with_hint("Refresh the project board.")
-        })?;
-        let slug = slug.clone();
-        let current_receipt = current_receipt(project, delivery);
-        if projection::delivery_revision(&slug, delivery, current_receipt) != expected {
-            return Err(AppError::new(
-                ErrorCode::StaleAnswer.as_str(),
-                "The delivery changed after it was displayed.",
-            )
-            .with_hint("Review the refreshed observation and review frontier."));
-        }
-        if delivery.superseded_by.is_some() {
-            return Err(AppError::new(
-                ErrorCode::StaleAnswer.as_str(),
-                "This delivery was superseded by a newer one.",
-            )
-            .with_hint("Review the current delivery."));
-        }
-        if current_receipt != Some(&delivery.receipt) {
-            return Err(AppError::new(
-                ErrorCode::StaleAnswer.as_str(),
-                "This delivery's receipt is no longer current.",
-            )
-            .with_hint("Review the delivery against the current receipt."));
-        }
-        let node = delivery.node.clone();
-        let mut causes: BTreeSet<EventId> = BTreeSet::new();
-        causes.insert(delivery.receipt.clone());
-        if let Some(receipt) = current_receipt {
-            causes.insert(receipt.clone());
-        }
-        for criterion in &delivery.criteria {
-            if let Some(observation) = &criterion.observation {
-                causes.insert(observation.clone());
+        let (state, before_events, _) = self.fresh_state_with_events(&mut inner, now)?;
+        let checked = check_review(&state, &delivery_id, &expected).map_err(|denial| {
+            let stale = |message: &str, hint: &str| {
+                AppError::new(ErrorCode::StaleAnswer.as_str(), message).with_hint(hint)
+            };
+            match denial {
+                ReviewDenial::NotFound => {
+                    AppError::new(ErrorCode::NotFound.as_str(), "Delivery was not found.")
+                        .with_hint("Refresh the project board.")
+                }
+                ReviewDenial::Changed => stale(
+                    "The delivery changed after it was displayed.",
+                    "Review the refreshed observation and review frontier.",
+                ),
+                ReviewDenial::Superseded => stale(
+                    "This delivery was superseded by a newer one.",
+                    "Review the current delivery.",
+                ),
+                ReviewDenial::ReceiptNotCurrent => stale(
+                    "This delivery's receipt is no longer current.",
+                    "Review the delivery against the current receipt.",
+                ),
             }
-            causes.extend(criterion.observation_frontier.iter().cloned());
-        }
-        causes.extend(delivery.review_frontier.iter().cloned());
+        })?;
+        let (project, delivery, causes) = (checked.project, checked.delivery, checked.causes);
+        let slug = checked.slug.clone();
+        let node = delivery.node.clone();
         let before = project.clone();
         let service = inner
             .service
             .as_ref()
             .ok_or_else(|| not_configured(&inner))?;
-        let (event_id, rule_event) = service
-            .review_delivery(
+        agendar_core::anchors::resolve_comments(
+            service.vault(),
+            &slug,
+            &delivery.demos,
+            &mut comments,
+        )
+        .map_err(crate::anchors::anchor_error)?;
+        let (review, rule_event) = service
+            .review_delivery_events(
                 &slug,
                 &node,
                 &delivery_id,
                 verdict,
                 reason,
                 save_rule,
-                causes.into_iter().collect(),
+                comments,
+                causes,
             )
             .map_err(AppError::from)?;
-        let after_now = self.clock.now();
-        let (after_state, events, generation) = self.fresh_state_with_events(&inner, after_now)?;
-        let after = after_state
+        self.appended();
+        // The review is durable: the reply depends on nothing else. The index
+        // refresh and publication run on the publisher.
+        self.request_publish();
+        let event_id = review.id.clone();
+        let rule_id = rule_event.as_ref().map(|rule| rule.id.clone());
+        let mut appended = vec![review];
+        appended.extend(rule_event);
+        let after_state = fold_appended(&before_events, &appended, self.clock.now());
+        let released = after_state
             .projects
             .get(&slug)
-            .ok_or_else(|| AppError::new(ErrorCode::NotFound.as_str(), "Project was not found."))?;
-        let released = released_nodes(&before, after, &node);
+            .map(|after| released_nodes(&before, after, &node))
+            .unwrap_or_default();
         let mut data = json!({
             "event_id": event_id,
             "released": released,
         });
-        if let Some(rule_event) = rule_event
+        if let Some(rule_id) = rule_id
             && let Value::Object(object) = &mut data
         {
-            object.insert("rule_event".to_owned(), json!(rule_event));
+            object.insert("rule_event".to_owned(), json!(rule_id));
         }
-        self.publish(
-            &mut inner,
-            &after_state,
-            &events,
-            generation,
-            after_now,
-            "local",
-        );
         inner.requests.insert(
             request_id,
             RequestEntry {
@@ -1164,7 +1311,7 @@ impl Host {
             return Err(request_conflict());
         }
         let now = self.clock.now();
-        let (state, generation) = self.fresh_state(&inner, now)?;
+        let (state, _) = self.fresh_state(&inner, now)?;
         let project_state = state.projects.get(&project).ok_or_else(|| {
             AppError::new(ErrorCode::NotFound.as_str(), "Project was not found.")
                 .with_hint("Check the project slug.")
@@ -1185,18 +1332,9 @@ impl Host {
         let event_id = service
             .set_rule(&project, rule, Vec::new())
             .map_err(AppError::from)?;
-        let after_now = self.clock.now();
-        let (after_state, events, after_generation) =
-            self.fresh_state_with_events(&inner, after_now)?;
+        self.appended();
+        self.request_publish();
         let data = json!({"event_id": event_id});
-        self.publish(
-            &mut inner,
-            &after_state,
-            &events,
-            after_generation.max(generation),
-            after_now,
-            "local",
-        );
         inner.requests.insert(
             request_id,
             RequestEntry {
@@ -1243,18 +1381,9 @@ impl Host {
         let event_id = service
             .set_policy(&project, policy, &expected)
             .map_err(AppError::from)?;
-        let after_now = self.clock.now();
-        let (after_state, events, after_generation) =
-            self.fresh_state_with_events(&inner, after_now)?;
+        self.appended();
+        self.request_publish();
         let data = json!({"event_id": event_id});
-        self.publish(
-            &mut inner,
-            &after_state,
-            &events,
-            after_generation,
-            after_now,
-            "local",
-        );
         inner.requests.insert(
             request_id,
             RequestEntry {
@@ -1299,18 +1428,9 @@ impl Host {
         let event_id = service
             .update_project(&project, patch, &expected)
             .map_err(AppError::from)?;
-        let after_now = self.clock.now();
-        let (after_state, events, after_generation) =
-            self.fresh_state_with_events(&inner, after_now)?;
+        self.appended();
+        self.request_publish();
         let data = json!({"event_id": event_id});
-        self.publish(
-            &mut inner,
-            &after_state,
-            &events,
-            after_generation,
-            after_now,
-            "local",
-        );
         inner.requests.insert(
             request_id,
             RequestEntry {
@@ -1362,22 +1482,67 @@ impl Host {
         let event_id = service
             .update_feature(&project, &node, patch, &expected, expected_graph.as_ref())
             .map_err(AppError::from)?;
-        let after_now = self.clock.now();
-        let (after_state, events, after_generation) =
-            self.fresh_state_with_events(&inner, after_now)?;
+        self.appended();
+        self.request_publish();
         let data = json!({"event_id": event_id});
-        self.publish(
-            &mut inner,
-            &after_state,
-            &events,
-            after_generation,
-            after_now,
-            "local",
-        );
         inner.requests.insert(
             request_id,
             RequestEntry {
                 command: "update_feature",
+                digest,
+                data: data.clone(),
+            },
+        );
+        Ok(data)
+    }
+
+    /// `drop_steps`: the owner drops the listed steps, one event each. Every
+    /// node is checked before anything is written.
+    pub fn drop_steps(&self, request: &Value) -> ApiResult<Value> {
+        let request_id = required_str(request, "request_id")?.to_owned();
+        EventId::parse(&request_id).map_err(AppError::from)?;
+        let project =
+            ProjectSlug::parse(required_str(request, "project")?).map_err(AppError::from)?;
+        let nodes = request
+            .get("nodes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| AppError::validation("/nodes", "nodes is required."))?
+            .iter()
+            .enumerate()
+            .map(|(index, node)| {
+                let node = node.as_str().ok_or_else(|| {
+                    AppError::validation(format!("/nodes/{index}"), "A node must be a string.")
+                })?;
+                agendar_core::model::NodePath::parse(node).map_err(AppError::from)
+            })
+            .collect::<ApiResult<Vec<_>>>()?;
+        let note = optional_str(request, "note");
+        let mut digest_value = request.clone();
+        if let Value::Object(object) = &mut digest_value {
+            object.remove("request_id");
+        }
+        let digest = guard::payload_digest(&digest_value);
+        let mut inner = self.lock();
+        if let Some(entry) = inner.requests.get(&request_id) {
+            if entry.command == "drop_steps" && entry.digest == digest {
+                return Ok(entry.data.clone());
+            }
+            return Err(request_conflict());
+        }
+        let service = inner
+            .service
+            .as_ref()
+            .ok_or_else(|| not_configured(&inner))?;
+        let event_ids = service
+            .drop_steps(&project, &nodes, note)
+            .map_err(AppError::from)?;
+        self.appended();
+        self.request_publish();
+        let data = json!({"event_ids": event_ids});
+        inner.requests.insert(
+            request_id,
+            RequestEntry {
+                command: "drop_steps",
                 digest,
                 data: data.clone(),
             },
@@ -1398,15 +1563,18 @@ impl Host {
         )
         .map_err(|error| AppError::validation("/blob", format!("Invalid blob: {error}.")))?;
         blob.validate("/blob").map_err(AppError::from)?;
-        let mut inner = self.lock();
-        let now = self.clock.now();
-        let fresh = {
-            let service = inner
+        // The Vault read, the reference check and the blob read run without
+        // the Host lock: a page asks for several blobs at once.
+        let service = {
+            let inner = self.lock();
+            inner
                 .service
                 .as_ref()
-                .ok_or_else(|| not_configured(&inner))?;
-            service.refresh(now, false).map_err(AppError::from)?
+                .ok_or_else(|| not_configured(&inner))?
+                .clone()
         };
+        let now = self.clock.now();
+        let fresh = service.refresh(now, false).map_err(AppError::from)?;
         if !fresh.state.projects.contains_key(&project) {
             return Err(AppError::new(
                 ErrorCode::NotFound.as_str(),
@@ -1422,10 +1590,6 @@ impl Host {
         }
         let media_referenced =
             agendar_core::reduce::evidence::blob_referenced(&fresh.events, &project, &blob, false);
-        let service = inner
-            .service
-            .as_ref()
-            .ok_or_else(|| not_configured(&inner))?;
         let bytes = read_blob(service.vault(), &project, &blob).map_err(AppError::from)?;
         let mime = mime_for(blob.ext).ok_or_else(|| {
             AppError::new(
@@ -1462,6 +1626,16 @@ impl Host {
             let token = guard::new_token();
             let expires_at = now.add_millis(MEDIA_TOKEN_TTL_S * 1_000);
             let sha256 = blob.sha256.clone();
+            let mut inner = self.lock();
+            // The Vault was switched while this read ran: its tokens were
+            // cleared, and this one must not outlive them.
+            if !inner
+                .service
+                .as_ref()
+                .is_some_and(|current| std::sync::Arc::ptr_eq(current, &service))
+            {
+                return Err(not_configured(&inner));
+            }
             inner.media_tokens.insert(
                 token.clone(),
                 MediaToken {
@@ -1471,6 +1645,7 @@ impl Host {
                     expires_at,
                 },
             );
+            drop(inner);
             return Ok(json!({
                 "mime": mime,
                 "media_token": token,
@@ -1669,7 +1844,7 @@ impl Host {
         .map_err(AppError::from)?;
         let mut inner = self.lock();
         let now = self.clock.now();
-        let (state, generation) = self.fresh_state(&inner, now)?;
+        let (state, _) = self.fresh_state(&inner, now)?;
         let project_state = state
             .projects
             .get(&project)
@@ -1706,21 +1881,12 @@ impl Host {
         let observation_id = service
             .append_observation(&project, &node, &delivery_id, body, causes)
             .map_err(AppError::from)?;
+        self.appended();
+        self.request_publish();
         let data = json!({
             "observation_id": observation_id,
             "result": run.result,
         });
-        let after_now = self.clock.now();
-        let (after_state, events, after_generation) =
-            self.fresh_state_with_events(&inner, after_now)?;
-        self.publish(
-            &mut inner,
-            &after_state,
-            &events,
-            after_generation.max(generation),
-            after_now,
-            "local",
-        );
         inner.requests.insert(
             request_id,
             RequestEntry {
@@ -1749,15 +1915,19 @@ impl Host {
         {
             return Err(media_not_found());
         }
-        let mut inner = self.lock();
         let now = self.clock.now();
-        inner
-            .media_tokens
-            .retain(|_, binding| binding.expires_at > now);
-        let Some(binding) = inner.media_tokens.get(token).cloned() else {
-            return Err(media_not_found());
+        // Only the token lookup needs the Host lock; the Vault is read without it.
+        let (binding, service) = {
+            let mut inner = self.lock();
+            inner
+                .media_tokens
+                .retain(|_, binding| binding.expires_at > now);
+            let Some(binding) = inner.media_tokens.get(token).cloned() else {
+                return Err(media_not_found());
+            };
+            let service = inner.service.clone().ok_or_else(media_not_found)?;
+            (binding, service)
         };
-        let service = inner.service.as_ref().ok_or_else(media_not_found)?;
         let fresh = service.refresh(now, false).map_err(|_| media_not_found())?;
         if !agendar_core::reduce::evidence::blob_referenced(
             &fresh.events,
@@ -1784,10 +1954,7 @@ impl Host {
         // them back on never replays what happened meanwhile.
         // The menu bar glyph follows the same visible count: a snooze that
         // runs out turns it amber again on the next tick.
-        self.ui.attention(
-            needs_count(state, &inner.preferences, now),
-            working_count(state),
-        );
+        self.report_attention(inner, state);
         let progress = self.progress_notices(inner, state, now);
         self.withdraw_settled_notices(inner, state, &progress);
         if !inner.preferences.notifications {
@@ -1799,13 +1966,8 @@ impl Host {
                 if !notifications::notice_eligible(need) {
                     continue;
                 }
-                if inner
-                    .preferences
-                    .snoozed
-                    .get(&need.id)
-                    .is_some_and(|until| *until > now)
-                    || inner.preferences.dismissed.contains(&need.id)
-                {
+                // Snoozed on any host (the state says so), or closed here.
+                if need.snoozed_until.is_some() || inner.preferences.dismissed.contains(&need.id) {
                     continue;
                 }
                 let decision = project.decisions.get(&need.source);
@@ -2050,6 +2212,8 @@ impl Host {
             let resolved = service
                 .resolve_rescue(&slug, &item_id, action)
                 .map_err(AppError::from)?;
+            self.appended();
+            self.request_publish();
             json!({"event_id": resolved["event_id"].clone()})
         };
         inner.requests.insert(
@@ -2214,6 +2378,12 @@ impl Host {
         self.ui.hide_popover();
     }
 
+    /// Bring the main window forward on Settings › About (the tray's Update
+    /// button). Only known tabs reach the UI.
+    pub fn show_about(&self) {
+        self.ui.open_settings("about");
+    }
+
     pub fn set_preferences(&self, request: &Value) -> ApiResult<Value> {
         let request_id = required_str(request, "request_id")?;
         EventId::parse(request_id).map_err(AppError::from)?;
@@ -2259,31 +2429,9 @@ impl Host {
         if let Some(notifications) = request.get("notifications").and_then(Value::as_bool) {
             next.notifications = notifications;
         }
-        if let Some(snooze) = request.get("snooze")
-            && let Value::Object(object) = snooze
-        {
-            let item_id = object
-                .get("item_id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| AppError::validation("/snooze/item_id", "item_id is required."))?;
-            let until_text = object
-                .get("until")
-                .and_then(Value::as_str)
-                .ok_or_else(|| AppError::validation("/snooze/until", "until is required."))?;
-            let until = UtcTime::parse(until_text).map_err(AppError::from)?;
-            let now = self.clock.now();
-            if until.millis() > now.add_millis(7 * 24 * 60 * 60 * 1_000).millis() {
-                return Err(AppError::validation(
-                    "/snooze/until",
-                    "A snooze can last at most seven days.",
-                ));
-            }
-            next.snoozed.insert(item_id.to_owned(), until);
+        if let Some(update_check) = request.get("update_check").and_then(Value::as_bool) {
+            next.update_check = update_check;
         }
-        // An ended snooze is gone: a restore sends a time already passed, and
-        // old entries must not pile up in the local preferences.
-        let now = self.clock.now();
-        next.snoozed.retain(|_, until| *until > now);
         if request.get("mark_looked").and_then(Value::as_bool) == Some(true) {
             next.last_looked_at = Some(self.clock.now());
             if let Some(service) = inner.service.as_ref()
@@ -2318,24 +2466,12 @@ impl Host {
         Ok(data)
     }
 
-    /// Recount what needs the person after a local snooze or dismissal, so
-    /// the menu bar glyph changes at once instead of at the next tick.
-    fn refresh_attention(&self, inner: &Inner, now: UtcTime) {
-        if let Some(service) = inner.service.as_ref()
-            && let Ok(fresh) = service.refresh(now, true)
-        {
-            self.ui.attention(
-                needs_count(&fresh.state, &inner.preferences, now),
-                working_count(&fresh.state),
-            );
-        }
-    }
-
-    /// Snooze one Needs-you item, or end its snooze with a time already
-    /// passed. Local only, and it patches that one entry, so it needs no
-    /// whole-preferences revision (a mark-looked write in between never
-    /// refuses it) and the tray may call it. Only an item that is waiting now
-    /// can be snoozed, for at most seven days.
+    /// Snooze one Needs-you item on every host, or end its snooze with a
+    /// time already passed: the owner's `need.snoozed` event in the Vault.
+    /// The answer carries `snoozed_until`, the time the item really returns
+    /// (an item with a default time returns before its default).
+    /// Only an item that is waiting now can be snoozed, for at most seven
+    /// days. The tray may call it.
     pub fn snooze_need(&self, request: &Value) -> ApiResult<Value> {
         let request_id = required_str(request, "request_id")?;
         EventId::parse(request_id).map_err(AppError::from)?;
@@ -2353,40 +2489,23 @@ impl Host {
             }
             return Err(request_conflict());
         }
-        let now = self.clock.now();
-        if until.millis() > now.add_millis(7 * 24 * 60 * 60 * 1_000).millis() {
-            return Err(AppError::validation(
-                "/until",
-                "A snooze can last at most seven days.",
-            ));
-        }
-        if until > now {
-            let waiting = inner
+        let data = {
+            let service = inner
                 .service
                 .as_ref()
-                .and_then(|service| service.refresh(now, true).ok())
-                .is_some_and(|fresh| {
-                    fresh
-                        .state
-                        .projects
-                        .values()
-                        .any(|project| project.needs_you.iter().any(|need| need.id == item_id))
-                });
-            if !waiting {
-                return Err(AppError::new(
-                    ErrorCode::NotFound.as_str(),
-                    "This item is no longer waiting for you.",
-                ));
-            }
-        }
-        let mut next = inner.preferences.clone();
-        next.snoozed.insert(item_id, until);
-        next.snoozed.retain(|_, until| *until > now);
-        next.revision = next.revision.saturating_add(1);
-        next.write(&self.data_root).map_err(AppError::from)?;
-        inner.preferences = next.clone();
-        self.refresh_attention(&inner, now);
-        let data = json!({"preferences": next.view()});
+                .ok_or_else(|| not_configured(&inner))?;
+            let fresh = service
+                .refresh(self.clock.now(), false)
+                .map_err(AppError::from)?;
+            let snoozed = service
+                .snooze_need(&fresh, &item_id, until)
+                .map_err(AppError::from)?;
+            self.appended();
+            // The menu bar recount runs on the publisher, never behind the
+            // index lock here.
+            self.request_publish();
+            json!({"event_id": snoozed.event, "snoozed_until": snoozed.until})
+        };
         inner.requests.insert(
             request_id.to_owned(),
             RequestEntry {
@@ -2398,10 +2517,9 @@ impl Host {
         Ok(data)
     }
 
-    /// Close one hand-off item for good on this computer (the user's Cancel).
-    /// The step is untouched: it stays stopped on its project page, where the
-    /// hand-off can still be chosen. Only a hand-off item waiting now can be
-    /// closed; the remembered set keeps only items still waiting.
+    /// Close one rescue row for good on this computer (the user's Dismiss).
+    /// The step is untouched: it stays on its project page, where the row can
+    /// still be opened. Only a rescue row waiting now can be closed; the remembered set keeps only items still waiting.
     pub fn dismiss_need(&self, request: &Value) -> ApiResult<Value> {
         let request_id = required_str(request, "request_id")?;
         EventId::parse(request_id).map_err(AppError::from)?;
@@ -2437,7 +2555,7 @@ impl Host {
         if !waiting.contains(&item_id) {
             return Err(AppError::new(
                 ErrorCode::NotFound.as_str(),
-                "Only a hand-off item that is waiting now can be closed.",
+                "Only a rescue row that is waiting now can be closed.",
             ));
         }
         let mut next = inner.preferences.clone();
@@ -2446,7 +2564,9 @@ impl Host {
         next.revision = next.revision.saturating_add(1);
         next.write(&self.data_root).map_err(AppError::from)?;
         inner.preferences = next.clone();
-        self.refresh_attention(&inner, now);
+        // The menu bar recount runs on the publisher, never behind the index
+        // lock here.
+        self.request_publish();
         let data = json!({"preferences": next.view()});
         inner.requests.insert(
             request_id.to_owned(),
@@ -2578,6 +2698,34 @@ impl Host {
             "cli_path": bundled_cli_path().ok().map(|path| path.to_string_lossy().into_owned()),
             "app_version": env!("CARGO_PKG_VERSION"),
         }))
+    }
+
+    /// Settings › Storage: what each project holds and what a cleanup could
+    /// free, the numbers `agendar prune` prints (the same core function). The
+    /// per-file list stays with the CLI. Read-only, and off the Host lock:
+    /// it reads the Vault and lists its folders.
+    pub fn get_storage_usage(&self) -> ApiResult<Value> {
+        let service = {
+            let inner = self.lock();
+            inner
+                .service
+                .as_ref()
+                .ok_or_else(|| not_configured(&inner))?
+                .clone()
+        };
+        let fresh = service
+            .refresh(self.clock.now(), false)
+            .map_err(AppError::from)?;
+        let usage = service
+            .storage_usage(&fresh, None)
+            .map_err(AppError::from)?;
+        let mut data = json!(usage);
+        for project in data["projects"].as_array_mut().into_iter().flatten() {
+            if let Value::Object(fields) = project {
+                fields.remove("blobs");
+            }
+        }
+        Ok(data)
     }
 
     /// Read-only suggested Vault locations for first-run Setup.
@@ -2847,17 +2995,86 @@ impl Host {
         if batch == "time" {
             self.refresh_usage();
         }
-        let mut inner = self.lock();
-        let now = self.clock.now();
-        let Ok((state, events, generation)) = self.fresh_state_with_events(&inner, now) else {
+        self.uploads_signal(None);
+        self.tick(batch, None);
+    }
+
+    /// The watcher saw the Vault change and says which paths it named.
+    pub fn watch_changed(&self, changes: &agendar_core::runtime::Changes) {
+        if self.is_shutdown() {
             return;
+        }
+        self.uploads_signal(Some(changes));
+        self.tick("sync", None);
+    }
+
+    /// One refresh and publication. The index lock is awaited without holding
+    /// `inner`, so a command is never stuck behind another process's ingest.
+    /// Returns false when the refresh failed.
+    fn tick(&self, batch: &str, deadline: Option<Instant>) -> bool {
+        let _gate = self
+            .tick_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let hook = self
+            .before_tick
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+        // A publisher can pass its initial due check and then wait here while
+        // a watcher publishes that same write. Do not refresh/publish it twice.
+        if batch == "local" && !*self.due() {
+            return true;
+        }
+        // Every write committed before this refresh starts is covered by it.
+        let due = std::mem::take(&mut *self.due());
+        let (service, unconfigured) = {
+            let inner = self.lock();
+            (inner.service.clone(), inner.config.vault.is_none())
         };
+        let now = self.clock.now();
+        let converged = service.as_ref().map(|service| {
+            service
+                .refresh_until(now, false, deadline)
+                .map(|fresh| (fresh.state, fresh.events, fresh.generation))
+        });
+        let (state, events, generation) = match converged {
+            Some(Ok(converged)) => converged,
+            Some(Err(_)) => {
+                if due {
+                    *self.due() = true;
+                }
+                return false;
+            }
+            None => {
+                // Before setup there is no Vault and so no project: hollow glyph.
+                if unconfigured {
+                    self.ui.attention(0, 0, 0);
+                }
+                return true;
+            }
+        };
+        let mut inner = self.lock();
+        let same_vault = match (&service, &inner.service) {
+            (Some(read), Some(current)) => std::sync::Arc::ptr_eq(read, current),
+            _ => false,
+        };
+        if !same_vault {
+            // The Vault was switched while this refresh ran: drop it.
+            if due {
+                *self.due() = true;
+            }
+            return false;
+        }
         if !inner.hydrated {
             // A tick may arrive before the first read: seed history instead of
             // animating everything that already existed.
             self.hydrate(&mut inner, &state, &events);
             inner.hydrated = true;
-            return;
+            return true;
         }
         self.publish(&mut inner, &state, &events, generation, now, batch);
         if batch == "time" {
@@ -2865,6 +3082,7 @@ impl Host {
             self.sink.refresh();
         }
         self.reconcile_notifications(&mut inner, &state, now);
+        true
     }
 
     pub fn steward_tick(&self) {
@@ -3047,33 +3265,6 @@ impl Host {
 
 const MEDIA_TOKEN_TTL_S: i64 = 60;
 
-fn find_delivery<'a>(
-    state: &'a State,
-    id: &EventId,
-) -> Option<(
-    &'a ProjectSlug,
-    &'a agendar_core::model::ProjectState,
-    &'a agendar_core::model::DeliveryState,
-)> {
-    for (slug, project) in &state.projects {
-        if let Some(delivery) = project.deliveries.get(id) {
-            return Some((slug, project, delivery));
-        }
-    }
-    None
-}
-
-fn current_receipt<'a>(
-    project: &'a agendar_core::model::ProjectState,
-    delivery: &agendar_core::model::DeliveryState,
-) -> Option<&'a EventId> {
-    project
-        .receipts
-        .get(&delivery.receipt)
-        .and_then(|receipt| project.decisions.get(&receipt.ask))
-        .and_then(|decision| decision.effective_receipt.as_ref())
-}
-
 fn mime_for(ext: BlobExt) -> Option<&'static str> {
     match ext {
         BlobExt::Txt => Some("text/plain"),
@@ -3253,24 +3444,27 @@ fn working_count(state: &State) -> usize {
         .count()
 }
 
-/// Items that need the person now: snoozed and dismissed ones are hidden from
-/// Needs you, so they never turn the menu bar glyph amber either.
-fn needs_count(
-    state: &State,
-    preferences: &crate::preferences::Preferences,
-    now: UtcTime,
-) -> usize {
+/// Projects on the board, archived ones excluded: none leaves every step of
+/// the menu bar glyph hollow.
+fn project_count(state: &State) -> usize {
+    state
+        .projects
+        .values()
+        .filter(|project| !project.summary.archived)
+        .count()
+}
+
+/// Items that need the person now: snoozed (on any host) and dismissed ones
+/// are hidden from Needs you, so they never turn the menu bar glyph amber
+/// either. `state` is reduced at the current time, so a snooze that ran out
+/// is no longer on its row.
+fn needs_count(state: &State, preferences: &crate::preferences::Preferences) -> usize {
     state
         .projects
         .values()
         .flat_map(|project| project.needs_you.iter())
-        .filter(|need| {
-            !preferences.dismissed.contains(&need.id)
-                && preferences
-                    .snoozed
-                    .get(&need.id)
-                    .is_none_or(|until| *until <= now)
-        })
+        .filter(|need| agendar_core::reduce::attention::is_active_need(need))
+        .filter(|need| need.snoozed_until.is_none() && !preferences.dismissed.contains(&need.id))
         .count()
 }
 
@@ -3450,6 +3644,16 @@ fn unblock_value(
     })
 }
 
+/// The state after `appended`, folded in memory into the event set read
+/// before the write. It needs no index and no lock; foreign events that landed
+/// in between show up with the next publication.
+fn fold_appended(before: &[Event], appended: &[Event], now: UtcTime) -> State {
+    let mut events = Vec::with_capacity(before.len() + appended.len());
+    events.extend_from_slice(before);
+    events.extend_from_slice(appended);
+    agendar_core::reduce::reduce(&events, &agendar_core::reduce::ReduceContext { as_of: now })
+}
+
 fn released_nodes(
     before: &agendar_core::model::ProjectState,
     after: &agendar_core::model::ProjectState,
@@ -3502,18 +3706,6 @@ fn affected_nodes(
             .collect();
     affected.insert(node.clone());
     affected
-}
-
-fn find_decision<'a>(
-    state: &'a State,
-    ask: &EventId,
-) -> Option<(&'a ProjectSlug, &'a DecisionState)> {
-    for (slug, project) in &state.projects {
-        if let Some(decision) = project.decisions.get(ask) {
-            return Some((slug, decision));
-        }
-    }
-    None
 }
 
 fn decide_receipt(decision: &DecisionState) -> Option<EventId> {
@@ -3641,6 +3833,49 @@ fn not_configured(inner: &Inner) -> AppError {
         "expected_preferences_revision",
         inner.preferences.wire_revision().as_str(),
     )
+}
+
+/// The shared answer check's denial as the error this app has always
+/// returned for it.
+fn answer_denied(denial: AnswerDenial) -> AppError {
+    match denial {
+        AnswerDenial::Refused {
+            refusal: Refusal::AlreadyAnswered | Refusal::Withdrawn,
+            revision_current: true,
+        } => AppError::new(
+            ErrorCode::StaleAnswer.as_str(),
+            "This decision is no longer open.",
+        )
+        .with_hint("Refresh the current card."),
+        // The app surface answers every guard and own words, so the shared
+        // check never refuses the surface here.
+        AnswerDenial::Refused {
+            refusal: Refusal::SurfaceNotAllowed,
+            ..
+        } => AppError::forbidden("This surface may not answer this decision."),
+        AnswerDenial::Refused { .. } | AnswerDenial::UnknownOption => stale_answer(),
+        // Own words are checked when the answer is prepared; a token never
+        // holds an empty or too long text.
+        AnswerDenial::OwnAnswerMissing => {
+            AppError::validation("/own_answer", "Write your answer first.")
+        }
+        AnswerDenial::OwnAnswerTooLong => AppError::validation(
+            "/own_answer",
+            format!(
+                "Keep your answer within {} characters.",
+                agendar_core::model::OWN_ANSWER_MAX
+            ),
+        ),
+        AnswerDenial::EchoMismatch => AppError::validation(
+            "/echo_label",
+            "The echoed label does not match the current chosen option.",
+        )
+        .with_hint("Review the refreshed card and choose again."),
+        AnswerDenial::EchoMissing => AppError::validation(
+            "/echo_label",
+            "Echo the chosen option label before answering.",
+        ),
+    }
 }
 
 fn stale_answer() -> AppError {

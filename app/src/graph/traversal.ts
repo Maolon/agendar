@@ -227,7 +227,8 @@ export function reviewUnblockText(
   featureId: NodeId,
   position?: (node: NodeId) => { x: number; y: number } | undefined,
 ): UnblockText | null {
-  const direct = orderedDescendants(index, reviewId, position);
+  // The review's own step is what it delivers, not something it unblocks.
+  const direct = orderedDescendants(index, reviewId, position).filter((id) => id !== featureId);
   if (direct.length) return textFor(index, project, direct);
   const throughFeature = orderedDescendants(index, featureId, position).filter(
     (id) => id !== reviewId,
