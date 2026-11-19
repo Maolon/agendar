@@ -16,6 +16,7 @@ dependencies = [
  "agendar-cli",
  "agendar-core",
  "agendar-ffi",
+ "agendar-materialize",
  "agendar-notify",
  "directories",
  "objc2",
@@ -46,6 +47,7 @@ name = "agendar-cli"
 version = "0.2.0"
 dependencies = [
  "agendar-core",
+ "agendar-materialize",
  "chrono",
  "clap",
  "ctrlc",
@@ -90,6 +92,10 @@ dependencies = [
  "tempfile",
  "uniffi",
 ]
+
+[[package]]
+name = "agendar-materialize"
+version = "0.2.0"
 
 [[package]]
 name = "agendar-notify"

@@ -202,7 +202,7 @@ cd app && node scripts/bundle-cli.mjs && pnpm exec tauri build --bundles app
 
 - `crates/agendar-core`：事件模型、只追加的存储、SQLite 索引，以及把事件收敛为计划、进度、决策和预测的 reducer。
 - `crates/agendar-cli`：agent 运行的 `agendar` 命令，包括 MCP 服务器和各 harness 的 hooks。
-- `crates/agendar-notify`、`crates/agendar-chrome`、`crates/agendar-ffi`：桌面原生通知、macOS 窗口外观，以及面向 core 的 UniFFI 接口层。
+- `crates/agendar-notify`、`crates/agendar-chrome`、`crates/agendar-materialize`、`crates/agendar-ffi`：桌面原生通知、macOS 窗口外观、读取时下载被 iCloud 移出本机的 Vault 文件，以及面向 core 的 UniFFI 接口层。
 - `app/`：桌面应用（Tauri 2、React 和 TypeScript）。
 - `skills/agendar/`：Agent Skill。
 

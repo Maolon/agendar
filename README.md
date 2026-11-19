@@ -268,9 +268,10 @@ The project layout:
   forecasts.
 - `crates/agendar-cli`: the `agendar` command agents run, including the MCP
   server and the harness hooks.
-- `crates/agendar-notify`, `crates/agendar-chrome`, `crates/agendar-ffi`: native
-  desktop notifications, macOS window chrome, and the UniFFI facade over the
-  core.
+- `crates/agendar-notify`, `crates/agendar-chrome`, `crates/agendar-materialize`,
+  `crates/agendar-ffi`: native desktop notifications, macOS window chrome,
+  downloading evicted iCloud Vault files on read, and the UniFFI facade over
+  the core.
 - `app/`: the desktop app (Tauri 2, React, and TypeScript).
 - `skills/agendar/`: the Agent Skill.
 
