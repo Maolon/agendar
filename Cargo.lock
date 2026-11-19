@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agendar-app"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "agendar-chrome",
  "agendar-cli",
@@ -32,7 +32,7 @@ dependencies = [
 
 [[package]]
 name = "agendar-chrome"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "objc2",
  "objc2-app-kit",
@@ -44,7 +44,7 @@ dependencies = [
 
 [[package]]
 name = "agendar-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "agendar-core",
  "agendar-materialize",
@@ -60,7 +60,7 @@ dependencies = [
 
 [[package]]
 name = "agendar-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "directories",
@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "agendar-ffi"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "agendar-core",
  "serde_json",
@@ -95,11 +95,11 @@ dependencies = [
 
 [[package]]
 name = "agendar-materialize"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "agendar-notify"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "block2",
  "notify-rust",
