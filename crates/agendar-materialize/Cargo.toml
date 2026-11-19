@@ -1,0 +1,11 @@
+[package]
+name = "agendar-materialize"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Lets the process download iCloud files evicted from this Mac when it reads them (macOS I/O policy; safe API)"
+publish = false
+
+[dependencies]

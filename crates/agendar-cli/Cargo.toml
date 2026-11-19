@@ -16,6 +16,7 @@ path = "src/lib.rs"
 
 [dependencies]
 agendar-core = { path = "../agendar-core" }
+agendar-materialize = { path = "../agendar-materialize" }
 clap.workspace = true
 ctrlc.workspace = true
 serde.workspace = true

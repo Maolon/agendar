@@ -23,6 +23,7 @@ tauri-build.workspace = true
 agendar-core = { path = "../../crates/agendar-core" }
 agendar-notify = { path = "../../crates/agendar-notify", default-features = false }
 agendar-chrome = { path = "../../crates/agendar-chrome" }
+agendar-materialize = { path = "../../crates/agendar-materialize" }
 directories.workspace = true
 # macos-private-api: a transparent window behind the native glass (no-op elsewhere).
 tauri = { workspace = true, features = ["macos-private-api"] }

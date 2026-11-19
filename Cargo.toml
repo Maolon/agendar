@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/agendar-core", "crates/agendar-cli", "crates/agendar-notify", "crates/agendar-chrome", "crates/agendar-ffi", "app/src-tauri"]
+members = ["crates/agendar-core", "crates/agendar-cli", "crates/agendar-notify", "crates/agendar-chrome", "crates/agendar-materialize", "crates/agendar-ffi", "app/src-tauri"]
 
 [workspace.package]
 version = "0.2.0"
