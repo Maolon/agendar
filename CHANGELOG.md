@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/Maolon/agendar/compare/v0.2.0...v0.2.1) (2026-11-19)
+
+
+### Fixes
+
+* an iCloud Vault reads files macOS moved off this Mac instead of failing with E_IO ([#7](https://github.com/Maolon/agendar/issues/7)) ([0c6ac95](https://github.com/Maolon/agendar/commit/0c6ac9515d5d1b0799c3ce0a31ac69b8d936dbce))
+
 ## [0.2.0](https://github.com/Maolon/agendar/compare/v0.1.0...v0.2.0) (2026-11-11)
 
 
